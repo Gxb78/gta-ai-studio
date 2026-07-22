@@ -330,7 +330,7 @@ export class PreviewCoordinator {
 
         const job = await response.json();
 
-        if (job.status === 'completed') {
+        if (job.status === 'SUCCEEDED') {
           // Job terminé, utiliser le cacheKey stocké pour récupérer l'artifact
           const state = this.getState(clipId);
           if (!state.cacheKey) {
@@ -351,10 +351,15 @@ export class PreviewCoordinator {
             artifactUrl: artifactUrl,
             error: null,
           });
-        } else if (job.status === 'failed') {
+        } else if (job.status === 'FAILED') {
           this.setState(clipId, {
             status: 'failed',
             error: job.error_message || 'Job failed',
+          });
+        } else if (job.status === 'CANCELLED') {
+          this.setState(clipId, {
+            status: 'failed',
+            error: 'Preview render was cancelled',
           });
         } else if (attempts >= maxAttempts) {
           this.setState(clipId, {
