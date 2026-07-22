@@ -18,12 +18,11 @@ import type {
 } from '../types';
 
 /**
- * Generate a monotonically increasing UUID-like ID using timestamp + random
+ * Generate a standard UUID v4 for client_request_id
+ * Respects backend constraint: exactly 36 characters
  */
 function generateClientRequestId(): string {
-  const timestamp = Date.now();
-  const random = Math.random().toString(36).substring(2, 15);
-  return `${timestamp}-${random}`;
+  return crypto.randomUUID();
 }
 
 export interface PreviewState {
@@ -31,6 +30,7 @@ export interface PreviewState {
   clientRequestId: string | null;
   jobRunId: string | null;
   cacheKey: string | null;
+  cacheHit: boolean;
   artifactUrl: string | null;
   error: string | null;
   lastInteractionMs: number;
@@ -89,6 +89,7 @@ export class PreviewCoordinator {
       clientRequestId: null,
       jobRunId: null,
       cacheKey: null,
+      cacheHit: false,
       artifactUrl: null,
       error: null,
       lastInteractionMs: 0,
@@ -270,6 +271,7 @@ export class PreviewCoordinator {
           clientRequestId: requestId,
           jobRunId: null,
           cacheKey: data.cache_key,
+          cacheHit: true,
           artifactUrl: data.artifact_url,
           error: null,
         });
@@ -280,6 +282,7 @@ export class PreviewCoordinator {
           clientRequestId: requestId,
           jobRunId: data.job_run_id,
           cacheKey: data.cache_key,
+          cacheHit: false,
           error: null,
         });
         this.pollJobStatus(projectId, clipId, requestId, data.job_run_id);
@@ -328,13 +331,13 @@ export class PreviewCoordinator {
         const job = await response.json();
 
         if (job.status === 'completed') {
-          // Job terminé, récupérer l'artifact
-          const previewResponse = await fetch(
-            `${this.apiBaseUrl}/api/v1/projects/${projectId}/timeline/preview/${clipId}`,
-          );
-          if (!previewResponse.ok) throw new Error('Failed to fetch artifact after job completion');
+          // Job terminé, utiliser le cacheKey stocké pour récupérer l'artifact
+          const state = this.getState(clipId);
+          if (!state.cacheKey) {
+            throw new Error('No cache_key available after job completion');
+          }
 
-          const previewData: PreviewResponse = await previewResponse.json();
+          const artifactUrl = `${this.apiBaseUrl}/api/v1/projects/${projectId}/previews/${state.cacheKey}`;
 
           // Latest-request-wins final check
           const finalState = this.getState(clipId);
@@ -344,7 +347,8 @@ export class PreviewCoordinator {
 
           this.setState(clipId, {
             status: 'ready',
-            artifactUrl: previewData.artifact_url,
+            cacheHit: false,
+            artifactUrl: artifactUrl,
             error: null,
           });
         } else if (job.status === 'failed') {

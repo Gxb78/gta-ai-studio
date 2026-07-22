@@ -629,9 +629,11 @@ class StudioService:
         for idx in adjacent_indices:
             adjacent_clip = clips[idx]
             try:
-                # Créer une requête prefetch (origin="prefetch" pour éviter récursion)
+                # Créer une requête prefetch avec un UUID unique (pas de concaténation)
+                from .ids import uuid7
+
                 prefetch_request = ClipPreviewRequest(
-                    client_request_id=f"{original_request.client_request_id}-prefetch-{idx}",
+                    client_request_id=uuid7(),
                     edit_project_id=original_request.edit_project_id,
                     clip_id=adjacent_clip.get("id"),
                     timeline_revision=original_request.timeline_revision,

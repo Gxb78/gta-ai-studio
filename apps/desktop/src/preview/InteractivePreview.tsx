@@ -133,7 +133,10 @@ export const InteractivePreview: React.FC<InteractivePreviewProps> = ({
     return sourceVideoUrl;
   }, [artifactUrl, status, sourceVideoUrl]);
 
-  const isInteractiveMode = status === 'interactive' && cssTransform && mode === 'cropped';
+  const isInteractiveMode =
+    ['interactive', 'dirty', 'debouncing', 'queued', 'rendering'].includes(status) &&
+    cssTransform &&
+    mode === 'cropped';
 
   return (
     <div ref={containerRef} className={`relative bg-black ${className}`} style={{ aspectRatio: `${outputWidth}/${outputHeight}` }}>

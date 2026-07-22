@@ -94,11 +94,19 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
     ? `${api.renderUrl(project.id)}?v=${project.production.render?.artifact_id ?? "final"}`
     : project.proxy ? `${api.proxyUrl(project.id)}?v=${project.proxy.sha256}` : null;
 
+  // Ref pour suivre le clip sélectionné dans le callback subscribe
+  const selectedIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    selectedIdRef.current = selected?.id ?? null;
+  }, [selected?.id]);
+
   useEffect(() => {
     const coordinator = new PreviewCoordinator();
     coordinatorRef.current = coordinator;
     const unsubscribe = coordinator.subscribe((clipId, state) => {
-      if (selected && clipId === selected.id) {
+      // Utiliser selectedIdRef pour avoir toujours la valeur à jour
+      if (clipId === selectedIdRef.current) {
         setPreviewState(state);
       }
     });
@@ -184,10 +192,19 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
 
   function updateClip(index: number, values: Partial<AdvancedEditingClip>) {
     commit((snapshot) => ({ ...snapshot, clips: normalizeClips(snapshot.clips.map((clip, clipIndex) => clipIndex === index ? { ...clip, ...values } : clip)) }));
-    // Marquer le clip comme stale après modification
+
+    // Déclencher automatiquement la preview après modification
     const clip = clips[index];
-    if (clip && coordinatorRef.current) {
-      coordinatorRef.current.markStale(clip.id);
+    if (clip && coordinatorRef.current && production && editProjectId) {
+      const updatedClip = { ...clip, ...values };
+      coordinatorRef.current.requestPreview(
+        projectId,
+        editProjectId,
+        updatedClip,
+        advanced_edit.revision,
+        'draft', // Par défaut en draft pour les modifications
+        null,
+      );
     }
   }
 
@@ -347,7 +364,7 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
               outputHeight={1920}
               status={previewState.status}
               artifactUrl={previewState.artifactUrl}
-              cacheHit={previewState.cacheKey !== null}
+              cacheHit={previewState.cacheHit}
               mode={viewMode}
               playheadMs={localPosition}
               onTimeUpdate={(ms) => seek(selectedStart + ms)}

@@ -132,6 +132,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         service.cancel_job(job_id)
         return {"accepted": True}
 
+    @app.get("/api/v1/jobs/{job_id}")
+    async def get_job(job_id: str) -> dict[str, Any]:
+        """Récupère le statut d'un job par son ID."""
+        job = service.repository.get_job(job_id)
+        if not job:
+            raise StudioError("JOB_NOT_FOUND", f"Job {job_id} not found", status_code=404)
+        return job
+
     @app.get("/api/v1/projects/{project_id}/proxy")
     async def project_proxy(project_id: str) -> FileResponse:
         return FileResponse(service.proxy_path(project_id), media_type="video/mp4", filename=f"{project_id}-proxy.mp4")

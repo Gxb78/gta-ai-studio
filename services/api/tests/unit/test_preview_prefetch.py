@@ -4,17 +4,24 @@ Tests unitaires pour le prefetch automatique des clips adjacents.
 import pytest
 from unittest.mock import MagicMock, patch, call
 from gta_studio_api.models import ClipPreviewRequest
+from gta_studio_api.ids import uuid7
 
 
 def test_prefetch_adjacent_clips_no_recursion(service_fixture):
     """Vérifie que les requêtes origin='prefetch' ne déclenchent pas de récursion."""
     service = service_fixture
 
+    # Générer des UUID valides pour les tests
+    clip_id_0 = uuid7()
+    clip_id_1 = uuid7()
+    clip_id_2 = uuid7()
+    edit_project_id = uuid7()
+
     # Clip au milieu (index 1 sur 3)
     clips = [
-        {"id": "clip-0", "start_ms": 0, "end_ms": 3000},
-        {"id": "clip-1", "start_ms": 3000, "end_ms": 6000},
-        {"id": "clip-2", "start_ms": 6000, "end_ms": 9000},
+        {"id": clip_id_0, "start_ms": 0, "end_ms": 3000},
+        {"id": clip_id_1, "start_ms": 3000, "end_ms": 6000},
+        {"id": clip_id_2, "start_ms": 6000, "end_ms": 9000},
     ]
 
     # Mock start_clip_preview pour compter les appels
@@ -39,9 +46,9 @@ def test_prefetch_adjacent_clips_no_recursion(service_fixture):
 
     # Requête utilisateur sur clip-1 (milieu)
     user_request = ClipPreviewRequest(
-        client_request_id="user-req-001",
-        edit_project_id="edit-123",
-        clip_id="clip-1",
+        client_request_id=uuid7(),
+        edit_project_id=edit_project_id,
+        clip_id=clip_id_1,
         timeline_revision=1,
         clip_revision=0,
         render_profile="draft",
@@ -60,9 +67,13 @@ def test_prefetch_edge_clips(service_fixture):
     """Vérifie que le prefetch fonctionne aux bords (premier et dernier clip)."""
     service = service_fixture
 
+    clip_id_0 = uuid7()
+    clip_id_1 = uuid7()
+    edit_project_id = uuid7()
+
     clips = [
-        {"id": "clip-0", "start_ms": 0, "end_ms": 3000},
-        {"id": "clip-1", "start_ms": 3000, "end_ms": 6000},
+        {"id": clip_id_0, "start_ms": 0, "end_ms": 3000},
+        {"id": clip_id_1, "start_ms": 3000, "end_ms": 6000},
     ]
 
     prefetch_calls = []
@@ -79,9 +90,9 @@ def test_prefetch_edge_clips(service_fixture):
 
     # Requête sur premier clip
     first_request = ClipPreviewRequest(
-        client_request_id="req-first",
-        edit_project_id="edit-123",
-        clip_id="clip-0",
+        client_request_id=uuid7(),
+        edit_project_id=edit_project_id,
+        clip_id=clip_id_0,
         timeline_revision=1,
         clip_revision=0,
         render_profile="draft",
@@ -90,15 +101,15 @@ def test_prefetch_edge_clips(service_fixture):
     )
 
     service.start_clip_preview("project-123", first_request)
-    assert prefetch_calls == ["clip-1"], "Prefetch seulement clip suivant"
+    assert prefetch_calls == [clip_id_1], "Prefetch seulement clip suivant"
 
     prefetch_calls.clear()
 
     # Requête sur dernier clip
     last_request = ClipPreviewRequest(
-        client_request_id="req-last",
-        edit_project_id="edit-123",
-        clip_id="clip-1",
+        client_request_id=uuid7(),
+        edit_project_id=edit_project_id,
+        clip_id=clip_id_1,
         timeline_revision=1,
         clip_revision=0,
         render_profile="draft",
@@ -107,16 +118,20 @@ def test_prefetch_edge_clips(service_fixture):
     )
 
     service.start_clip_preview("project-123", last_request)
-    assert prefetch_calls == ["clip-0"], "Prefetch seulement clip précédent"
+    assert prefetch_calls == [clip_id_0], "Prefetch seulement clip précédent"
 
 
 def test_prefetch_uses_draft_profile(service_fixture):
     """Vérifie que le prefetch utilise toujours draft profile."""
     service = service_fixture
 
+    clip_id_0 = uuid7()
+    clip_id_1 = uuid7()
+    edit_project_id = uuid7()
+
     clips = [
-        {"id": "clip-0", "start_ms": 0, "end_ms": 3000},
-        {"id": "clip-1", "start_ms": 3000, "end_ms": 6000},
+        {"id": clip_id_0, "start_ms": 0, "end_ms": 3000},
+        {"id": clip_id_1, "start_ms": 3000, "end_ms": 6000},
     ]
 
     prefetch_profiles = []
@@ -132,9 +147,9 @@ def test_prefetch_uses_draft_profile(service_fixture):
 
     # Requête utilisateur avec fidelity
     user_request = ClipPreviewRequest(
-        client_request_id="req-user",
-        edit_project_id="edit-123",
-        clip_id="clip-0",
+        client_request_id=uuid7(),
+        edit_project_id=edit_project_id,
+        clip_id=clip_id_0,
         timeline_revision=1,
         clip_revision=0,
         render_profile="fidelity",  # User demande fidelity
@@ -151,9 +166,13 @@ def test_prefetch_fire_and_forget(service_fixture):
     """Vérifie que les erreurs de prefetch ne propagent pas."""
     service = service_fixture
 
+    clip_id_0 = uuid7()
+    clip_id_1 = uuid7()
+    edit_project_id = uuid7()
+
     clips = [
-        {"id": "clip-0", "start_ms": 0, "end_ms": 3000},
-        {"id": "clip-1", "start_ms": 3000, "end_ms": 6000},
+        {"id": clip_id_0, "start_ms": 0, "end_ms": 3000},
+        {"id": clip_id_1, "start_ms": 3000, "end_ms": 6000},
     ]
 
     def mock_start(project_id, request):
@@ -166,10 +185,11 @@ def test_prefetch_fire_and_forget(service_fixture):
 
     service.start_clip_preview = mock_start
 
+    user_request_id = uuid7()
     user_request = ClipPreviewRequest(
-        client_request_id="req-user",
-        edit_project_id="edit-123",
-        clip_id="clip-0",
+        client_request_id=user_request_id,
+        edit_project_id=edit_project_id,
+        clip_id=clip_id_0,
         timeline_revision=1,
         clip_revision=0,
         render_profile="draft",
@@ -179,7 +199,7 @@ def test_prefetch_fire_and_forget(service_fixture):
 
     # Ne doit pas lever d'exception
     result = service.start_clip_preview("project-123", user_request)
-    assert result["client_request_id"] == "req-user"
+    assert result["client_request_id"] == user_request_id
 
 
 @pytest.fixture
