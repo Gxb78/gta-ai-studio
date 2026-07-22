@@ -432,7 +432,7 @@ class StudioService:
                 "event": "preview.request.received",
                 "project_id": project_id,
                 "attributes": {
-                    "clip_id": request.clip_id,
+                    "clip_id": request.clip_snapshot.clip_id,
                     "render_profile": request.render_profile,
                     "timeline_revision": request.timeline_revision,
                     "origin": request.origin,
@@ -447,19 +447,23 @@ class StudioService:
         advanced_edit = production.get("advanced_edit")
         if not edit or not advanced_edit or str(edit["id"]) != request.edit_project_id:
             raise StudioError("TIMELINE_PREVIEW_REVISION_STALE", "Save or reload the current timeline revision before generating a preview.", status_code=409)
-        
+
         if int(edit["revision"]) != request.timeline_revision:
             raise StudioError("TIMELINE_PREVIEW_REVISION_MISMATCH", "Timeline revision mismatch.", status_code=409)
 
+        # Vérifier que le clip_id existe dans la révision
         clips = list(advanced_edit.get("clips", []))
-        clip = next((c for c in clips if c.get("id") == request.clip_id), None)
-        if clip is None:
+        clip_exists = any(c.get("id") == request.clip_snapshot.clip_id for c in clips)
+        if not clip_exists:
             raise StudioError("TIMELINE_CLIP_NOT_FOUND", "The selected clip does not exist.", status_code=404)
+
+        # Utiliser le snapshot reçu au lieu de recharger depuis la DB
+        clip = request.clip_snapshot.model_dump()
 
         media_record = self.repository.get_primary_media(project_id)
         resolved_profile = resolve_preview_profile(request.render_profile, self.renderer)
         preview_window = request.preview_window.model_dump() if request.preview_window else None
-        
+
         cache_key = _preview_cache_key(
             source_sha256=media_record["sha256"],
             clip=clip,
@@ -478,13 +482,13 @@ class StudioService:
                     "project_id": project_id,
                     "attributes": {
                         "cache_key": cache_key,
-                        "clip_id": request.clip_id,
+                        "clip_id": request.clip_snapshot.clip_id,
                         "hit_count": existing_entry.get("hit_count", 0),
                     },
                 },
             )
             self.repository.touch_preview_cache(cache_key)
-            self.repository.link_project_preview(project_id, cache_key, request.clip_id)
+            self.repository.link_project_preview(project_id, cache_key, request.clip_snapshot.clip_id)
             return PreviewResponse(
                 client_request_id=request.client_request_id,
                 job_run_id=None,
@@ -492,7 +496,7 @@ class StudioService:
                 cache_hit=True,
                 status="ready",
                 artifact_url=self._clip_preview_url(project_id, cache_key),
-                clip_id=request.clip_id,
+                clip_id=request.clip_snapshot.clip_id,
                 clip_revision=request.clip_revision,
                 timeline_revision=request.timeline_revision,
                 render_profile=request.render_profile,
@@ -506,13 +510,13 @@ class StudioService:
                     "project_id": project_id,
                     "attributes": {
                         "cache_key": cache_key,
-                        "clip_id": request.clip_id,
+                        "clip_id": request.clip_snapshot.clip_id,
                         "status": existing_entry["status"],
                         "job_run_id": existing_entry.get("job_run_id"),
                     },
                 },
             )
-            self.repository.link_project_preview(project_id, cache_key, request.clip_id)
+            self.repository.link_project_preview(project_id, cache_key, request.clip_snapshot.clip_id)
             return PreviewResponse(
                 client_request_id=request.client_request_id,
                 job_run_id=existing_entry["job_run_id"],
@@ -520,7 +524,7 @@ class StudioService:
                 cache_hit=True,
                 status=existing_entry["status"],  # type: ignore
                 artifact_url=None,
-                clip_id=request.clip_id,
+                clip_id=request.clip_snapshot.clip_id,
                 clip_revision=request.clip_revision,
                 timeline_revision=request.timeline_revision,
                 render_profile=request.render_profile,
@@ -528,14 +532,14 @@ class StudioService:
 
         parameters = {
             "edit_project_id": request.edit_project_id,
-            "clip_id": request.clip_id,
+            "clip_id": request.clip_snapshot.clip_id,
             "clip": clip,
             "composition": dict(production["brief"]["structured"].get("production", {})).get("composition", "smart_blur"),
             "resolved_profile": resolved_profile,
             "preview_window": preview_window,
             "cache_key": cache_key,
         }
-        
+
         job_id = self.repository.enqueue_job(
             project_id, "RENDER_CLIP_PREVIEW", parameters, cache_key, CLIP_PREVIEW_VERSION,
             idempotency_suffix=f":manual:{uuid7()}",
@@ -549,7 +553,7 @@ class StudioService:
                 "job_id": job_id,
                 "attributes": {
                     "cache_key": cache_key,
-                    "clip_id": request.clip_id,
+                    "clip_id": request.clip_snapshot.clip_id,
                     "render_profile": request.render_profile,
                     "origin": request.origin,
                 },
@@ -562,7 +566,7 @@ class StudioService:
             renderer_version=RENDER_VERSION,
             job_run_id=job_id,
         )
-        self.repository.link_project_preview(project_id, cache_key, request.clip_id)
+        self.repository.link_project_preview(project_id, cache_key, request.clip_snapshot.clip_id)
         self.repository.set_project_status(project_id, "ACTIVE")
 
         # Prefetch automatique des clips adjacents (non-récursif)
@@ -576,7 +580,7 @@ class StudioService:
             cache_hit=False,
             status="pending",
             artifact_url=None,
-            clip_id=request.clip_id,
+            clip_id=request.clip_snapshot.clip_id,
             clip_revision=request.clip_revision,
             timeline_revision=request.timeline_revision,
             render_profile=request.render_profile,

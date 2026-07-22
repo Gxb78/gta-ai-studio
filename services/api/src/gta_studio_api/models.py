@@ -98,12 +98,26 @@ class PreviewWindowRequest(ApiModel):
     playhead_ms: int = Field(ge=0)
     duration_ms: int = Field(ge=500, le=10_000, default=3000)
 
+
+class ClipPreviewSnapshot(ApiModel):
+    clip_id: str = Field(min_length=36, max_length=36)
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(gt=0)
+    duration_ms: int = Field(ge=250, le=180_000)
+    speed: float = Field(ge=0.5, le=2)
+    zoom: float = Field(ge=1, le=1.2)
+    focus_start_x: float = Field(ge=0, le=1)
+    focus_end_x: float = Field(ge=0, le=1)
+    focus_y: float = Field(ge=0, le=1)
+    reframe_mode: Literal["dynamic_crop", "fixed_crop", "blur_background", "split_screen"]
+
+
 class ClipPreviewRequest(ApiModel):
     client_request_id: str = Field(min_length=36, max_length=36)
     edit_project_id: Annotated[str, StringConstraints(min_length=36, max_length=36)]
-    clip_id: str = Field(min_length=36, max_length=36)
     timeline_revision: int = Field(ge=0)
     clip_revision: int = Field(ge=0, default=0)
+    clip_snapshot: ClipPreviewSnapshot
     render_profile: Literal["draft", "fidelity"] = "draft"
     preview_window: PreviewWindowRequest | None = None
     origin: Literal["user", "prefetch"] = "user"

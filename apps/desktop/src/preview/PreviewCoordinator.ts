@@ -37,12 +37,25 @@ export interface PreviewState {
   generation: number;
 }
 
+export interface ClipPreviewSnapshot {
+  clip_id: string;
+  start_ms: number;
+  end_ms: number;
+  duration_ms: number;
+  speed: number;
+  zoom: number;
+  focus_start_x: number;
+  focus_end_x: number;
+  focus_y: number;
+  reframe_mode: string;
+}
+
 export interface ClipPreviewRequest {
   client_request_id: string;
   edit_project_id: string;
-  clip_id: string;
   timeline_revision: number;
   clip_revision: number;
+  clip_snapshot: ClipPreviewSnapshot;
   render_profile: PreviewRenderProfile;
   preview_window: PreviewWindow | null;
   origin?: "user" | "prefetch";
@@ -148,9 +161,20 @@ export class PreviewCoordinator {
     const requestId = generateClientRequestId();
     const params: Omit<ClipPreviewRequest, 'client_request_id'> = {
       edit_project_id: editProjectId,
-      clip_id: clipId,
       timeline_revision: timelineRevision,
       clip_revision: 0, // Pour l'instant pas de révision de clip
+      clip_snapshot: {
+        clip_id: clip.id,
+        start_ms: clip.start_ms,
+        end_ms: clip.end_ms,
+        duration_ms: clip.duration_ms,
+        speed: clip.speed,
+        zoom: clip.zoom,
+        focus_start_x: clip.focus_start_x,
+        focus_end_x: clip.focus_end_x,
+        focus_y: clip.focus_y,
+        reframe_mode: clip.reframe_mode,
+      },
       render_profile: renderProfile,
       preview_window: previewWindow,
       origin: 'user', // Requête utilisateur, déclenche prefetch
@@ -198,9 +222,20 @@ export class PreviewCoordinator {
 
     const params: Omit<ClipPreviewRequest, 'client_request_id'> = {
       edit_project_id: editProjectId,
-      clip_id: clipId,
       timeline_revision: timelineRevision,
       clip_revision: 0,
+      clip_snapshot: {
+        clip_id: clip.id,
+        start_ms: clip.start_ms,
+        end_ms: clip.end_ms,
+        duration_ms: clip.duration_ms,
+        speed: clip.speed,
+        zoom: clip.zoom,
+        focus_start_x: clip.focus_start_x,
+        focus_end_x: clip.focus_end_x,
+        focus_y: clip.focus_y,
+        reframe_mode: clip.reframe_mode,
+      },
       render_profile: renderProfile,
       preview_window: previewWindow,
     };
