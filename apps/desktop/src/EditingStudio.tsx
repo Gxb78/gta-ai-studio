@@ -71,6 +71,7 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
     clientRequestId: null,
     jobRunId: null,
     cacheKey: null,
+    cacheHit: false,
     artifactUrl: null,
     error: null,
     lastInteractionMs: 0,
@@ -195,14 +196,14 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
 
     // Déclencher automatiquement la preview après modification
     const clip = clips[index];
-    if (clip && coordinatorRef.current && production && editProjectId) {
+    if (clip && coordinatorRef.current && edit && editor) {
       const updatedClip = { ...clip, ...values };
       coordinatorRef.current.requestPreview(
-        projectId,
-        editProjectId,
+        project.id,
+        editor.edit_project_id,
         updatedClip,
-        advanced_edit.revision,
-        'draft', // Par défaut en draft pour les modifications
+        editor.revision,
+        'draft',
         null,
       );
     }
