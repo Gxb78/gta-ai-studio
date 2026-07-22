@@ -52,7 +52,7 @@ export const InteractivePreview: React.FC<InteractivePreviewProps> = ({
 
   // Calculer le transform CSS pour Niveau A
   const cssTransform = useMemo(() => {
-    if (mode === 'before_after' || status !== 'interactive') {
+    if (mode === 'before_after') {
       return null;
     }
 
@@ -69,7 +69,7 @@ export const InteractivePreview: React.FC<InteractivePreviewProps> = ({
       clip.focus_y,
       clip.zoom,
     );
-  }, [clip, sourceWidth, sourceHeight, outputWidth, outputHeight, mode, status, playheadMs]);
+  }, [clip, sourceWidth, sourceHeight, outputWidth, outputHeight, mode, playheadMs]);
 
   // Synchroniser playhead externe avec video
   useEffect(() => {
