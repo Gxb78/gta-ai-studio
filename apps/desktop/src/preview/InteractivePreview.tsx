@@ -50,6 +50,12 @@ export const InteractivePreview: React.FC<InteractivePreviewProps> = ({
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTimeMs, setCurrentTimeMs] = useState(0);
 
+  // Calculer le temps source dans le rush (accounting for clip timing and speed)
+  const sourceTimeMs = useMemo(() => {
+    if (playheadMs === undefined) return 0;
+    return clip.start_ms + playheadMs * clip.speed;
+  }, [clip.start_ms, clip.speed, playheadMs]);
+
   // Calculer le transform CSS pour Niveau A
   const cssTransform = useMemo(() => {
     if (mode === 'before_after') {
@@ -71,15 +77,15 @@ export const InteractivePreview: React.FC<InteractivePreviewProps> = ({
     );
   }, [clip, sourceWidth, sourceHeight, outputWidth, outputHeight, mode, playheadMs]);
 
-  // Synchroniser playhead externe avec video
+  // Synchroniser playhead externe avec video source
   useEffect(() => {
-    if (videoRef.current && playheadMs !== undefined) {
-      const targetSec = playheadMs / 1000;
+    if (videoRef.current && sourceTimeMs !== undefined) {
+      const targetSec = sourceTimeMs / 1000;
       if (Math.abs(videoRef.current.currentTime - targetSec) > 0.1) {
         videoRef.current.currentTime = targetSec;
       }
     }
-  }, [playheadMs]);
+  }, [sourceTimeMs]);
 
   // Mettre à jour currentTime
   const handleTimeUpdate = () => {
