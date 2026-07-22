@@ -474,6 +474,15 @@ class Repository:
             )
             self._audit(connection, str(row["project_id"]), job_id, "job.cancel_requested", {})
 
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+
+        return self._job_dict(row) if row else None
+
     def retry_latest_failed_job(self, project_id: str) -> str:
         with self.database.connect() as connection:
             row = connection.execute(
