@@ -1,0 +1,14 @@
+{
+  "id": "studio.game-adapter.gta6",
+  "game_id": "gta6",
+  "version": "0.0.0",
+  "contract_version": "1.0",
+  "display_name": "GTA VI",
+  "implementation_status": "NOT_IMPLEMENTED_PHASE_11",
+  "supported_game_versions": [],
+  "supported_locales": ["fr-FR", "en-US"],
+  "capabilities": [],
+  "knowledge_namespace": "gta6",
+  "enabled": false
+}
+

@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "id": "studio.overlay.tutorial",
+  "version": "1.0.0",
+  "editorial_style": "tutorial",
+  "font_family": "Segoe UI",
+  "accent_color": "#67D8FF",
+  "secondary_color": "#FFFFFF",
+  "safe_area": {"top": 0.08, "right": 0.06, "bottom": 0.16, "left": 0.06},
+  "motion": {"zoom_menu": 1.12, "zoom_proof": 1.14, "max_speed": 1.25, "transition_ms": 100, "dynamic_reframe_threshold": 0.36},
+  "density": {"max_overlays": 7, "min_gap_ms": 700, "title_duration_ms": 1600, "step_duration_ms": 1500, "proof_duration_ms": 1300},
+  "audio_mix": {"target_lufs": -14.0, "true_peak_db": -1.0, "lra": 7.0, "ducking_threshold": 0.022, "ducking_ratio": 10.0, "attack_ms": 15, "release_ms": 240, "ambient_highpass_hz": 60, "ambient_lowpass_hz": 14000}
+}

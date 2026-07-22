@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0",
+  "adapter_id": "studio.game-adapter.gta5",
+  "locales": ["fr-FR", "en-US"],
+  "menu_rules": [
+    {
+      "id": "pause",
+      "label": "Menu pause probable",
+      "keywords": ["carte", "map", "en ligne", "online", "amis", "friends", "paramètres", "settings", "statistiques", "stats"]
+    },
+    {
+      "id": "workshop",
+      "label": "Menu atelier probable",
+      "keywords": ["armure", "armor", "freins", "brakes", "moteur", "engine", "peinture", "respray", "jantes", "wheels", "aileron", "spoiler", "suspension", "transmission", "turbo"]
+    },
+    {
+      "id": "interaction",
+      "label": "Menu interaction probable",
+      "keywords": ["menu interaction", "interaction menu", "inventaire", "inventory", "style", "véhicules", "vehicles"]
+    }
+  ],
+  "event_rules": [
+    {
+      "event_type": "mission_success_text",
+      "label": "Texte de réussite probable",
+      "keywords": ["mission passed", "mission réussie", "mission accomplie", "succès"]
+    },
+    {
+      "event_type": "mission_failure_text",
+      "label": "Texte d’échec probable",
+      "keywords": ["mission failed", "mission échouée", "échec", "failed"]
+    },
+    {
+      "event_type": "player_down_text",
+      "label": "Écran de mise hors combat probable",
+      "keywords": ["wasted", "busted", "mort", "arrêté"]
+    }
+  ],
+  "guided_intents": [
+    {
+      "intent": "workshop",
+      "brief_keywords": ["atelier", "customisation", "customiser", "modifier", "peinture", "jantes", "aileron"],
+      "detection_labels": ["menu.workshop", "workshop_menu_entered"]
+    },
+    {
+      "intent": "mission",
+      "brief_keywords": ["mission", "objectif", "réussite", "récompense", "échec"],
+      "detection_labels": ["mission_success_text", "mission_failure_text"]
+    },
+    {
+      "intent": "menu",
+      "brief_keywords": ["menu", "carte", "paramètre", "inventaire"],
+      "detection_labels": ["menu.pause", "menu.interaction", "menu.workshop"]
+    },
+    {
+      "intent": "action",
+      "brief_keywords": ["conduite", "course", "vitesse", "combat", "action", "poursuite"],
+      "detection_labels": ["high_motion", "gameplay_candidate"]
+    }
+  ],
+  "stop_words": [
+    "alors", "avec", "avoir", "cette", "comme", "dans", "des", "donc", "elle", "faire", "les", "mais", "mon", "montrer", "nous", "pour", "présenter", "que", "qui", "rush", "sans", "sur", "une", "vidéo"
+  ]
+}

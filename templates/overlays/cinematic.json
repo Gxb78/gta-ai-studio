@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "id": "studio.overlay.cinematic",
+  "version": "1.0.0",
+  "editorial_style": "cinematic",
+  "font_family": "Segoe UI Semibold",
+  "accent_color": "#FFC95C",
+  "secondary_color": "#F5F0E8",
+  "safe_area": {"top": 0.08, "right": 0.06, "bottom": 0.16, "left": 0.06},
+  "motion": {"zoom_menu": 1.05, "zoom_proof": 1.08, "max_speed": 1.15, "transition_ms": 180, "dynamic_reframe_threshold": 0.42},
+  "density": {"max_overlays": 4, "min_gap_ms": 1000, "title_duration_ms": 1900, "step_duration_ms": 1500, "proof_duration_ms": 1400},
+  "audio_mix": {"target_lufs": -15.0, "true_peak_db": -1.2, "lra": 10.0, "ducking_threshold": 0.028, "ducking_ratio": 7.0, "attack_ms": 30, "release_ms": 380, "ambient_highpass_hz": 50, "ambient_lowpass_hz": 15000}
+}
