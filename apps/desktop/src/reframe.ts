@@ -51,8 +51,11 @@ export function computeCropRect(
 }
 
 /**
- * Compute the CSS transform style for a video element inside an overflow:hidden container.
+ * Compute the CSS positioning style for a video element inside an overflow:hidden container.
  * The container dimensions match the output dimensions.
+ *
+ * This uses percentage-based positioning derived from the normalized crop rectangle
+ * to ensure exact visual parity with FFmpeg crop filter.
  */
 export function computePreviewTransform(
   proxyWidth: number,
@@ -62,21 +65,21 @@ export function computePreviewTransform(
   focusX: number,
   focusY: number,
   zoom: number,
-): { transform: string; transformOrigin: string } {
+): { width: string; height: string; left: string; top: string } {
   const crop = computeCropRect(
     proxyWidth, proxyHeight,
     outputWidth, outputHeight,
     focusX, focusY, zoom,
   );
 
-  const scaleX = 1 / crop.cropWidth;
-  const scaleY = 1 / crop.cropHeight;
-  const translateX = -crop.cropX * proxyWidth;
-  const translateY = -crop.cropY * proxyHeight;
-
+  // Position video using normalized crop rectangle
+  // Video fills container by scaling to 1/cropWidth × 1/cropHeight
+  // Then offset by -cropX and -cropY (as percentage of scaled size)
   return {
-    transformOrigin: "0 0",
-    transform: `scale(${scaleX}, ${scaleY}) translate(${translateX}px, ${translateY}px)`,
+    width: `${(100 / crop.cropWidth).toFixed(4)}%`,
+    height: `${(100 / crop.cropHeight).toFixed(4)}%`,
+    left: `${(-(crop.cropX / crop.cropWidth) * 100).toFixed(4)}%`,
+    top: `${(-(crop.cropY / crop.cropHeight) * 100).toFixed(4)}%`,
   };
 }
 

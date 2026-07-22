@@ -150,16 +150,17 @@ export const InteractivePreview: React.FC<InteractivePreviewProps> = ({
 
       <div className="relative w-full h-full overflow-hidden">
         {mode === 'cropped' && isInteractiveMode ? (
-          // Niveau A: CSS transform pour preview interactive
+          // Niveau A: CSS percentage-based positioning for interactive preview
           <video
             ref={videoRef}
             src={activeVideoUrl}
             style={{
-              width: '100%',
-              height: '100%',
-              objectFit: 'none',
-              transformOrigin: cssTransform.transformOrigin,
-              transform: cssTransform.transform,
+              position: 'absolute',
+              width: cssTransform.width,
+              height: cssTransform.height,
+              left: cssTransform.left,
+              top: cssTransform.top,
+              objectFit: 'fill',
             }}
             onTimeUpdate={handleTimeUpdate}
             onClick={togglePlay}
