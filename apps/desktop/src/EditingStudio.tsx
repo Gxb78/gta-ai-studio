@@ -92,9 +92,14 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
   const focusX = selected ? selected.focus_start_x + (selected.focus_end_x - selected.focus_start_x) * selectedProgress : 0.5;
   const focusY = selected?.focus_y ?? 0.5;
   const preview = editor?.previews.find((item) => item.clip_index === selectedIndex);
-  const mediaUrl = project.production.render_url
+
+  // Source proxy pour Niveau A (toujours proxy/original, jamais le rendu final)
+  const sourceProxyUrl = project.proxy ? `${api.proxyUrl(project.id)}?v=${project.proxy.sha256}` : null;
+
+  // Rendu final pour comparaison/lecture
+  const finalRenderUrl = project.production.render_url
     ? `${api.renderUrl(project.id)}?v=${project.production.render?.artifact_id ?? "final"}`
-    : project.proxy ? `${api.proxyUrl(project.id)}?v=${project.proxy.sha256}` : null;
+    : null;
 
   // Ref pour suivre le clip sélectionné dans le callback subscribe
   const selectedIdRef = useRef<string | null>(null);
@@ -356,10 +361,10 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
                "RENDRE L'APERÇU"}
             </button>
           </div>
-          {mediaUrl && selected ? (
+          {sourceProxyUrl && selected ? (
             <InteractivePreview
               clip={selected}
-              sourceVideoUrl={mediaUrl}
+              sourceVideoUrl={sourceProxyUrl}
               sourceWidth={project.media[0]?.width || 1920}
               sourceHeight={project.media[0]?.height || 1080}
               outputWidth={1080}
