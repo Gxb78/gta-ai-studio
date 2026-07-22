@@ -75,6 +75,7 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
     artifactUrl: null,
     error: null,
     lastInteractionMs: 0,
+    generation: 0,
   });
   const [viewMode, setViewMode] = useState<PreviewViewMode>("cropped");
   const [renderProfile, setRenderProfile] = useState<PreviewRenderProfile>("draft");

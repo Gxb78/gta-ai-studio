@@ -34,6 +34,7 @@ export interface PreviewState {
   artifactUrl: string | null;
   error: string | null;
   lastInteractionMs: number;
+  generation: number;
 }
 
 export interface ClipPreviewRequest {
@@ -60,6 +61,8 @@ export class PreviewCoordinator {
   private states: Map<string, PreviewState> = new Map();
   private pendingRequests: Map<string, PendingRequest> = new Map();
   private listeners: Set<PreviewStateChangeCallback> = new Set();
+  private generations: Map<string, number> = new Map();
+  private abortControllers: Map<string, AbortController> = new Map();
   private debounceMs: number;
   private apiBaseUrl: string;
 
@@ -80,6 +83,16 @@ export class PreviewCoordinator {
     this.listeners.forEach(cb => cb(clipId, state));
   }
 
+  private nextGeneration(clipId: string): number {
+    const generation = (this.generations.get(clipId) ?? 0) + 1;
+    this.generations.set(clipId, generation);
+    return generation;
+  }
+
+  private isCurrent(clipId: string, generation: number): boolean {
+    return this.generations.get(clipId) === generation;
+  }
+
   /**
    * Obtenir l'état actuel d'un clip
    */
@@ -93,6 +106,7 @@ export class PreviewCoordinator {
       artifactUrl: null,
       error: null,
       lastInteractionMs: 0,
+      generation: 0,
     };
   }
 
@@ -121,10 +135,14 @@ export class PreviewCoordinator {
     // Annuler toute requête en attente pour ce clip
     this.cancelPending(clipId);
 
+    // Générer nouvelle génération
+    const generation = this.nextGeneration(clipId);
+
     // Marquer comme dirty puis debouncing
     this.setState(clipId, {
       status: 'dirty',
       lastInteractionMs: now,
+      generation,
     });
 
     const requestId = generateClientRequestId();
@@ -141,7 +159,7 @@ export class PreviewCoordinator {
     // Lancer le debounce
     const timeoutId = window.setTimeout(() => {
       this.pendingRequests.delete(clipId);
-      this.executePreviewRequest(projectId, clipId, requestId, params);
+      this.executePreviewRequest(projectId, clipId, requestId, params, generation);
     }, this.debounceMs);
 
     this.pendingRequests.set(clipId, {
@@ -154,6 +172,7 @@ export class PreviewCoordinator {
     this.setState(clipId, {
       status: 'debouncing',
       clientRequestId: requestId,
+      generation,
     });
   }
 
@@ -174,6 +193,9 @@ export class PreviewCoordinator {
 
     this.cancelPending(clipId);
 
+    // Générer nouvelle génération
+    const generation = this.nextGeneration(clipId);
+
     const params: Omit<ClipPreviewRequest, 'client_request_id'> = {
       edit_project_id: editProjectId,
       clip_id: clipId,
@@ -186,9 +208,10 @@ export class PreviewCoordinator {
     this.setState(clipId, {
       status: 'queued',
       clientRequestId: requestId,
+      generation,
     });
 
-    this.executePreviewRequest(projectId, clipId, requestId, params);
+    this.executePreviewRequest(projectId, clipId, requestId, params, generation);
   }
 
   /**
@@ -199,6 +222,13 @@ export class PreviewCoordinator {
     if (pending) {
       window.clearTimeout(pending.timeoutId);
       this.pendingRequests.delete(clipId);
+    }
+
+    // Annuler la requête HTTP en cours
+    const controller = this.abortControllers.get(clipId);
+    if (controller) {
+      controller.abort();
+      this.abortControllers.delete(clipId);
     }
   }
 
@@ -229,16 +259,19 @@ export class PreviewCoordinator {
     clipId: string,
     requestId: string,
     params: Omit<ClipPreviewRequest, 'client_request_id'>,
+    generation: number,
   ): Promise<void> {
-    const state = this.getState(clipId);
-
     // Latest-request-wins: ignorer si une requête plus récente existe
-    if (state.clientRequestId && state.clientRequestId > requestId) {
-      console.log(`[PreviewCoordinator] Ignoring stale request ${requestId} for clip ${clipId}`);
+    if (!this.isCurrent(clipId, generation)) {
+      console.log(`[PreviewCoordinator] Ignoring stale request ${requestId} (gen ${generation}) for clip ${clipId}`);
       return;
     }
 
     this.setState(clipId, { status: 'queued' });
+
+    // Créer AbortController pour cette requête
+    const controller = new AbortController();
+    this.abortControllers.set(clipId, controller);
 
     try {
       const response = await fetch(`${this.apiBaseUrl}/api/v1/projects/${projectId}/timeline/preview`, {
@@ -248,6 +281,7 @@ export class PreviewCoordinator {
           client_request_id: requestId,
           ...params,
         }),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -258,9 +292,8 @@ export class PreviewCoordinator {
       const data: PreviewResponse = await response.json();
 
       // Latest-request-wins: vérifier que c'est toujours la dernière requête
-      const currentState = this.getState(clipId);
-      if (currentState.clientRequestId && currentState.clientRequestId > requestId) {
-        console.log(`[PreviewCoordinator] Response for stale request ${requestId}, ignoring`);
+      if (!this.isCurrent(clipId, generation)) {
+        console.log(`[PreviewCoordinator] Response for stale request ${requestId} (gen ${generation}), ignoring`);
         return;
       }
 
@@ -285,13 +318,18 @@ export class PreviewCoordinator {
           cacheHit: false,
           error: null,
         });
-        this.pollJobStatus(projectId, clipId, requestId, data.job_run_id);
+        this.pollJobStatus(projectId, clipId, requestId, data.job_run_id, generation);
       } else {
         throw new Error('Invalid response: no artifact_url and no job_run_id');
       }
     } catch (err) {
-      const currentState = this.getState(clipId);
-      if (currentState.clientRequestId && currentState.clientRequestId > requestId) {
+      // Ignorer AbortError si la requête a été annulée
+      if (err instanceof Error && err.name === 'AbortError') {
+        console.log(`[PreviewCoordinator] Request aborted for clip ${clipId}`);
+        return;
+      }
+
+      if (!this.isCurrent(clipId, generation)) {
         return; // Ignorer l'erreur si requête obsolète
       }
 
@@ -299,6 +337,8 @@ export class PreviewCoordinator {
         status: 'failed',
         error: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      this.abortControllers.delete(clipId);
     }
   }
 
@@ -310,6 +350,7 @@ export class PreviewCoordinator {
     clipId: string,
     requestId: string,
     jobRunId: string,
+    generation: number,
   ): Promise<void> {
     const maxAttempts = 60; // 60 * 2s = 2 minutes max
     let attempts = 0;
@@ -318,9 +359,8 @@ export class PreviewCoordinator {
       attempts++;
 
       // Latest-request-wins
-      const currentState = this.getState(clipId);
-      if (currentState.clientRequestId && currentState.clientRequestId > requestId) {
-        console.log(`[PreviewCoordinator] Stopping poll for stale request ${requestId}`);
+      if (!this.isCurrent(clipId, generation)) {
+        console.log(`[PreviewCoordinator] Stopping poll for stale request ${requestId} (gen ${generation})`);
         return;
       }
 
@@ -340,8 +380,7 @@ export class PreviewCoordinator {
           const artifactUrl = `${this.apiBaseUrl}/api/v1/projects/${projectId}/previews/${state.cacheKey}`;
 
           // Latest-request-wins final check
-          const finalState = this.getState(clipId);
-          if (finalState.clientRequestId && finalState.clientRequestId > requestId) {
+          if (!this.isCurrent(clipId, generation)) {
             return;
           }
 
@@ -371,8 +410,7 @@ export class PreviewCoordinator {
           setTimeout(poll, 2000);
         }
       } catch (err) {
-        const finalState = this.getState(clipId);
-        if (finalState.clientRequestId && finalState.clientRequestId > requestId) {
+        if (!this.isCurrent(clipId, generation)) {
           return;
         }
 
