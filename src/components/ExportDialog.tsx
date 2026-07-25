@@ -10,13 +10,8 @@ import { clipEndMs, formatTime, sortClips, timelineGaps, usedSources } from "../
  * Ordre temporel : une entrée FFmpeg par rush utilisé, chaque segment pointant
  * vers la sienne et précédé de son éventuel trou (noir silencieux).
  */
-function buildRequest(
-  sources: Record<string, SourceInfo>,
-  clips: Clip[],
-): Pick<ExportRequest, "sources" | "segments" | "hasAudio" | "frameWidth" | "frameHeight" | "frameFps"> {
-  const used = usedSources(sources, clips);
-  const indexOf = new Map(used.map((source, index) => [source.id, index]));
-
+/** Segments d'un plan, chacun précédé de son éventuel silence ou noir. */
+function toSegments(clips: Clip[], indexOf: Map<string, number>): ExportSegment[] {
   let cursor = 0;
   const segments: ExportSegment[] = [];
   for (const clip of sortClips(clips)) {
@@ -30,6 +25,22 @@ function buildRequest(
     });
     cursor = clipEndMs(clip);
   }
+  return segments;
+}
+
+function buildRequest(
+  sources: Record<string, SourceInfo>,
+  clips: Clip[],
+  audioClips: Clip[],
+): Pick<
+  ExportRequest,
+  "sources" | "segments" | "audioSegments" | "hasAudio" | "frameWidth" | "frameHeight" | "frameFps"
+> {
+  // Les deux plans partagent la même liste de rushs : les index concordent.
+  const used = usedSources(sources, clips.concat(audioClips));
+  const indexOf = new Map(used.map((source, index) => [source.id, index]));
+  const segments = toSegments(clips, indexOf);
+  const audioSegments = toSegments(audioClips, indexOf);
 
   // Le format de sortie est imposé par le premier rush : tous les autres y sont
   // ramenés avant concaténation, sinon FFmpeg refuse d'assembler les flux.
@@ -37,7 +48,9 @@ function buildRequest(
   return {
     sources: used.map((source) => ({ path: source.originalPath, hasAudio: source.probe.hasAudio })),
     segments,
-    hasAudio: used.some((source) => source.probe.hasAudio),
+    audioSegments,
+    // Un montage sans aucun clip sonore sort muet, plutôt que du silence encodé.
+    hasAudio: audioSegments.length > 0 && used.some((source) => source.probe.hasAudio),
     frameWidth: reference?.probe.width ?? 1920,
     frameHeight: reference?.probe.height ?? 1080,
     frameFps: reference?.probe.fps ?? 30,
@@ -46,14 +59,17 @@ function buildRequest(
 
 interface Props {
   sources: Record<string, SourceInfo>;
+  /** Plan vidéo. */
   clips: Clip[];
+  /** Plan audio, indépendant du plan vidéo. */
+  audioClips: Clip[];
   defaultName: string;
   onClose: () => void;
 }
 
 type Phase = "config" | "running" | "done" | "error";
 
-export function ExportDialog({ sources, clips, defaultName, onClose }: Props) {
+export function ExportDialog({ sources, clips, audioClips, defaultName, onClose }: Props) {
   const [mode, setMode] = useState<ExportMode>("crop");
   const [fileName, setFileName] = useState(defaultName);
   const [phase, setPhase] = useState<Phase>("config");
@@ -86,7 +102,7 @@ export function ExportDialog({ sources, clips, defaultName, onClose }: Props) {
     setPercent(0);
     try {
       const path = await exportTimeline({
-        ...buildRequest(sources, clips),
+        ...buildRequest(sources, clips, audioClips),
         mode,
         fileName: sanitized,
       });

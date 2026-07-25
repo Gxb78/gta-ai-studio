@@ -559,6 +559,21 @@ body.moving, body.moving * { cursor: grabbing !important; }
   z-index: 2;
 }
 
+/* Clip dont le son ne participe pas au montage. */
+.clip-muted {
+  position: absolute;
+  bottom: calc(var(--audio-h, 28px) + 6px);
+  left: 8px;
+  display: grid;
+  place-items: center;
+  color: var(--warn);
+  background: rgba(8, 10, 15, 0.72);
+  border-radius: 5px;
+  padding: 3px;
+  pointer-events: none;
+  z-index: 2;
+}
+
 /* Provenance du clip. N'apparaît que si le projet contient plusieurs rushs. */
 .clip-source {
   position: absolute;

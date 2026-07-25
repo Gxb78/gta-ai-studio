@@ -773,6 +773,11 @@ const ClipView = memo(function ClipView(props: {
         />
       )}
       <span className="clip-duration">{formatTime(clipDurationMs(clip))}</span>
+      {!clip.audioEnabled && (
+        <span className="clip-muted" title="Son coupé — la piste du dessous continue de s'entendre">
+          <Icon name="soundOff" size={13} />
+        </span>
+      )}
       {multiSource && (
         <span className="clip-source" title={source.originalPath}>
           {sourceLabel(source)}

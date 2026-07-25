@@ -60,6 +60,13 @@ export interface Clip {
   timelineStartMs: number;
   srcInMs: number;
   srcOutMs: number;
+  /**
+   * Le son de ce clip participe-t-il au montage ?
+   *
+   * Par défaut vrai sur la piste principale et faux sur les surcouches : poser
+   * un plan de coupe ne doit pas couper le son de ce qui se joue en dessous.
+   */
+  audioEnabled: boolean;
 }
 
 /** Nombre de pistes à afficher : la plus haute occupée, plus une vide au-dessus. */
@@ -79,8 +86,13 @@ export const clipsOnTrack = (clips: Clip[], track: number): Clip[] =>
  * se chevauchent jamais — exactement ce que consomment déjà le lecteur et
  * l'export, qui n'ont donc pas à connaître la notion de piste.
  */
-export function flattenTracks(clips: Clip[], hiddenTracks?: ReadonlySet<number>): Clip[] {
-  const visible = hiddenTracks ? clips.filter((clip) => !hiddenTracks.has(clip.track)) : clips;
+export function flattenTracks(
+  clips: Clip[],
+  hiddenTracks?: ReadonlySet<number>,
+  keep?: (clip: Clip) => boolean,
+): Clip[] {
+  let visible = hiddenTracks ? clips.filter((clip) => !hiddenTracks.has(clip.track)) : clips;
+  if (keep) visible = visible.filter(keep);
   if (visible.length === 0) return [];
 
   const edges = new Set<number>();
@@ -112,6 +124,7 @@ export function flattenTracks(clips: Clip[], hiddenTracks?: ReadonlySet<number>)
       timelineStartMs: from,
       srcInMs: top.srcInMs + offset,
       srcOutMs: top.srcInMs + offset + (to - from),
+      audioEnabled: top.audioEnabled,
     };
 
     // Deux tronçons consécutifs du même rush qui se suivent aussi dans le temps
@@ -178,7 +191,10 @@ export interface ExportSegment {
 
 export interface ExportRequest {
   sources: ExportSource[];
+  /** Plan vidéo : ce qui se voit. */
   segments: ExportSegment[];
+  /** Plan audio : ce qui s'entend. Indépendant du plan vidéo. */
+  audioSegments: ExportSegment[];
   mode: ExportMode;
   fileName: string;
   /** Vrai si au moins un rush a du son : les autres reçoivent du silence. */
@@ -243,6 +259,25 @@ export function clipAt(sorted: Clip[], timelineMs: number): TimelinePosition | n
   }
   return null;
 }
+
+/**
+ * Les deux plans dérivés du montage. Ils ont des sémantiques différentes et ne
+ * doivent surtout pas être confondus :
+ *
+ *   VIDÉO = sélection — un seul clip visible à la fois, celui de la piste la
+ *   plus haute qui couvre l'instant.
+ *   AUDIO = ce qui s'entend — indépendant de ce qui se voit, pour qu'une
+ *   surcouche muette laisse passer le son de la piste du dessous.
+ *
+ * À ce palier, l'audio est encore résolu par priorité de piste parmi les seuls
+ * clips sonores. Le mixage de plusieurs sources simultanées viendra ensuite et
+ * ne touchera QUE `resolveAudioPlan`.
+ */
+export const resolveVideoPlan = (clips: Clip[], hiddenTracks?: ReadonlySet<number>): Clip[] =>
+  flattenTracks(clips, hiddenTracks);
+
+export const resolveAudioPlan = (clips: Clip[], hiddenTracks?: ReadonlySet<number>): Clip[] =>
+  flattenTracks(clips, hiddenTracks, (clip) => clip.audioEnabled);
 
 /** Vrai si l'intervalle est libre sur cette piste. */
 export function trackIsFree(clips: Clip[], track: number, startMs: number, endMs: number): boolean {
@@ -395,10 +430,14 @@ export function closeGaps(clips: Clip[]): Clip[] {
 }
 
 /** Forme d'un clip tel qu'il peut sortir du disque, tous formats confondus. */
-export type StoredClip = Omit<Clip, "timelineStartMs" | "sourceId" | "track"> & {
+export type StoredClip = Omit<
+  Clip,
+  "timelineStartMs" | "sourceId" | "track" | "audioEnabled"
+> & {
   timelineStartMs?: number | null;
   sourceId?: string | null;
   track?: number | null;
+  audioEnabled?: boolean | null;
 };
 
 /** Forme d'un projet tel qu'il peut sortir du disque, tous formats confondus. */
@@ -434,13 +473,17 @@ export function migrateProject(stored: StoredProject): Project {
     cursor = timelineStartMs + (clip.srcOutMs - clip.srcInMs);
     const sourceId = clip.sourceId ?? fallbackId;
     if (!sources[sourceId]) continue;
+    const track = typeof clip.track === "number" && clip.track >= 0 ? Math.floor(clip.track) : 0;
     clips.push({
       id: clip.id,
       sourceId,
-      track: typeof clip.track === "number" && clip.track >= 0 ? Math.floor(clip.track) : 0,
+      track,
       timelineStartMs,
       srcInMs: clip.srcInMs,
       srcOutMs: clip.srcOutMs,
+      // Projets antérieurs au son par clip : la piste principale s'entend,
+      // les surcouches sont muettes, ce qui reconduit leur comportement.
+      audioEnabled: typeof clip.audioEnabled === "boolean" ? clip.audioEnabled : track === 0,
     });
   }
 

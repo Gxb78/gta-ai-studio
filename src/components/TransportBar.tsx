@@ -13,6 +13,9 @@ interface Props {
   canUndo: boolean;
   canRedo: boolean;
   hasSelection: boolean;
+  /** Le clip sélectionné participe-t-il au montage sonore ? */
+  selectionAudible: boolean;
+  onToggleClipAudio: () => void;
   showGuide: boolean;
   onTogglePlay: () => void;
   onSplit: () => void;
@@ -97,6 +100,14 @@ export function TransportBar(props: Props) {
 
         <div className="btn-group">
           <IconButton icon="split" label="Couper au playhead" shortcut="S" onClick={props.onSplit} />
+          <IconButton
+            icon={props.selectionAudible ? "sound" : "soundOff"}
+            label={props.selectionAudible ? "Couper le son du clip" : "Rendre le son au clip"}
+            shortcut="M"
+            onClick={props.onToggleClipAudio}
+            disabled={!props.hasSelection}
+            active={props.hasSelection && !props.selectionAudible}
+          />
           <IconButton
             icon="trash"
             label="Supprimer le clip"

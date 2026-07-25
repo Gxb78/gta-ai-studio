@@ -108,7 +108,12 @@ pub struct ExportSource {
 #[serde(rename_all = "camelCase")]
 pub struct ExportRequest {
     pub sources: Vec<ExportSource>,
+    /// Plan vidéo : ce qui se voit.
     pub segments: Vec<ExportSegment>,
+    /// Plan audio : ce qui s'entend. Indépendant du plan vidéo, pour qu'une
+    /// surcouche muette laisse passer le son de la piste du dessous.
+    #[serde(default)]
+    pub audio_segments: Vec<ExportSegment>,
     pub mode: String,
     pub file_name: String,
     /// Vrai si au moins un rush a du son : les autres reçoivent du silence.
@@ -554,6 +559,21 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     // Graphe de filtres : chaque trou devient du noir silencieux, chaque clip un
     // trim du rush ; on concatène le tout, puis on passe en 9:16.
     // Les entrées lavfi (noir, silence) ne sont ajoutées que si un trou existe.
+    // Les deux plans sont assemblés séparément puis mappés ensemble : l'image
+    // vient du plan vidéo, le son du plan audio.
+    let total_video_ms: f64 = request
+        .segments
+        .iter()
+        .map(|s| s.src_out_ms - s.src_in_ms + s.gap_before_ms)
+        .sum();
+    let total_audio_ms: f64 = request
+        .audio_segments
+        .iter()
+        .map(|s| s.src_out_ms - s.src_in_ms + s.gap_before_ms)
+        .sum();
+    // Le son doit couvrir toute la durée de l'image : on complète au silence.
+    let audio_tail_ms = (total_video_ms - total_audio_ms).max(0.0);
+
     let has_gap = request.segments.iter().any(|s| s.gap_before_ms > 0.0);
     // Les rushs occupent les entrées 0..n ; les sources synthétiques (noir,
     // silence) viennent juste après.
@@ -575,9 +595,10 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     );
     const AFMT: &str = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo";
     let mut graph = String::new();
+
+    // --- Branche vidéo : uniquement le plan vidéo -------------------------------
     let mut parts: Vec<usize> = Vec::new();
     let mut next_label = 0usize;
-
     for segment in &request.segments {
         if segment.gap_before_ms > 0.0 {
             let duration = segment.gap_before_ms / 1000.0;
@@ -585,11 +606,6 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
             graph += &format!(
                 "[{black_input}:v]trim=duration={duration:.3},setpts=PTS-STARTPTS,{vfmt}[v{i}];"
             );
-            if request.has_audio {
-                graph += &format!(
-                    "[{silence_input}:a]atrim=duration={duration:.3},asetpts=PTS-STARTPTS,{AFMT}[a{i}];"
-                );
-            }
             parts.push(i);
             next_label += 1;
         }
@@ -600,21 +616,45 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         graph += &format!(
             "[{input}:v]trim=start={start:.3}:end={end:.3},setpts=PTS-STARTPTS,{vfmt}[v{i}];"
         );
-        if request.has_audio {
+        parts.push(i);
+        next_label += 1;
+    }
+
+    // --- Branche audio : uniquement le plan audio -------------------------------
+    let mut audio_parts: Vec<usize> = Vec::new();
+    let mut next_audio = 0usize;
+    if request.has_audio {
+        let push_silence = |graph: &mut String, duration: f64, index: &mut usize| {
+            let i = *index;
+            graph.push_str(&format!(
+                "[{silence_input}:a]atrim=duration={duration:.3},asetpts=PTS-STARTPTS,{AFMT}[a{i}];"
+            ));
+            *index += 1;
+            i
+        };
+        for segment in &request.audio_segments {
+            if segment.gap_before_ms > 0.0 {
+                audio_parts.push(push_silence(&mut graph, segment.gap_before_ms / 1000.0, &mut next_audio));
+            }
+            let start = segment.src_in_ms / 1000.0;
+            let end = segment.src_out_ms / 1000.0;
+            let input = segment.source_index;
             if request.sources[input].has_audio {
+                let i = next_audio;
                 graph += &format!(
                     "[{input}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{AFMT}[a{i}];"
                 );
+                audio_parts.push(i);
+                next_audio += 1;
             } else {
-                // Rush muet : on fabrique le silence de la bonne durée.
                 let duration = (segment.src_out_ms - segment.src_in_ms) / 1000.0;
-                graph += &format!(
-                    "[{silence_input}:a]atrim=duration={duration:.3},asetpts=PTS-STARTPTS,{AFMT}[a{i}];"
-                );
+                audio_parts.push(push_silence(&mut graph, duration, &mut next_audio));
             }
         }
-        parts.push(i);
-        next_label += 1;
+        // Le plan audio peut s'arrêter avant l'image : on complète au silence.
+        if audio_tail_ms > 1.0 {
+            audio_parts.push(push_silence(&mut graph, audio_tail_ms / 1000.0, &mut next_audio));
+        }
     }
 
     let n = parts.len();
@@ -623,16 +663,19 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     }
     for i in &parts {
         graph += &format!("[v{i}]");
-        if request.has_audio {
+    }
+    graph += &format!("concat=n={n}:v=1:a=0[vc];");
+
+    if request.has_audio {
+        let m = audio_parts.len();
+        if m > MAX_SEGMENTS {
+            return Err(format!("Trop de segments sonores ({MAX_SEGMENTS} maximum)."));
+        }
+        for i in &audio_parts {
             graph += &format!("[a{i}]");
         }
+        graph += &format!("concat=n={m}:v=0:a=1[ac];");
     }
-    let audio_flag = if request.has_audio { 1 } else { 0 };
-    graph += &format!("concat=n={n}:v=1:a={audio_flag}[vc]");
-    if request.has_audio {
-        graph += "[ac]";
-    }
-    graph += ";";
     match request.mode.as_str() {
         "crop" => {
             graph += "[vc]crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=1080:1920:flags=lanczos,setsar=1[vout]";
@@ -645,11 +688,7 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         }
     }
 
-    let total_ms: f64 = request
-        .segments
-        .iter()
-        .map(|s| s.src_out_ms - s.src_in_ms + s.gap_before_ms)
-        .sum();
+    let total_ms = total_video_ms;
 
     let partial = exports_dir.join(format!(".partial-{}.mp4", std::process::id()));
     let _ = fs::remove_file(&partial);

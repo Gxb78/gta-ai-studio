@@ -39,9 +39,9 @@ export interface PlaybackApi {
 }
 
 /** Positionne une balise, en attendant ses métadonnées si elle charge encore. */
-const pendingSeeks = new WeakMap<HTMLVideoElement, () => void>();
+const pendingSeeks = new WeakMap<HTMLMediaElement, () => void>();
 
-function seekWhenReady(video: HTMLVideoElement, timeSec: number): void {
+function seekWhenReady(video: HTMLMediaElement, timeSec: number): void {
   const previous = pendingSeeks.get(video);
   if (previous) previous();
   if (video.readyState >= 1) {
@@ -61,19 +61,25 @@ function seekWhenReady(video: HTMLVideoElement, timeSec: number): void {
 }
 
 /** Charge le rush voulu si besoin, puis positionne la balise. */
-function assign(video: HTMLVideoElement, source: SourceInfo, srcMs: number): void {
-  if (video.dataset.sourceId !== source.id) {
-    video.dataset.sourceId = source.id;
-    video.src = mediaUrl(source.proxyPath);
-    video.load();
+function assign(media: HTMLMediaElement, source: SourceInfo, srcMs: number): void {
+  if (media.dataset.sourceId !== source.id) {
+    media.dataset.sourceId = source.id;
+    media.src = mediaUrl(source.proxyPath);
+    media.load();
   }
-  seekWhenReady(video, Math.max(0, srcMs) / 1000);
+  seekWhenReady(media, Math.max(0, srcMs) / 1000);
 }
+
+/** Écart au-delà duquel on recale le son sur l'image plutôt que de le laisser dériver. */
+const AUDIO_DRIFT_MS = 120;
 
 export function usePlayback(
   videoA: React.RefObject<HTMLVideoElement | null>,
   videoB: React.RefObject<HTMLVideoElement | null>,
+  audioA: React.RefObject<HTMLAudioElement | null>,
+  audioB: React.RefObject<HTMLAudioElement | null>,
   clips: Clip[],
+  audioClips: Clip[],
   sources: Record<string, SourceInfo>,
 ): PlaybackApi {
   const [playing, setPlaying] = useState(false);
@@ -90,6 +96,11 @@ export function usePlayback(
 
   const clipsRef = useRef(clips);
   clipsRef.current = clips;
+  const audioClipsRef = useRef(audioClips);
+  audioClipsRef.current = audioClips;
+  /** Balise sonore active, et clip déjà préchargé sur l'autre. */
+  const audioActiveIsARef = useRef(true);
+  const primedAudioIdRef = useRef<string | null>(null);
   const sourcesRef = useRef(sources);
   sourcesRef.current = sources;
 
@@ -119,9 +130,11 @@ export function usePlayback(
   const pause = useCallback(() => {
     videoA.current?.pause();
     videoB.current?.pause();
+    audioA.current?.pause();
+    audioB.current?.pause();
     stopLoop();
     setPlaying(false);
-  }, [stopLoop, videoA, videoB]);
+  }, [audioA, audioB, stopLoop, videoA, videoB]);
 
   /** Prépare la balise inactive sur le clip qui suit, sans la jouer. */
   const ensurePrimed = useCallback(
@@ -164,13 +177,76 @@ export function usePlayback(
     [ensurePrimed, getActive],
   );
 
+  /**
+   * Cale le son sur le playhead, indépendamment de ce qui est à l'image.
+   *
+   * L'image reste maître du temps ; le son suit et se recale s'il dérive. C'est
+   * ce découplage qui permet à la piste principale de continuer à s'entendre
+   * pendant qu'une surcouche muette occupe l'écran.
+   */
+  const syncAudio = useCallback(
+    (timelineMs: number, shouldPlay: boolean) => {
+      const elements = [audioA.current, audioB.current];
+      const sorted = sortClips(audioClipsRef.current);
+      const position = clipAt(sorted, timelineMs);
+
+      if (!position) {
+        for (const element of elements) element?.pause();
+        primedAudioIdRef.current = null;
+        return;
+      }
+
+      const clip = sorted[position.clipIndex];
+      const source = sourcesRef.current[clip.sourceId];
+      if (!source) return;
+
+      // Changement de segment : on bascule sur la balise déjà préchargée.
+      const currentId = audioActiveIsARef.current ? audioA.current : audioB.current;
+      if (currentId && currentId.dataset.clipId !== clip.id) {
+        if (primedAudioIdRef.current === clip.id) {
+          audioActiveIsARef.current = !audioActiveIsARef.current;
+          primedAudioIdRef.current = null;
+        }
+      }
+
+      const active = audioActiveIsARef.current ? audioA.current : audioB.current;
+      const idle = audioActiveIsARef.current ? audioB.current : audioA.current;
+      if (!active) return;
+
+      const targetMs = clip.srcInMs + position.offsetMs;
+      if (active.dataset.clipId !== clip.id) {
+        active.dataset.clipId = clip.id;
+        assign(active, source, targetMs);
+      } else if (Math.abs(active.currentTime * 1000 - targetMs) > AUDIO_DRIFT_MS) {
+        seekWhenReady(active, targetMs / 1000);
+      }
+
+      if (shouldPlay && active.paused) void active.play().catch(() => undefined);
+      if (!shouldPlay && !active.paused) active.pause();
+      idle?.pause();
+
+      // Préchargement du segment sonore suivant.
+      const upcoming = sorted[position.clipIndex + 1];
+      if (idle && upcoming && primedAudioIdRef.current !== upcoming.id) {
+        const nextSource = sourcesRef.current[upcoming.sourceId];
+        if (nextSource) {
+          primedAudioIdRef.current = upcoming.id;
+          idle.dataset.clipId = upcoming.id;
+          assign(idle, nextSource, upcoming.srcInMs);
+        }
+      }
+    },
+    [audioA, audioB],
+  );
+
   const seek = useCallback(
     (timelineMs: number) => {
       const clamped = Math.max(0, Math.min(timelineMs, timelineDurationMs(clipsRef.current)));
       applyPosition(clamped);
+      syncAudio(clamped, false);
       setPlayhead(clamped);
     },
-    [applyPosition, setPlayhead],
+    [applyPosition, setPlayhead, syncAudio],
   );
 
   /** Bascule sur la balise préchargée : c'est l'opération qui rend la jonction invisible. */
@@ -260,8 +336,11 @@ export function usePlayback(
         setInGap(true);
       }
     }
+    // Le son se recale sur le playhead à chaque image, sans dépendre de ce qui
+    // est affiché : une surcouche muette laisse donc passer le son du dessous.
+    syncAudio(playheadRef.current, true);
     rafRef.current = requestAnimationFrame(loop);
-  }, [applyPosition, ensurePrimed, getActive, getIdle, pause, setPlayhead, swap]);
+  }, [applyPosition, ensurePrimed, getActive, getIdle, pause, setPlayhead, swap, syncAudio]);
 
   const play = useCallback(() => {
     const sorted = sortClips(clipsRef.current);
@@ -276,8 +355,9 @@ export function usePlayback(
     if (clipAt(sorted, playheadRef.current)) {
       void getActive()?.play().catch(() => undefined);
     }
+    syncAudio(playheadRef.current, true);
     rafRef.current = requestAnimationFrame(loop);
-  }, [getActive, loop, seek, stopLoop]);
+  }, [getActive, loop, seek, stopLoop, syncAudio]);
 
   const toggle = useCallback(() => {
     if (playing) pause();

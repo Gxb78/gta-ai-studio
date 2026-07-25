@@ -9,7 +9,7 @@ import { importSource, loadLastProject, pickVideoFile, saveProject } from "./ipc
 import { usePlayback } from "./playback/usePlayback";
 import { editorReducer, effectiveClips, initialEditorState, newClipId } from "./state/editor";
 import type { Project, SourceInfo } from "./types";
-import { ASSET_VERSION, clipAt, flattenTracks, frameMs, sortClips } from "./types";
+import { ASSET_VERSION, clipAt, frameMs, resolveAudioPlan, resolveVideoPlan, sortClips } from "./types";
 
 /** Référence stable : évite de recréer un objet vide à chaque rendu. */
 const EMPTY_SOURCES: Record<string, SourceInfo> = {};
@@ -23,13 +23,17 @@ export default function App() {
   // Deux balises : celle qui est masquée précharge le clip suivant.
   const videoA = useRef<HTMLVideoElement | null>(null);
   const videoB = useRef<HTMLVideoElement | null>(null);
+  // Balises sonores : le son suit le plan audio, pas le plan vidéo.
+  const audioA = useRef<HTMLAudioElement | null>(null);
+  const audioB = useRef<HTMLAudioElement | null>(null);
 
   const clips = effectiveClips(state);
   const sources = state.project?.sources ?? EMPTY_SOURCES;
   // Le lecteur et l'export ne connaissent pas les pistes : ils consomment le
   // montage APLATI, où la piste la plus haute a déjà gagné à chaque instant.
-  const flatClips = useMemo(() => flattenTracks(state.clips), [state.clips]);
-  const playback = usePlayback(videoA, videoB, flatClips, sources);
+  const videoPlan = useMemo(() => resolveVideoPlan(state.clips), [state.clips]);
+  const audioPlan = useMemo(() => resolveAudioPlan(state.clips), [state.clips]);
+  const playback = usePlayback(videoA, videoB, audioA, audioB, videoPlan, audioPlan, sources);
 
   // Reprendre le dernier projet au lancement. Si les fichiers dérivés d'un rush
   // datent d'une version antérieure, on les régénère : l'import réutilise le
@@ -82,6 +86,7 @@ export default function App() {
           timelineStartMs: 0,
           srcInMs: 0,
           srcOutMs: source.probe.durationMs,
+          audioEnabled: true,
         },
       ],
       createdAt: now,
@@ -130,6 +135,10 @@ export default function App() {
     Object.values(sources)[0]?.probe.fps ??
     30;
 
+  const toggleClipAudio = useCallback(() => {
+    if (state.selectedClipId) dispatch({ type: "TOGGLE_CLIP_AUDIO", clipId: state.selectedClipId });
+  }, [state.selectedClipId]);
+
   // Trim au clavier : précision à l'image quel que soit le zoom.
   const trimSelected = useCallback(
     (side: "left" | "right", mode: { deltaMs: number } | { toPlayhead: true }) => {
@@ -176,6 +185,8 @@ export default function App() {
       ) {
         event.preventDefault();
         dispatch({ type: "REDO" });
+      } else if (event.key === "m" || event.key === "M") {
+        toggleClipAudio();
       } else if (event.key === "i" || event.key === "I") {
         trimSelected("left", { toPlayhead: true });
       } else if (event.key === "o" || event.key === "O") {
@@ -198,7 +209,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [deleteSelected, exporting, playback, splitAtPlayhead, state.project, trimSelected]);
+  }, [deleteSelected, exporting, playback, splitAtPlayhead, state.project, toggleClipAudio, trimSelected]);
 
   if (!state.project) {
     return <ImportView onImported={handleImported} />;
@@ -215,6 +226,8 @@ export default function App() {
         canRedo={state.future.length > 0}
         showGuide={showGuide}
         hasSelection={state.selectedClipId !== null}
+        selectionAudible={selectedClip?.audioEnabled ?? true}
+        onToggleClipAudio={toggleClipAudio}
         onTogglePlay={playback.toggle}
         onSplit={splitAtPlayhead}
         onShowShortcuts={() => setShowShortcuts(true)}
@@ -234,6 +247,8 @@ export default function App() {
       <PreviewPlayer
         videoA={videoA}
         videoB={videoB}
+        audioA={audioA}
+        audioB={audioB}
         activeIsA={playback.activeIsA}
         showGuide={showGuide}
         inGap={playback.inGap}
@@ -267,7 +282,8 @@ export default function App() {
       {exporting && (
         <ExportDialog
           sources={sources}
-          clips={flatClips}
+          clips={videoPlan}
+          audioClips={audioPlan}
           defaultName={`${state.project.name} tiktok`}
           onClose={() => setExporting(false)}
         />

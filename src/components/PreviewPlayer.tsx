@@ -6,6 +6,9 @@
 interface Props {
   videoA: React.RefObject<HTMLVideoElement | null>;
   videoB: React.RefObject<HTMLVideoElement | null>;
+  /** Balises sonores : le son est découplé de l'image (voir usePlayback). */
+  audioA: React.RefObject<HTMLAudioElement | null>;
+  audioB: React.RefObject<HTMLAudioElement | null>;
   /** Balise actuellement visible. */
   activeIsA: boolean;
   showGuide: boolean;
@@ -14,7 +17,16 @@ interface Props {
   onTogglePlay: () => void;
 }
 
-export function PreviewPlayer({ videoA, videoB, activeIsA, showGuide, inGap, onTogglePlay }: Props) {
+export function PreviewPlayer({
+  videoA,
+  videoB,
+  audioA,
+  audioB,
+  activeIsA,
+  showGuide,
+  inGap,
+  onTogglePlay,
+}: Props) {
   return (
     <div className="preview-area">
       <div
@@ -24,8 +36,24 @@ export function PreviewPlayer({ videoA, videoB, activeIsA, showGuide, inGap, onT
         tabIndex={-1}
         title="Cliquer pour lire ou mettre en pause"
       >
-        <video ref={videoA} className={"preview-video" + (activeIsA ? " visible" : "")} preload="auto" playsInline />
-        <video ref={videoB} className={"preview-video" + (activeIsA ? "" : " visible")} preload="auto" playsInline />
+        {/* Les balises vidéo sont MUETTES : tout le son passe par les balises
+            audio, seules à connaître le plan sonore. */}
+        <video
+          ref={videoA}
+          className={"preview-video" + (activeIsA ? " visible" : "")}
+          preload="auto"
+          playsInline
+          muted
+        />
+        <video
+          ref={videoB}
+          className={"preview-video" + (activeIsA ? "" : " visible")}
+          preload="auto"
+          playsInline
+          muted
+        />
+        <audio ref={audioA} preload="auto" />
+        <audio ref={audioB} preload="auto" />
         {inGap && (
           <div className="preview-gap">
             <span>Trou — écran noir</span>

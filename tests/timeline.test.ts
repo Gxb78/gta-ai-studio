@@ -5,6 +5,8 @@ import {
   clipEndMs,
   firstFreeTrack,
   flattenTracks,
+  resolveAudioPlan,
+  resolveVideoPlan,
   timelineGaps,
   type Clip,
   type SourceInfo,
@@ -22,7 +24,15 @@ const clip = (
   srcIn: number,
   dur: number,
   sourceId = `S${track}`,
-): Clip => ({ id, sourceId, track, timelineStartMs: start, srcInMs: srcIn, srcOutMs: srcIn + dur });
+): Clip => ({
+  id,
+  sourceId,
+  track,
+  timelineStartMs: start,
+  srcInMs: srcIn,
+  srcOutMs: srcIn + dur,
+  audioEnabled: track === 0,
+});
 
 let failures = 0;
 function check(label: string, actual: unknown, expected: unknown): void {
@@ -257,6 +267,48 @@ check(
 );
 
 // --- Parité lecteur / export -------------------------------------------------
+
+// --- Plans vidéo et audio ----------------------------------------------------
+
+// La règle du palier : la surcouche remplace l'IMAGE, mais son son est coupé
+// par défaut, donc c'est le son de la piste principale qui continue.
+console.log("Plans vidéo et audio séparés");
+const avecSurcouche = [clip("bas", 0, 0, 0, 20000), clip("haut", 1, 5000, 0, 10000)];
+check(
+  "l'image passe à la surcouche",
+  summary(resolveVideoPlan(avecSurcouche)),
+  ["S0:0-5000@0", "S1:5000-15000@0", "S0:15000-20000@15000"],
+);
+check(
+  "le son de la principale continue, sans coupure",
+  summary(resolveAudioPlan(avecSurcouche)),
+  ["S0:0-20000@0"],
+);
+
+const surcoucheSonore = [
+  clip("bas", 0, 0, 0, 20000),
+  { ...clip("haut", 1, 5000, 0, 10000), audioEnabled: true },
+];
+check(
+  "une surcouche rendue sonore reprend la main sur le son",
+  summary(resolveAudioPlan(surcoucheSonore)),
+  ["S0:0-5000@0", "S1:5000-15000@0", "S0:15000-20000@15000"],
+);
+
+const toutMuet = [{ ...clip("bas", 0, 0, 0, 20000), audioEnabled: false }];
+check("un montage entièrement muet donne un plan audio vide", resolveAudioPlan(toutMuet).length, 0);
+
+console.log("Bascule du son par le réducteur");
+const coupe = editorReducer(stateWith(avecSurcouche, "bas"), {
+  type: "TOGGLE_CLIP_AUDIO",
+  clipId: "bas",
+});
+check(
+  "couper le son du clip principal vide le plan audio",
+  resolveAudioPlan(coupe.clips).length,
+  0,
+);
+check("l'image, elle, ne change pas", summary(resolveVideoPlan(coupe.clips)).length, 3);
 
 // Le lecteur et l'export consomment la MÊME liste (flattenTracks). On vérifie
 // ici que cette liste est un montage continu, sans trou ni recouvrement, donc

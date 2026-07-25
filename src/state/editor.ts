@@ -62,6 +62,8 @@ export type EditorAction =
   | { type: "GESTURE_CANCEL" }
   /** Trim committé d'un coup (clavier) : une seule entrée d'historique. */
   | { type: "TRIM_EDGE"; clipId: string; side: "left" | "right"; edgeSrcMs: number }
+  /** Fait entrer ou sortir un clip du montage sonore. */
+  | { type: "TOGGLE_CLIP_AUDIO"; clipId: string }
   | { type: "CLOSE_GAPS" }
   | { type: "UNDO" }
   | { type: "REDO" };
@@ -139,13 +141,16 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       const startMs = Math.max(0, action.atMs);
       const endMs = startMs + action.source.probe.durationMs;
       const fromTrack = state.clips.find((c) => c.id === state.selectedClipId)?.track ?? 0;
+      const track = firstFreeTrack(state.clips, startMs, endMs, fromTrack);
       const clip: Clip = {
         id: newClipId(),
         sourceId: action.source.id,
-        track: firstFreeTrack(state.clips, startMs, endMs, fromTrack),
+        track,
         timelineStartMs: startMs,
         srcInMs: 0,
         srcOutMs: action.source.probe.durationMs,
+        // Une surcouche arrive muette : elle ne doit pas couper le son du dessous.
+        audioEnabled: track === 0,
       };
       return {
         ...pushHistory(state, [...state.clips, clip]),
@@ -185,6 +190,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         timelineStartMs: action.timelineMs,
         srcInMs: cutSrc,
         srcOutMs: clip.srcOutMs,
+        audioEnabled: clip.audioEnabled,
       };
       const next = state.clips.map((c) => (c.id === clip.id ? left : c));
       next.push(right);
@@ -247,6 +253,15 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         applyTrim(clip, action.side, action.edgeSrcMs, { ...limits, sourceDurationMs: durationOf(clip) }),
       );
       if (!next) return state;
+      return pushHistory(state, next);
+    }
+
+    case "TOGGLE_CLIP_AUDIO": {
+      const target = state.clips.find((clip) => clip.id === action.clipId);
+      if (!target) return state;
+      const next = state.clips.map((clip) =>
+        clip.id === action.clipId ? { ...clip, audioEnabled: !clip.audioEnabled } : clip,
+      );
       return pushHistory(state, next);
     }
 
