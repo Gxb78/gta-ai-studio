@@ -148,6 +148,17 @@ class Storage:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
+    def preview_cache_path(self, cache_key: str) -> Path:
+        """Global preview cache path (not project-specific)."""
+        if not re.fullmatch(r"[0-9a-f]{64}", cache_key):
+            raise StudioError("STORAGE_INVALID_CACHE_KEY", "Invalid preview cache key.", status_code=500)
+        # Sharding: ab/cd/abcdef...
+        prefix = cache_key[:2]
+        subdir = cache_key[2:4]
+        path = self._inside(self.data_dir / "cache" / "previews" / prefix / subdir / f"{cache_key}.mp4")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
     def link_project_proxy(self, project_id: str, cache_path: Path) -> Path:
         destination = self._inside(self.prepare_project(project_id) / "proxy" / "proxy.mp4")
         if destination.exists():

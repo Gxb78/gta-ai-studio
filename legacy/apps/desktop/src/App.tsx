@@ -186,7 +186,10 @@ export function App() {
     }
   };
 
-  const activeJob = project?.jobs.find((job) => ["QUEUED", "BLOCKED", "LEASED", "RUNNING", "RETRY_WAIT"].includes(job.status));
+  const activeJob = project?.jobs.find((job) =>
+    job.kind !== "RENDER_CLIP_PREVIEW" &&
+    ["QUEUED", "BLOCKED", "LEASED", "RUNNING", "RETRY_WAIT"].includes(job.status)
+  );
   const globalProgress = useMemo(() => {
     if (!project) return 0;
     if (project.run_status === "COMPLETED") return 100;

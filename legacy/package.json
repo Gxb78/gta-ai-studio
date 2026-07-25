@@ -1,0 +1,32 @@
+{
+  "name": "gta-ai-studio",
+  "version": "0.7.2",
+  "private": true,
+  "description": "Local-first GTA video production studio with a non-destructive timeline editor.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=10.0.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/start-dev.ps1",
+    "dev:web": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/start-dev.ps1 -Frontend web",
+    "dev:api": "uv run --project services/api uvicorn gta_studio_api.main:app --app-dir services/api/src --host 127.0.0.1 --port 8765",
+    "dev:desktop": "npm run dev --workspace @gta-ai-studio/desktop",
+    "build:desktop": "npm run build --workspace @gta-ai-studio/desktop",
+    "typecheck": "npm run typecheck --workspace @gta-ai-studio/desktop && tsc -p tsconfig.json --noEmit",
+    "test:ts": "tsx --test tests/unit/typescript/*.test.ts",
+    "test:py": "uv run --project packages/contracts/python pytest tests/unit/python",
+    "test:api": "uv run --project services/api pytest tests/integration/api",
+    "test": "npm run typecheck && npm run test:ts && npm run test:py && npm run test:api"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

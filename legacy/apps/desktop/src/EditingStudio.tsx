@@ -66,6 +66,10 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
   const [previewing, setPreviewing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Boucle A : État transitoire pour interactions immédiates
+  const [transientClip, setTransientClip] = useState<AdvancedEditingClip | null>(null);
+  const [transientClipIndex, setTransientClipIndex] = useState<number | null>(null);
+
   const [previewState, setPreviewState] = useState<PreviewState>({
     status: "interactive",
     clientRequestId: null,
@@ -85,7 +89,12 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
   const overlays = history.present.overlays;
   const totalDuration = clips.reduce((sum, clip) => sum + clip.duration_ms, 0) || 1;
   const dirty = signature(history.present) !== savedSignature;
-  const selected = clips[selectedIndex] ?? null;
+
+  // Utiliser transientClip si disponible, sinon le clip commité
+  const selected = (transientClipIndex === selectedIndex && transientClip)
+    ? transientClip
+    : clips[selectedIndex] ?? null;
+
   const selectedStart = clipStart(clips, selectedIndex);
   const localPosition = Math.max(0, positionMs - selectedStart);
   const selectedProgress = selected ? Math.min(1, localPosition / Math.max(1, selected.duration_ms)) : 0;
@@ -200,7 +209,7 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
   function updateClip(index: number, values: Partial<AdvancedEditingClip>) {
     commit((snapshot) => ({ ...snapshot, clips: normalizeClips(snapshot.clips.map((clip, clipIndex) => clipIndex === index ? { ...clip, ...values } : clip)) }));
 
-    // Déclencher automatiquement la preview après modification
+    // Déclencher automatiquement la preview après modification (Boucle B)
     const clip = clips[index];
     if (clip && coordinatorRef.current && edit && editor) {
       const updatedClip = { ...clip, ...values };
@@ -212,6 +221,81 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
         'draft',
         null,
       );
+    }
+  }
+
+  function updateClipTransient(index: number, values: Partial<AdvancedEditingClip>) {
+    // Boucle A : mise à jour transitoire sans commit
+    const baseClip = clips[index];
+    if (!baseClip) return;
+    const updated = { ...baseClip, ...values };
+    setTransientClip(updated);
+    setTransientClipIndex(index);
+  }
+
+  function commitTransientClip() {
+    // Fin de Boucle A : commit de l'état transitoire
+    if (transientClip !== null && transientClipIndex !== null) {
+      const baseClip = clips[transientClipIndex];
+      if (!baseClip) {
+        setTransientClip(null);
+        setTransientClipIndex(null);
+        return;
+      }
+
+      // Créer un objet avec les différences
+      const changes: Partial<AdvancedEditingClip> = {};
+      let hasChanges = false;
+
+      // Comparer et copier les différences
+      if (transientClip.focus_start_x !== baseClip.focus_start_x) {
+        changes.focus_start_x = transientClip.focus_start_x;
+        hasChanges = true;
+      }
+      if (transientClip.focus_end_x !== baseClip.focus_end_x) {
+        changes.focus_end_x = transientClip.focus_end_x;
+        hasChanges = true;
+      }
+      if (transientClip.focus_y !== baseClip.focus_y) {
+        changes.focus_y = transientClip.focus_y;
+        hasChanges = true;
+      }
+      if (transientClip.duration_ms !== baseClip.duration_ms) {
+        changes.duration_ms = transientClip.duration_ms;
+        hasChanges = true;
+      }
+      if (transientClip.speed !== baseClip.speed) {
+        changes.speed = transientClip.speed;
+        hasChanges = true;
+      }
+      if (transientClip.tracking_method !== baseClip.tracking_method) {
+        changes.tracking_method = transientClip.tracking_method;
+        hasChanges = true;
+      }
+
+      if (hasChanges) {
+        commit((snapshot) => ({
+          ...snapshot,
+          clips: normalizeClips(snapshot.clips.map((clip, clipIndex) =>
+            clipIndex === transientClipIndex ? { ...clip, ...changes } : clip
+          ))
+        }));
+
+        // Déclencher preview après commit (Boucle B avec debounce)
+        if (coordinatorRef.current && edit && editor) {
+          coordinatorRef.current.requestPreview(
+            project.id,
+            editor.edit_project_id,
+            transientClip,
+            editor.revision,
+            'draft',
+            null,
+          );
+        }
+      }
+
+      setTransientClip(null);
+      setTransientClipIndex(null);
     }
   }
 
@@ -261,18 +345,27 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
   function startResize(event: React.PointerEvent<HTMLSpanElement>, index: number) {
     event.preventDefault(); event.stopPropagation();
     const originX = event.clientX;
-    const origin = cloneSnapshot(history.present);
-    const originDuration = origin.clips[index]?.duration_ms ?? 1000;
+    const originClip = clips[index];
+    if (!originClip) return;
+    const originDuration = originClip.duration_ms;
     const pixelsPerSecond = 55 * zoom;
+
     const onMove = (moveEvent: PointerEvent) => {
+      // Boucle A : mise à jour transitoire pendant le drag
       const duration = Math.max(250, Math.round((originDuration + (moveEvent.clientX - originX) / pixelsPerSecond * 1000) / 50) * 50);
-      setHistory((current) => ({ ...current, present: { ...current.present, clips: normalizeClips(current.present.clips.map((clip, clipIndex) => clipIndex === index ? { ...clip, duration_ms: duration, speed: Math.max(0.5, Math.min(2, clip.source_duration_ms / duration)) } : clip)) }, future: [] }));
+      const speed = Math.max(0.5, Math.min(2, originClip.source_duration_ms / duration));
+      updateClipTransient(index, { duration_ms: duration, speed });
     };
+
     const onUp = () => {
-      setHistory((current) => signature(current.present) === signature(origin) ? current : ({ past: [...history.past.slice(-79), origin], present: current.present, future: [] }));
-      window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp);
+      // Fin de Boucle A : commit l'état transitoire
+      commitTransientClip();
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
     };
-    window.addEventListener("pointermove", onMove); window.addEventListener("pointerup", onUp);
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   }
 
   function updateOverlay(index: number, values: Partial<EditableOverlay>) {
@@ -386,9 +479,9 @@ export function EditingStudio({ project, onProject }: { project: Project; onProj
           {selected && <>
             <label>Mode<select value={selected.reframe_mode} onChange={(event) => updateClip(selectedIndex, { reframe_mode: event.target.value as AdvancedEditingClip["reframe_mode"] })}><option value="dynamic_crop">Suivi dynamique</option><option value="fixed_crop">Crop stable</option><option value="blur_background">Cadre immersif</option><option value="split_screen">Avant / après</option></select></label>
             <div className="inspector-grid"><label>Entrée source<input type="number" min="0" step="100" value={selected.start_ms} onChange={(event) => { const start = Number(event.target.value); const source = selected.end_ms - start; updateClip(selectedIndex, { start_ms: start, source_duration_ms: source, speed: Math.max(0.5, Math.min(2, source / selected.duration_ms)) }); }} /></label><label>Sortie source<input type="number" min={selected.start_ms + 1} step="100" value={selected.end_ms} onChange={(event) => { const end = Number(event.target.value); const source = end - selected.start_ms; updateClip(selectedIndex, { end_ms: end, source_duration_ms: source, speed: Math.max(0.5, Math.min(2, source / selected.duration_ms)) }); }} /></label><label>Durée montage<input type="number" min="250" step="50" value={selected.duration_ms} onChange={(event) => { const duration = Number(event.target.value); updateClip(selectedIndex, { duration_ms: duration, speed: Math.max(0.5, Math.min(2, selected.source_duration_ms / duration)) }); }} /></label><label>Zoom<input type="number" min="1" max="1.2" step="0.01" value={selected.zoom} onChange={(event) => updateClip(selectedIndex, { zoom: Number(event.target.value), zoom_reason: "manual" })} /></label></div>
-            <label>Focus début <b>{Math.round(selected.focus_start_x * 100)}%</b><input type="range" min="0" max="1" step="0.01" value={selected.focus_start_x} onChange={(event) => updateClip(selectedIndex, { focus_start_x: Number(event.target.value), tracking_method: "manual_keyframe" })} /></label>
-            <label>Focus fin <b>{Math.round(selected.focus_end_x * 100)}%</b><input type="range" min="0" max="1" step="0.01" value={selected.focus_end_x} onChange={(event) => updateClip(selectedIndex, { focus_end_x: Number(event.target.value), tracking_method: "manual_keyframe" })} /></label>
-            <label>Hauteur <b>{Math.round(selected.focus_y * 100)}%</b><input type="range" min="0" max="1" step="0.01" value={selected.focus_y} onChange={(event) => updateClip(selectedIndex, { focus_y: Number(event.target.value), tracking_method: "manual_keyframe" })} /></label>
+            <label>Focus début <b>{Math.round(selected.focus_start_x * 100)}%</b><input type="range" min="0" max="1" step="0.01" value={selected.focus_start_x} onInput={(event) => updateClipTransient(selectedIndex, { focus_start_x: Number(event.currentTarget.value), tracking_method: "manual_keyframe" })} onChange={() => commitTransientClip()} /></label>
+            <label>Focus fin <b>{Math.round(selected.focus_end_x * 100)}%</b><input type="range" min="0" max="1" step="0.01" value={selected.focus_end_x} onInput={(event) => updateClipTransient(selectedIndex, { focus_end_x: Number(event.currentTarget.value), tracking_method: "manual_keyframe" })} onChange={() => commitTransientClip()} /></label>
+            <label>Hauteur <b>{Math.round(selected.focus_y * 100)}%</b><input type="range" min="0" max="1" step="0.01" value={selected.focus_y} onInput={(event) => updateClipTransient(selectedIndex, { focus_y: Number(event.currentTarget.value), tracking_method: "manual_keyframe" })} onChange={() => commitTransientClip()} /></label>
             <button className="regenerate-clip" disabled={previewing} onClick={() => void regenerateSelected()}>{previewing ? "PRÉPARATION…" : "↻ RÉGÉNÉRER UNIQUEMENT CE PLAN"}</button>
             {preview && <video className="clip-preview-player" controls src={`${api.clipPreviewUrl(project.id, editor.edit_project_id, selectedIndex)}?v=${preview.sha256}`} />}
           </>}

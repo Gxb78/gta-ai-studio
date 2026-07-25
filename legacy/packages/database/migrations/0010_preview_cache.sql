@@ -16,7 +16,8 @@ CREATE TABLE preview_cache_entries (
     created_at        TEXT NOT NULL,
     last_accessed_at  TEXT NOT NULL,
     hit_count         INTEGER NOT NULL DEFAULT 0,
-    ref_count         INTEGER NOT NULL DEFAULT 0,
+    linked_project_count INTEGER NOT NULL DEFAULT 0,
+    pin_count         INTEGER NOT NULL DEFAULT 0,
     job_run_id        TEXT REFERENCES job_runs(id) ON DELETE SET NULL
 ) STRICT;
 
@@ -35,14 +36,14 @@ CREATE INDEX ix_project_preview_refs_cache
     ON project_preview_cache_refs(cache_key);
 
 CREATE INDEX ix_preview_cache_status
-    ON preview_cache_entries(status, ref_count);
+    ON preview_cache_entries(status, pin_count);
 
--- Trigger: décrémenter ref_count lors de la suppression d'une ref
+-- Trigger: décrémenter linked_project_count lors de la suppression d'une ref
 CREATE TRIGGER tg_preview_ref_decrement
 AFTER DELETE ON project_preview_cache_refs
 BEGIN
     UPDATE preview_cache_entries
-    SET ref_count = ref_count - 1
+    SET linked_project_count = linked_project_count - 1
     WHERE cache_key = OLD.cache_key;
 END;
 

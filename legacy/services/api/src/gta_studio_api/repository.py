@@ -221,6 +221,7 @@ class Repository:
         *,
         dependencies: list[str] | None = None,
         idempotency_suffix: str = "",
+        priority: int = 50,
     ) -> str:
         idempotency_key = f"{kind}:{algorithm_version}:{fingerprint(parameters)}:{input_fingerprint}{idempotency_suffix}"
         dependencies = dependencies or []
@@ -240,13 +241,14 @@ class Repository:
                     id, project_id, kind, status, priority, idempotency_key,
                     input_fingerprint, algorithm_version, parameters_json,
                     attempt, max_attempts, progress, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, 0, 3, 0, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 3, 0, ?, ?)
                 """,
                 (
                     job_id,
                     project_id,
                     kind,
                     status,
+                    priority,
                     idempotency_key,
                     input_fingerprint,
                     algorithm_version,
@@ -262,6 +264,54 @@ class Repository:
                 )
             self._audit(connection, project_id, job_id, "job.queued", {"kind": kind, "status": status})
             return job_id
+
+    def claim_preview_job(self, worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
+        """Claim a preview job specifically (RENDER_CLIP_PREVIEW only). Separate queue from main pipeline."""
+        now = datetime.now(UTC)
+        now_text = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        expires = (now + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        with self.database.transaction() as connection:
+            # Cancel requested preview jobs
+            connection.execute(
+                "UPDATE job_runs SET status = 'CANCELLED', completed_at = ?, updated_at = ? WHERE kind = 'RENDER_CLIP_PREVIEW' AND status IN ('QUEUED', 'BLOCKED', 'RETRY_WAIT') AND cancel_requested_at IS NOT NULL",
+                (now_text, now_text),
+            )
+            # Retry preview jobs
+            connection.execute(
+                "UPDATE job_runs SET status = 'QUEUED', next_retry_at = NULL, updated_at = ? WHERE kind = 'RENDER_CLIP_PREVIEW' AND status = 'RETRY_WAIT' AND next_retry_at <= ?",
+                (now_text, now_text),
+            )
+            # Claim highest priority preview job
+            row = connection.execute(
+                """
+                SELECT * FROM job_runs AS candidate
+                WHERE candidate.kind = 'RENDER_CLIP_PREVIEW'
+                  AND candidate.status = 'QUEUED'
+                  AND candidate.cancel_requested_at IS NULL
+                ORDER BY candidate.priority DESC, candidate.created_at
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+            job_id = str(row["id"])
+            result = connection.execute(
+                """
+                UPDATE job_runs
+                SET status = 'LEASED', lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?,
+                    attempt = attempt + 1, started_at = COALESCE(started_at, ?), updated_at = ?, row_version = row_version + 1
+                WHERE id = ? AND status = 'QUEUED' AND row_version = ?
+                """,
+                (worker_id, expires, now_text, now_text, now_text, job_id, row["row_version"]),
+            )
+            if result.rowcount != 1:
+                return None
+            connection.execute(
+                "UPDATE job_runs SET status = 'RUNNING', updated_at = ?, row_version = row_version + 1 WHERE id = ? AND status = 'LEASED' AND lease_owner = ?",
+                (now_text, job_id, worker_id),
+            )
+            # Note: Preview jobs don't affect project status
+            return self._job_dict(connection.execute("SELECT * FROM job_runs WHERE id = ?", (job_id,)).fetchone())
 
     def claim_job(self, worker_id: str, lease_seconds: int) -> dict[str, Any] | None:
         now = datetime.now(UTC)
@@ -292,6 +342,7 @@ class Repository:
                 """
                 SELECT * FROM job_runs AS candidate
                 WHERE candidate.status = 'QUEUED' AND candidate.cancel_requested_at IS NULL
+                  AND candidate.kind != 'RENDER_CLIP_PREVIEW'
                   AND NOT EXISTS (
                     SELECT 1 FROM job_dependencies dependency
                     JOIN job_runs parent ON parent.id = dependency.depends_on_job_id
@@ -473,6 +524,45 @@ class Repository:
                 (utc_now(), utc_now(), job_id),
             )
             self._audit(connection, str(row["project_id"]), job_id, "job.cancel_requested", {})
+
+    def cancel_preview_jobs_for_clip(self, project_id: str, clip_id: str) -> int:
+        """Cancel all in-progress preview jobs for a specific clip. Returns count of cancelled jobs."""
+        with self.database.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM job_runs
+                WHERE project_id = ? AND kind = 'RENDER_CLIP_PREVIEW'
+                  AND status IN ('QUEUED', 'LEASED', 'BLOCKED')
+                  AND json_extract(parameters_json, '$.clip_id') = ?
+                """,
+                (project_id, clip_id),
+            ).fetchall()
+            if not rows:
+                return 0
+            now = utc_now()
+            job_ids = [str(row["id"]) for row in rows]
+            placeholders = ",".join("?" * len(job_ids))
+            connection.execute(
+                f"UPDATE job_runs SET cancel_requested_at = ?, updated_at = ? WHERE id IN ({placeholders})",
+                (now, now, *job_ids),
+            )
+            for job_id in job_ids:
+                self._audit(connection, project_id, job_id, "job.cancel_requested", {"reason": "superseded_by_new_preview"})
+            return len(job_ids)
+
+    def count_active_prefetch_jobs(self, project_id: str) -> int:
+        """Count active prefetch preview jobs for concurrency control."""
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) as count FROM job_runs
+                WHERE project_id = ? AND kind = 'RENDER_CLIP_PREVIEW'
+                  AND status IN ('QUEUED', 'LEASED', 'RUNNING')
+                  AND json_extract(parameters_json, '$.origin') = 'prefetch'
+                """,
+                (project_id,),
+            ).fetchone()
+            return int(row["count"]) if row else 0
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self.database.connect() as connection:
@@ -2027,7 +2117,7 @@ class Repository:
                 (project_id, cache_key, clip_id, now),
             )
             connection.execute(
-                """UPDATE preview_cache_entries SET ref_count = (
+                """UPDATE preview_cache_entries SET linked_project_count = (
                        SELECT COUNT(*) FROM project_preview_cache_refs WHERE cache_key = ?
                    ) WHERE cache_key = ?""",
                 (cache_key, cache_key),
@@ -2045,32 +2135,32 @@ class Repository:
                 "SELECT SUM(size_bytes) as total FROM preview_cache_entries WHERE status = 'ready'"
             ).fetchone()
             total_bytes = int(total_bytes_row["total"]) if total_bytes_row and total_bytes_row["total"] else 0
-            
+
             total_entries_row = connection.execute(
                 "SELECT COUNT(*) as cnt FROM preview_cache_entries WHERE status = 'ready'"
             ).fetchone()
             total_entries = int(total_entries_row["cnt"]) if total_entries_row else 0
-            
+
             uris_to_delete: list[str] = []
             keys_to_delete: list[str] = []
             for row in rows:
                 if total_bytes <= max_bytes and total_entries <= max_entries:
                     break
                 key = str(row["cache_key"])
-                ref = connection.execute(
-                    "SELECT ref_count FROM preview_cache_entries WHERE cache_key = ?", (key,)
+                pin = connection.execute(
+                    "SELECT pin_count FROM preview_cache_entries WHERE cache_key = ?", (key,)
                 ).fetchone()
-                if ref and int(ref["ref_count"]) > 0:
+                if pin and int(pin["pin_count"]) > 0:
                     continue
                 keys_to_delete.append(key)
                 if row["artifact_uri"]:
                     uris_to_delete.append(str(row["artifact_uri"]))
                 total_bytes -= int(row["size_bytes"])
                 total_entries -= 1
-            
+
             for key in keys_to_delete:
                 connection.execute("DELETE FROM preview_cache_entries WHERE cache_key = ?", (key,))
-            
+
             return uris_to_delete
 
     def get_preview_cache_stats(self) -> dict[str, Any]:
@@ -2087,7 +2177,8 @@ class Repository:
                     SUM(CASE WHEN status = 'corrupted' THEN 1 ELSE 0 END) as corrupted_count,
                     SUM(size_bytes) as total_bytes,
                     SUM(hit_count) as total_hits,
-                    AVG(ref_count) as avg_ref_count
+                    AVG(linked_project_count) as avg_linked_project_count,
+                    SUM(pin_count) as total_pinned
                 FROM preview_cache_entries"""
             ).fetchone()
 
@@ -2098,7 +2189,7 @@ class Repository:
 
             # Top 10 entries by hit_count
             top_entries = list(connection.execute(
-                """SELECT cache_key, hit_count, ref_count, size_bytes, created_at, last_accessed_at
+                """SELECT cache_key, hit_count, linked_project_count, pin_count, size_bytes, created_at, last_accessed_at
                    FROM preview_cache_entries
                    WHERE status = 'ready'
                    ORDER BY hit_count DESC
@@ -2115,7 +2206,8 @@ class Repository:
                 "total_bytes": int(stats_row["total_bytes"]) if stats_row["total_bytes"] else 0,
                 "total_hits": total_hits,
                 "cache_hit_rate": round(cache_hit_rate, 3),
-                "avg_ref_count": round(float(stats_row["avg_ref_count"]), 2) if stats_row["avg_ref_count"] else 0.0,
+                "avg_linked_project_count": round(float(stats_row["avg_linked_project_count"]), 2) if stats_row["avg_linked_project_count"] else 0.0,
+                "total_pinned": int(stats_row["total_pinned"]) if stats_row["total_pinned"] else 0,
                 "top_entries": [dict(row) for row in top_entries],
             }
 

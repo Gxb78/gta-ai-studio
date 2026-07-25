@@ -104,8 +104,10 @@ class StudioService:
             settings.render_preset,
         )
         self.worker_id = f"local-worker-{uuid7()}"
+        self.preview_worker_id = f"preview-worker-{uuid7()}"
         self._stop = asyncio.Event()
         self._worker_task: asyncio.Task[None] | None = None
+        self._preview_worker_task: asyncio.Task[None] | None = None
 
     @property
     def _ffmpeg_build_id(self) -> str:
@@ -137,16 +139,22 @@ class StudioService:
     async def start_worker(self) -> None:
         if self._worker_task is None:
             self._worker_task = asyncio.create_task(self._worker_loop(), name="gta-studio-local-worker")
+        if self._preview_worker_task is None:
+            self._preview_worker_task = asyncio.create_task(self._preview_worker_loop(), name="gta-studio-preview-worker")
 
     async def stop_worker(self) -> None:
         self._stop.set()
         if self._worker_task:
             await self._worker_task
             self._worker_task = None
+        if self._preview_worker_task:
+            await self._preview_worker_task
+            self._preview_worker_task = None
 
     @property
     def worker_running(self) -> bool:
-        return self._worker_task is not None and not self._worker_task.done()
+        return (self._worker_task is not None and not self._worker_task.done()) or \
+               (self._preview_worker_task is not None and not self._preview_worker_task.done())
 
     def create_import_project(self, source_path: str, title: str | None, game_id: str) -> dict[str, Any]:
         source = self.storage.validate_source(source_path)
@@ -538,11 +546,31 @@ class StudioService:
             "resolved_profile": resolved_profile,
             "preview_window": preview_window,
             "cache_key": cache_key,
+            "origin": request.origin,
         }
+
+        # Annuler les jobs preview en cours pour ce clip (dernière requête gagne)
+        cancelled_count = self.repository.cancel_preview_jobs_for_clip(project_id, request.clip_snapshot.clip_id)
+        if cancelled_count > 0:
+            logger.info(
+                f"Cancelled {cancelled_count} in-progress preview job(s) for clip",
+                extra={
+                    "event": "preview.jobs.cancelled",
+                    "project_id": project_id,
+                    "attributes": {
+                        "clip_id": request.clip_snapshot.clip_id,
+                        "cancelled_count": cancelled_count,
+                    },
+                },
+            )
+
+        # Priorité selon l'origine : user=100 (interactive), manual=80, prefetch=10
+        priority = 100 if request.origin == "user" else 10 if request.origin == "prefetch" else 80
 
         job_id = self.repository.enqueue_job(
             project_id, "RENDER_CLIP_PREVIEW", parameters, cache_key, CLIP_PREVIEW_VERSION,
             idempotency_suffix=f":manual:{uuid7()}",
+            priority=priority,
         )
 
         logger.info(
@@ -567,7 +595,7 @@ class StudioService:
             job_run_id=job_id,
         )
         self.repository.link_project_preview(project_id, cache_key, request.clip_snapshot.clip_id)
-        self.repository.set_project_status(project_id, "ACTIVE")
+        # Note: Les jobs de preview sont auxiliaires et ne doivent pas affecter le statut du projet
 
         # Prefetch automatique des clips adjacents (non-récursif)
         if request.origin == "user":
@@ -599,13 +627,34 @@ class StudioService:
         - Seules les requêtes origin="user" déclenchent prefetch
         - Les requêtes prefetch ont origin="prefetch" (pas de récursion)
         - Préfère draft profile pour économiser ressources
+        - Respecte preview_prefetch_max_concurrent
         - Ignore les erreurs de prefetch (fire-and-forget)
         """
         import logging
         logger = logging.getLogger(__name__)
 
+        # Vérifier si le prefetch est activé
+        if not self.settings.preview_prefetch_enabled:
+            return
+
         current_index = next((i for i, c in enumerate(clips) if c.get("id") == current_clip.get("id")), None)
         if current_index is None:
+            return
+
+        # Vérifier le nombre de jobs prefetch actifs
+        active_prefetch = self.repository.count_active_prefetch_jobs(project_id)
+        if active_prefetch >= self.settings.preview_prefetch_max_concurrent:
+            logger.debug(
+                "Prefetch skipped: max concurrent limit reached",
+                extra={
+                    "event": "preview.prefetch.skipped",
+                    "project_id": project_id,
+                    "attributes": {
+                        "active_prefetch": active_prefetch,
+                        "max_concurrent": self.settings.preview_prefetch_max_concurrent,
+                    },
+                },
+            )
             return
 
         adjacent_indices = []
@@ -624,22 +673,37 @@ class StudioService:
                         "current_clip_id": current_clip.get("id"),
                         "current_index": current_index,
                         "adjacent_count": len(adjacent_indices),
+                        "active_prefetch": active_prefetch,
                     },
                 },
             )
 
         prefetch_profile = "draft"  # Toujours draft pour prefetch
+        prefetched_count = 0
 
         for idx in adjacent_indices:
+            # Re-vérifier la limite avant chaque prefetch
+            if prefetched_count + active_prefetch >= self.settings.preview_prefetch_max_concurrent:
+                logger.debug(
+                    "Stopping prefetch: concurrent limit reached",
+                    extra={
+                        "event": "preview.prefetch.limit_reached",
+                        "project_id": project_id,
+                        "attributes": {"prefetched": prefetched_count},
+                    },
+                )
+                break
+
             adjacent_clip = clips[idx]
             try:
                 # Créer une requête prefetch avec un UUID unique (pas de concaténation)
                 from .ids import uuid7
+                from .models import ClipSnapshot
 
                 prefetch_request = ClipPreviewRequest(
                     client_request_id=uuid7(),
                     edit_project_id=original_request.edit_project_id,
-                    clip_id=adjacent_clip.get("id"),
+                    clip_snapshot=ClipSnapshot(**adjacent_clip),
                     timeline_revision=original_request.timeline_revision,
                     clip_revision=0,
                     render_profile=prefetch_profile,
@@ -650,6 +714,10 @@ class StudioService:
                 # Lancer le prefetch (peut être cache hit)
                 result = self.start_clip_preview(project_id, prefetch_request)
 
+                # Incrémenter seulement si un nouveau job a été créé (pas cache hit)
+                if not result.cache_hit:
+                    prefetched_count += 1
+
                 logger.debug(
                     "Prefetch completed",
                     extra={
@@ -659,6 +727,7 @@ class StudioService:
                             "adjacent_clip_id": adjacent_clip.get("id"),
                             "adjacent_index": idx,
                             "cache_hit": result.cache_hit,
+                            "prefetched_count": prefetched_count,
                         },
                     },
                 )
@@ -745,6 +814,23 @@ class StudioService:
             if job is None:
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self.settings.worker_poll_interval_seconds)
+                except TimeoutError:
+                    pass
+                continue
+            await asyncio.to_thread(self._run_job, job)
+
+    async def _preview_worker_loop(self) -> None:
+        """Worker dédié aux previews (Boucle B). Polling plus rapide pour réactivité."""
+        while not self._stop.is_set():
+            job = await asyncio.to_thread(
+                self.repository.claim_preview_job,
+                self.preview_worker_id,
+                self.settings.worker_lease_seconds,
+            )
+            if job is None:
+                try:
+                    # Polling plus rapide pour les previews (0.5s au lieu de worker_poll_interval)
+                    await asyncio.wait_for(self._stop.wait(), timeout=0.5)
                 except TimeoutError:
                     pass
                 continue
@@ -1877,10 +1963,10 @@ class StudioService:
 
         media_record = self.repository.get_primary_media(project_id)
         source = self.storage.resolve_uri(str(media_record["original_uri"]))
-        destination = self.storage.project_file(
-            project_id,
-            f"renders/previews/{cache_key}.mp4",
-        )
+
+        # Cache global, pas par projet
+        destination = self.storage.preview_cache_path(cache_key)
+
         progress = self._progress_callback(job_id)
         try:
             probe = self.renderer.render_clip_preview(
@@ -1894,13 +1980,14 @@ class StudioService:
                 progress=progress,
                 cancelled=lambda: self.repository.is_cancel_requested(job_id),
             )
-            
+
             artifact_uri = self.storage.to_uri(destination)
             sha256 = sha256_file(destination)
             size_bytes = destination.stat().st_size
-            
+
+            # Artifact global (project_id=None pour cache partagé)
             artifact_id = self.repository.register_artifact(
-                project_id,
+                None,  # Cache global, pas de projet spécifique
                 "clip_preview",
                 artifact_uri,
                 sha256,
@@ -1910,66 +1997,18 @@ class StudioService:
                 str(job["input_fingerprint"]),
                 {**probe.as_dict(), "clip_id": clip_id, "cache_key": cache_key},
             )
-            
+
             self.repository.complete_preview_cache(cache_key, artifact_uri, sha256, size_bytes)
             self.repository.link_project_preview(project_id, cache_key, clip_id)
-            
-            # Prefetch neighbors: only for user-originated requests, never recursive
-            if origin == "user" and self.settings.preview_prefetch_enabled:
-                try:
-                    project = self.repository.get_project(project_id)
-                    production = dict(project["production"])
-                    advanced_edit = production.get("advanced_edit")
-                    if advanced_edit:
-                        all_clips = list(advanced_edit.get("clips", []))
-                        current_index = next(
-                            (i for i, c in enumerate(all_clips) if str(c.get("id")) == clip_id), -1,
-                        )
-                        media = self.repository.get_primary_media(project_id)
-                        composition = str(
-                            dict(production.get("brief", {}).get("structured", {}).get("production", {}))
-                            .get("composition", "smart_blur")
-                        )
-                        draft_profile = resolve_preview_profile("draft", self.renderer)
-                        for offset in (-1, 1):
-                            neighbor_idx = current_index + offset
-                            if 0 <= neighbor_idx < len(all_clips):
-                                neighbor_clip = all_clips[neighbor_idx]
-                                neighbor_key = _preview_cache_key(
-                                    source_sha256=str(media["sha256"]),
-                                    clip=neighbor_clip,
-                                    preview_window=None,
-                                    resolved_profile=draft_profile,
-                                    renderer_version=RENDER_VERSION,
-                                    ffmpeg_build_id=self._ffmpeg_build_id,
-                                )
-                                if self.repository.find_preview_cache_entry(neighbor_key) is None:
-                                    neighbor_params = {
-                                        "edit_project_id": str(parameters.get("edit_project_id", "")),
-                                        "clip_id": str(neighbor_clip.get("id", "")),
-                                        "clip": neighbor_clip,
-                                        "composition": composition,
-                                        "resolved_profile": draft_profile,
-                                        "preview_window": None,
-                                        "cache_key": neighbor_key,
-                                        "origin": "prefetch",
-                                    }
-                                    self.repository.enqueue_job(
-                                        project_id, "RENDER_CLIP_PREVIEW",
-                                        neighbor_params, neighbor_key, CLIP_PREVIEW_VERSION,
-                                        idempotency_suffix=f":prefetch:{neighbor_key[:16]}",
-                                    )
-                                    self.repository.create_preview_cache_entry(
-                                        neighbor_key, "draft", RENDER_VERSION, "",
-                                    )
-                except Exception:
-                    pass  # Prefetch failure must not block the main render
-            
+
+            # Note: Prefetch est maintenant géré uniquement dans start_clip_preview (Boucle C)
+            # pour éviter la duplication et permettre un meilleur contrôle de la concurrence
+
             self.repository.evict_preview_cache_lru(
-                self.settings.preview_cache_max_bytes, 
+                self.settings.preview_cache_max_bytes,
                 self.settings.preview_cache_max_entries
             )
-            
+
             return artifact_id
         except Exception as error:
             self.repository.fail_preview_cache(cache_key, str(error))
