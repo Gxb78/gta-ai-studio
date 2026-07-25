@@ -1,0 +1,191 @@
+// Export TikTok 1080×1920. Le seul moment où FFmpeg travaille sur le rush original.
+
+import { useEffect, useRef, useState } from "react";
+import { exportTimeline, onExportProgress, revealPath } from "../ipc";
+import { Icon } from "./Icon";
+import type { Clip, ExportMode, ExportRequest, ExportSegment, SourceInfo } from "../types";
+import { clipEndMs, formatTime, sortClips, timelineGaps, usedSources } from "../types";
+
+/**
+ * Ordre temporel : une entrée FFmpeg par rush utilisé, chaque segment pointant
+ * vers la sienne et précédé de son éventuel trou (noir silencieux).
+ */
+function buildRequest(
+  sources: Record<string, SourceInfo>,
+  clips: Clip[],
+): Pick<ExportRequest, "sources" | "segments" | "hasAudio" | "frameWidth" | "frameHeight" | "frameFps"> {
+  const used = usedSources(sources, clips);
+  const indexOf = new Map(used.map((source, index) => [source.id, index]));
+
+  let cursor = 0;
+  const segments: ExportSegment[] = [];
+  for (const clip of sortClips(clips)) {
+    const index = indexOf.get(clip.sourceId);
+    if (index === undefined) continue;
+    segments.push({
+      sourceIndex: index,
+      srcInMs: clip.srcInMs,
+      srcOutMs: clip.srcOutMs,
+      gapBeforeMs: Math.max(0, clip.timelineStartMs - cursor),
+    });
+    cursor = clipEndMs(clip);
+  }
+
+  // Le format de sortie est imposé par le premier rush : tous les autres y sont
+  // ramenés avant concaténation, sinon FFmpeg refuse d'assembler les flux.
+  const reference = used[0];
+  return {
+    sources: used.map((source) => ({ path: source.originalPath, hasAudio: source.probe.hasAudio })),
+    segments,
+    hasAudio: used.some((source) => source.probe.hasAudio),
+    frameWidth: reference?.probe.width ?? 1920,
+    frameHeight: reference?.probe.height ?? 1080,
+    frameFps: reference?.probe.fps ?? 30,
+  };
+}
+
+interface Props {
+  sources: Record<string, SourceInfo>;
+  clips: Clip[];
+  defaultName: string;
+  onClose: () => void;
+}
+
+type Phase = "config" | "running" | "done" | "error";
+
+export function ExportDialog({ sources, clips, defaultName, onClose }: Props) {
+  const [mode, setMode] = useState<ExportMode>("crop");
+  const [fileName, setFileName] = useState(defaultName);
+  const [phase, setPhase] = useState<Phase>("config");
+  const [percent, setPercent] = useState(0);
+  const [outputPath, setOutputPath] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const unlistenRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    void onExportProgress((p) => {
+      setPercent(p.percent);
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unlistenRef.current = unlisten;
+    });
+    return () => {
+      disposed = true;
+      unlistenRef.current?.();
+    };
+  }, []);
+
+  const sanitized = fileName.replace(/[^A-Za-z0-9 _-]/g, "").trim();
+  const gaps = timelineGaps(clips);
+  const gapTotalMs = gaps.reduce((sum, gap) => sum + (gap.endMs - gap.startMs), 0);
+
+  const start = async () => {
+    if (!sanitized) return;
+    setPhase("running");
+    setPercent(0);
+    try {
+      const path = await exportTimeline({
+        ...buildRequest(sources, clips),
+        mode,
+        fileName: sanitized,
+      });
+      setOutputPath(path);
+      setPhase("done");
+    } catch (e) {
+      setError(String(e));
+      setPhase("error");
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={phase === "running" ? undefined : onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h2>Exporter en 1080×1920</h2>
+          {phase !== "running" && (
+            <button className="icon-btn ghost" onClick={onClose} title="Fermer">
+              <Icon name="close" />
+            </button>
+          )}
+        </div>
+
+        {phase === "config" && (
+          <>
+            <label className="field">
+              <span>Nom du fichier</span>
+              <input
+                value={fileName}
+                onChange={(e) => setFileName(e.target.value)}
+                maxLength={60}
+                autoFocus
+              />
+            </label>
+            <div className="field">
+              <span>Passage au format vertical</span>
+              <div className="option-grid">
+                <label className={"option" + (mode === "crop" ? " selected" : "")}>
+                  <input type="radio" checked={mode === "crop"} onChange={() => setMode("crop")} />
+                  <span className="option-preview option-crop" aria-hidden="true" />
+                  <span className="option-label">Recadrage centré</span>
+                  <span className="option-note muted">Plein écran, coupe les côtés</span>
+                </label>
+                <label className={"option" + (mode === "blur" ? " selected" : "")}>
+                  <input type="radio" checked={mode === "blur"} onChange={() => setMode("blur")} />
+                  <span className="option-preview option-blur" aria-hidden="true" />
+                  <span className="option-label">Fond flou</span>
+                  <span className="option-note muted">Image entière conservée</span>
+                </label>
+              </div>
+            </div>
+            {gaps.length > 0 && (
+              <p className="warn">
+                {gaps.length} trou{gaps.length > 1 ? "s" : ""} dans la timeline (
+                {formatTime(gapTotalMs)} au total) : {gaps.length > 1 ? "ils seront rendus" : "il sera rendu"}{" "}
+                en noir silencieux. Ferme les trous avant d'exporter si ce n'est pas voulu.
+              </p>
+            )}
+            <div className="modal-actions">
+              <button className="ghost" onClick={onClose}>Annuler</button>
+              <button className="primary" onClick={() => void start()} disabled={!sanitized}>
+                Lancer l'export
+              </button>
+            </div>
+          </>
+        )}
+
+        {phase === "running" && (
+          <div className="import-progress">
+            <div className="progress-track">
+              <div className="progress-fill" style={{ width: `${Math.round(percent)}%` }} />
+            </div>
+            <span className="muted">Rendu en cours… {Math.round(percent)}%</span>
+          </div>
+        )}
+
+        {phase === "done" && outputPath && (
+          <>
+            <p>Export terminé ✅</p>
+            <p className="muted path">{outputPath}</p>
+            <div className="modal-actions">
+              <button className="ghost" onClick={() => void revealPath(outputPath)}>
+                Ouvrir le dossier
+              </button>
+              <button className="primary" onClick={onClose}>Fermer</button>
+            </div>
+          </>
+        )}
+
+        {phase === "error" && (
+          <>
+            <p className="error">{error}</p>
+            <div className="modal-actions">
+              <button className="primary" onClick={() => setPhase("config")}>Réessayer</button>
+              <button className="ghost" onClick={onClose}>Fermer</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}

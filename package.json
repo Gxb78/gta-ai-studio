@@ -1,32 +1,31 @@
 {
-  "name": "gta-ai-studio",
-  "version": "0.7.2",
+  "name": "gta-studio",
+  "version": "0.1.0",
   "private": true,
-  "description": "Local-first GTA video production studio with a non-destructive timeline editor.",
+  "description": "Éditeur de montage local ultra-fluide pour rushs GTA — format TikTok.",
   "type": "module",
   "engines": {
-    "node": ">=22.0.0",
-    "npm": ">=10.0.0"
+    "node": ">=22.0.0"
   },
-  "workspaces": [
-    "apps/*",
-    "packages/*"
-  ],
   "scripts": {
-    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/start-dev.ps1",
-    "dev:web": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/start-dev.ps1 -Frontend web",
-    "dev:api": "uv run --project services/api uvicorn gta_studio_api.main:app --app-dir services/api/src --host 127.0.0.1 --port 8765",
-    "dev:desktop": "npm run dev --workspace @gta-ai-studio/desktop",
-    "build:desktop": "npm run build --workspace @gta-ai-studio/desktop",
-    "typecheck": "npm run typecheck --workspace @gta-ai-studio/desktop && tsc -p tsconfig.json --noEmit",
-    "test:ts": "tsx --test tests/unit/typescript/*.test.ts",
-    "test:py": "uv run --project packages/contracts/python pytest tests/unit/python",
-    "test:api": "uv run --project services/api pytest tests/integration/api",
-    "test": "npm run typecheck && npm run test:ts && npm run test:py && npm run test:api"
+    "dev": "vite",
+    "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --disable-warning=ExperimentalWarning --import ./tests/register.mjs tests/timeline.test.ts",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.7.2",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
-    "tsx": "^4.20.0",
-    "typescript": "^5.9.0"
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "typescript": "^5.9.0",
+    "vite": "^8.1.5"
   }
 }

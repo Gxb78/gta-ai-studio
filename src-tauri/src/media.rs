@@ -1,0 +1,727 @@
+// Préparation des médias et export final.
+// Règles : commandes FFmpeg construites uniquement depuis des valeurs typées
+// et validées (jamais de shell libre), écritures via fichier temporaire puis
+// renommage, sources d'origine jamais modifiées.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_shell::ShellExt;
+
+const ALLOWED_EXTENSIONS: [&str; 4] = ["mp4", "mov", "mkv", "m4v"];
+const PROXY_HEIGHT: u32 = 720;
+const PROXY_GOP: u32 = 15; // GOP courtes = scrubbing quasi instantané
+/// Hauteur de la bande de vignettes côté interface. Miroir de THUMB_STRIP_PX
+/// dans src/components/Timeline.tsx : les deux doivent bouger ensemble.
+const THUMB_STRIP_PX: f64 = 122.0;
+/// Zoom maximal de la timeline. Miroir de MAX_PX_PER_SEC dans Timeline.tsx.
+const MAX_PX_PER_SEC: f64 = 240.0;
+/// Vignettes générées au double de la hauteur d'affichage : sur un écran à
+/// 125 ou 150 %, une vignette à l'échelle 1 serait agrandie, donc floue.
+const THUMB_SCALE: f64 = 2.0;
+/// Plafond du nombre de vignettes, pour qu'un rush de deux heures reste raisonnable.
+const MAX_THUMBS: f64 = 1800.0;
+/// Version globale des fichiers dérivés, vue par l'interface : elle déclenche
+/// le rafraîchissement au chargement d'un projet. À incrémenter dès qu'un
+/// paramètre de génération change, sinon le cache resservirait les anciens
+/// fichiers indéfiniment.
+const ASSET_VERSION: u32 = 4;
+/// Versions par famille de fichiers : seules celles qui changent réellement
+/// provoquent un recalcul, les autres restent en cache.
+const THUMB_VERSION: u32 = 3;
+const WAVEFORM_VERSION: u32 = 1;
+const MAX_SEGMENTS: usize = 500;
+/// Un rush = une entrée FFmpeg ouverte simultanément. Au-delà, on sature les
+/// descripteurs de fichiers et la mémoire du décodeur.
+const MAX_SOURCES: usize = 32;
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeInfo {
+    pub duration_ms: f64,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub has_audio: bool,
+    pub video_codec: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceInfo {
+    pub id: String,
+    pub original_path: String,
+    pub proxy_path: String,
+    pub thumb_paths: Vec<String>,
+    pub thumb_interval_ms: f64,
+    pub waveform_path: Option<String>,
+    /// Version des fichiers dérivés présents sur disque. Absente des projets
+    /// enregistrés avant l'introduction du champ : ils valent alors la version 1.
+    #[serde(default = "legacy_asset_version")]
+    pub asset_version: u32,
+    pub probe: ProbeInfo,
+}
+
+fn legacy_asset_version() -> u32 {
+    1
+}
+
+#[derive(Serialize, Clone)]
+struct ImportProgress {
+    stage: &'static str,
+    percent: f64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ExportProgress {
+    percent: f64,
+    done: bool,
+    output_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSegment {
+    /// Index du rush dans `ExportRequest.sources`.
+    #[serde(default)]
+    pub source_index: usize,
+    pub src_in_ms: f64,
+    pub src_out_ms: f64,
+    /// Durée de noir silencieux à insérer AVANT ce segment (trou de la timeline).
+    #[serde(default)]
+    pub gap_before_ms: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSource {
+    pub path: String,
+    pub has_audio: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportRequest {
+    pub sources: Vec<ExportSource>,
+    pub segments: Vec<ExportSegment>,
+    pub mode: String,
+    pub file_name: String,
+    /// Vrai si au moins un rush a du son : les autres reçoivent du silence.
+    pub has_audio: bool,
+    /// Format de sortie du montage. Tous les rushs y sont ramenés avant
+    /// concaténation, sinon le filtre `concat` refuse d'assembler les flux.
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub frame_fps: f64,
+}
+
+// --- Chemins -----------------------------------------------------------------
+
+pub fn data_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Dossier de données introuvable : {e}"))?;
+    fs::create_dir_all(&root).map_err(|e| format!("Création du dossier de données impossible : {e}"))?;
+    Ok(root)
+}
+
+fn ensure_dir(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|e| format!("Création de dossier impossible ({}) : {e}", path.display()))
+}
+
+// --- Utilitaires process -------------------------------------------------------
+
+fn base_command(binary: &str) -> Command {
+    let command = Command::new(binary);
+    #[cfg(windows)]
+    let command = {
+        use std::os::windows::process::CommandExt;
+        let mut c = command;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        c
+    };
+    command
+}
+
+fn missing_tool_error(tool: &str) -> String {
+    format!("{tool} est introuvable. Installe FFmpeg et vérifie qu'il est dans le PATH.")
+}
+
+fn str_args(values: &[&str]) -> Vec<String> {
+    values.iter().map(|s| s.to_string()).collect()
+}
+
+/// Parse "HH:MM:SS.micro" en millisecondes.
+fn parse_ffmpeg_time(value: &str) -> Option<f64> {
+    let parts: Vec<&str> = value.trim().split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let hours: f64 = parts[0].parse().ok()?;
+    let minutes: f64 = parts[1].parse().ok()?;
+    let seconds: f64 = parts[2].parse().ok()?;
+    Some(((hours * 60.0 + minutes) * 60.0 + seconds) * 1000.0)
+}
+
+/// Lance ffmpeg avec `-progress pipe:1` et remonte l'avancement via `on_progress`.
+fn run_ffmpeg_with_progress(
+    args: &[String],
+    total_ms: f64,
+    mut on_progress: impl FnMut(f64),
+) -> Result<(), String> {
+    let mut child = base_command("ffmpeg")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| missing_tool_error("FFmpeg"))?;
+
+    let stdout = child.stdout.take().ok_or("Sortie FFmpeg indisponible")?;
+    let stderr = child.stderr.take();
+
+    // Capture de la fin de stderr pour un diagnostic utile en cas d'échec.
+    let stderr_handle = std::thread::spawn(move || {
+        let mut tail = String::new();
+        if let Some(stderr) = stderr {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                tail.push_str(&line);
+                tail.push('\n');
+                if tail.len() > 4000 {
+                    tail = tail[tail.len() - 2000..].to_string();
+                }
+            }
+        }
+        tail
+    });
+
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        if let Some(value) = line.strip_prefix("out_time=") {
+            if let Some(out_ms) = parse_ffmpeg_time(value) {
+                if total_ms > 0.0 {
+                    on_progress((out_ms / total_ms * 100.0).clamp(0.0, 99.9));
+                }
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|e| format!("FFmpeg : {e}"))?;
+    let tail = stderr_handle.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!("FFmpeg a échoué :\n{}", tail.trim()));
+    }
+    Ok(())
+}
+
+// --- Empreinte -----------------------------------------------------------------
+
+/// Empreinte rapide : taille + premier et dernier blocs de 4 Mo.
+/// Suffisant comme clé de cache locale (la source est immuable), et
+/// instantané même sur un rush de plusieurs Go.
+fn quick_fingerprint(path: &Path) -> Result<String, String> {
+    const BLOCK: usize = 4 * 1024 * 1024;
+    let mut file = fs::File::open(path).map_err(|e| format!("Lecture du fichier impossible : {e}"))?;
+    let size = file
+        .metadata()
+        .map_err(|e| format!("Métadonnées illisibles : {e}"))?
+        .len();
+
+    let mut hasher = Sha256::new();
+    hasher.update(size.to_le_bytes());
+
+    let mut buffer = vec![0u8; BLOCK];
+    let read = file.read(&mut buffer).map_err(|e| format!("Lecture : {e}"))?;
+    hasher.update(&buffer[..read]);
+
+    if size > (BLOCK as u64) * 2 {
+        file.seek(SeekFrom::End(-(BLOCK as i64)))
+            .map_err(|e| format!("Lecture : {e}"))?;
+        let read = file.read(&mut buffer).map_err(|e| format!("Lecture : {e}"))?;
+        hasher.update(&buffer[..read]);
+    }
+
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(hex[..16].to_string())
+}
+
+// --- Probe -----------------------------------------------------------------------
+
+fn probe_file(path: &Path) -> Result<ProbeInfo, String> {
+    let output = base_command("ffprobe")
+        .args([
+            "-v", "error",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|_| missing_tool_error("FFprobe"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "FFprobe n'a pas pu lire ce fichier : {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Réponse FFprobe illisible : {e}"))?;
+
+    let duration_s: f64 = parsed["format"]["duration"]
+        .as_str()
+        .and_then(|d| d.parse().ok())
+        .ok_or("Durée introuvable dans le fichier.")?;
+
+    let streams = parsed["streams"].as_array().ok_or("Aucun flux détecté.")?;
+    let video = streams
+        .iter()
+        .find(|s| s["codec_type"] == "video")
+        .ok_or("Aucune piste vidéo détectée dans ce fichier.")?;
+    let has_audio = streams.iter().any(|s| s["codec_type"] == "audio");
+
+    let fps = video["avg_frame_rate"]
+        .as_str()
+        .or_else(|| video["r_frame_rate"].as_str())
+        .and_then(parse_frame_rate)
+        .unwrap_or(30.0);
+
+    Ok(ProbeInfo {
+        duration_ms: duration_s * 1000.0,
+        width: video["width"].as_u64().unwrap_or(0) as u32,
+        height: video["height"].as_u64().unwrap_or(0) as u32,
+        fps,
+        has_audio,
+        video_codec: video["codec_name"].as_str().unwrap_or("inconnu").to_string(),
+    })
+}
+
+fn parse_frame_rate(value: &str) -> Option<f64> {
+    let mut parts = value.split('/');
+    let num: f64 = parts.next()?.parse().ok()?;
+    let den: f64 = parts.next().unwrap_or("1").parse().ok()?;
+    if den == 0.0 || num <= 0.0 {
+        None
+    } else {
+        Some(num / den)
+    }
+}
+
+// --- Import ------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn import_source(app: AppHandle, path: String) -> Result<SourceInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || import_source_blocking(&app, &path))
+        .await
+        .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
+fn emit_import(app: &AppHandle, stage: &'static str, percent: f64) {
+    let _ = app.emit("import://progress", ImportProgress { stage, percent });
+}
+
+fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, String> {
+    let source = PathBuf::from(path);
+    if !source.is_file() {
+        return Err("Ce fichier n'existe pas ou n'est pas accessible.".into());
+    }
+    let extension = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !ALLOWED_EXTENSIONS.contains(&extension.as_str()) {
+        return Err(format!(
+            "Format non pris en charge (.{extension}). Formats acceptés : mp4, mov, mkv, m4v."
+        ));
+    }
+
+    let root = data_root(app)?;
+
+    emit_import(app, "hash", 5.0);
+    let id = quick_fingerprint(&source)?;
+
+    emit_import(app, "probe", 10.0);
+    let probe = probe_file(&source)?;
+
+    // 1) Proxy de montage (réutilisé s'il existe déjà pour cette source).
+    let proxies_dir = root.join("proxies");
+    ensure_dir(&proxies_dir)?;
+    let proxy_path = proxies_dir.join(format!("{id}.mp4"));
+    if !proxy_path.is_file() {
+        let partial = proxies_dir.join(format!("{id}.partial.mp4"));
+        let _ = fs::remove_file(&partial);
+        let mut args: Vec<String> = str_args(&[
+            "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        ]);
+        args.push("-i".into());
+        args.push(source.to_str().ok_or("Chemin source invalide.")?.into());
+        args.extend(str_args(&["-map", "0:v:0", "-map", "0:a:0?", "-vf"]));
+        args.push(format!("scale=-2:{PROXY_HEIGHT}"));
+        args.extend(str_args(&["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-g"]));
+        args.push(PROXY_GOP.to_string());
+        args.push("-keyint_min".into());
+        args.push(PROXY_GOP.to_string());
+        args.extend(str_args(&[
+            "-sc_threshold", "0",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            "-progress", "pipe:1", "-nostats",
+        ]));
+        args.push(partial.to_str().ok_or("Chemin proxy invalide.")?.into());
+
+        run_ffmpeg_with_progress(&args, probe.duration_ms, |p| {
+            emit_import(app, "proxy", 10.0 + p * 0.6);
+        })?;
+        fs::rename(&partial, &proxy_path).map_err(|e| format!("Finalisation du proxy impossible : {e}"))?;
+    }
+    emit_import(app, "thumbs", 72.0);
+
+    // 2) Vignettes, générées depuis le proxy.
+    // La largeur d'un créneau de pellicule vaut hauteur_de_bande × ratio du rush ;
+    // en échantillonnant à ce rythme au zoom maximal, deux créneaux voisins ne
+    // peuvent jamais afficher la même image.
+    let aspect = (probe.width as f64 / probe.height.max(1) as f64).clamp(0.5, 3.0);
+    let slot_px = (THUMB_STRIP_PX * aspect).round();
+    let thumb_interval_s = (slot_px / MAX_PX_PER_SEC)
+        .max(probe.duration_ms / 1000.0 / MAX_THUMBS)
+        .clamp(0.25, 8.0);
+    let thumb_height = (THUMB_STRIP_PX * THUMB_SCALE).round() as u32;
+
+    let thumbs_dir = root.join("thumbs").join(format!("{id}-v{THUMB_VERSION}"));
+    let thumb_paths = if thumbs_dir.is_dir() && count_jpgs(&thumbs_dir) > 0 {
+        list_jpgs(&thumbs_dir)
+    } else {
+        ensure_dir(&thumbs_dir)?;
+        let pattern = thumbs_dir.join("%05d.jpg");
+        let mut args: Vec<String> = str_args(&["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
+        args.push("-i".into());
+        args.push(proxy_path.to_str().ok_or("Chemin proxy invalide.")?.into());
+        args.extend(str_args(&["-an", "-sn"]));
+        args.push("-vf".into());
+        // fps en débit décimal (et non 1/x) pour ne pas dépendre de l'évaluateur
+        // de fractions. -2 : largeur déduite du ratio, arrondie au pair.
+        // lanczos : la réduction 720 → 244 en bicubique est molle.
+        args.push(format!(
+            "fps={:.6},scale=-2:{thumb_height}:flags=lanczos",
+            1.0 / thumb_interval_s
+        ));
+        args.extend(str_args(&["-q:v", "4", "-progress", "pipe:1", "-nostats"]));
+        args.push(pattern.to_str().ok_or("Chemin vignettes invalide.")?.into());
+        run_ffmpeg_with_progress(&args, probe.duration_ms, |p| {
+            emit_import(app, "thumbs", 72.0 + p * 0.18);
+        })?;
+        list_jpgs(&thumbs_dir)
+    };
+
+    // 3) Waveform du rush complet (image unique, si piste audio).
+    emit_import(app, "waveform", 92.0);
+    let waveform_path = if probe.has_audio {
+        let waveforms_dir = root.join("waveforms");
+        ensure_dir(&waveforms_dir)?;
+        let waveform = waveforms_dir.join(format!("{id}-w{WAVEFORM_VERSION}.png"));
+        if !waveform.is_file() {
+            let width = ((probe.duration_ms / 1000.0 * 30.0) as u32).clamp(900, 24000);
+            let mut args: Vec<String> = str_args(&["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
+            args.push("-i".into());
+            args.push(proxy_path.to_str().ok_or("Chemin proxy invalide.")?.into());
+            args.push("-filter_complex".into());
+            // scale=sqrt : sans ça, un gameplay à niveau moyen donne un trait plat
+            // et illisible une fois la waveform écrasée dans 28 px de haut.
+            args.push(format!(
+                "aformat=channel_layouts=mono,showwavespic=s={width}x120:colors=#7aa4ff:scale=sqrt"
+            ));
+            args.extend(str_args(&["-frames:v", "1"]));
+            args.push(waveform.to_str().ok_or("Chemin waveform invalide.")?.into());
+            // Pas de suivi de progression nécessaire : c'est très rapide.
+            run_ffmpeg_with_progress(&args, 0.0, |_| {})?;
+        }
+        Some(waveform.to_string_lossy().to_string())
+    } else {
+        None
+    };
+
+    emit_import(app, "done", 100.0);
+    Ok(SourceInfo {
+        id,
+        original_path: source.to_string_lossy().to_string(),
+        proxy_path: proxy_path.to_string_lossy().to_string(),
+        thumb_paths,
+        thumb_interval_ms: thumb_interval_s * 1000.0,
+        waveform_path,
+        asset_version: ASSET_VERSION,
+        probe,
+    })
+}
+
+fn count_jpgs(dir: &Path) -> usize {
+    list_jpgs(dir).len()
+}
+
+fn list_jpgs(dir: &Path) -> Vec<String> {
+    let mut files: Vec<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jpg"))
+                .map(|p| p.to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+// --- Export ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn export_timeline(app: AppHandle, request: ExportRequest) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || export_timeline_blocking(&app, &request))
+        .await
+        .map_err(|e| format!("Tâche interrompue : {e}"))?
+}
+
+fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<String, String> {
+    // Validation stricte des entrées avant toute construction de commande.
+    if request.segments.is_empty() {
+        return Err("Aucun clip à exporter.".into());
+    }
+    if request.segments.len() > MAX_SEGMENTS {
+        return Err(format!("Trop de clips ({MAX_SEGMENTS} maximum)."));
+    }
+    if request.sources.is_empty() {
+        return Err("Aucun rush à exporter.".into());
+    }
+    if request.sources.len() > MAX_SOURCES {
+        return Err(format!("Trop de rushs ({MAX_SOURCES} maximum)."));
+    }
+    for segment in &request.segments {
+        if segment.src_in_ms < 0.0 || segment.src_out_ms <= segment.src_in_ms {
+            return Err("Un clip a des bornes invalides.".into());
+        }
+        if !segment.gap_before_ms.is_finite() || segment.gap_before_ms < 0.0 {
+            return Err("Un trou a une durée invalide.".into());
+        }
+        if segment.source_index >= request.sources.len() {
+            return Err("Un clip référence un rush inconnu.".into());
+        }
+    }
+    if !(16..=7680).contains(&request.frame_width) || !(16..=7680).contains(&request.frame_height) {
+        return Err("Dimensions de sortie invalides.".into());
+    }
+    if !request.frame_fps.is_finite() || request.frame_fps <= 0.0 || request.frame_fps > 480.0 {
+        return Err("Cadence de sortie invalide.".into());
+    }
+    if request.mode != "crop" && request.mode != "blur" {
+        return Err("Mode d'export inconnu.".into());
+    }
+    let name_ok = !request.file_name.is_empty()
+        && request.file_name.len() <= 60
+        && request
+            .file_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '_' || c == '-');
+    if !name_ok {
+        return Err("Nom de fichier invalide (lettres, chiffres, espaces, - et _ uniquement).".into());
+    }
+    for source in &request.sources {
+        if !PathBuf::from(&source.path).is_file() {
+            return Err(format!(
+                "Rush introuvable, a-t-il été déplacé ? {}",
+                source.path
+            ));
+        }
+    }
+
+    let exports_dir = data_root(app)?.join("exports");
+    ensure_dir(&exports_dir)?;
+    let mut output = exports_dir.join(format!("{}.mp4", request.file_name.trim()));
+    let mut counter = 2;
+    while output.exists() {
+        output = exports_dir.join(format!("{} ({counter}).mp4", request.file_name.trim()));
+        counter += 1;
+    }
+
+    // Graphe de filtres : chaque trou devient du noir silencieux, chaque clip un
+    // trim du rush ; on concatène le tout, puis on passe en 9:16.
+    // Les entrées lavfi (noir, silence) ne sont ajoutées que si un trou existe.
+    let has_gap = request.segments.iter().any(|s| s.gap_before_ms > 0.0);
+    // Les rushs occupent les entrées 0..n ; les sources synthétiques (noir,
+    // silence) viennent juste après.
+    let n_sources = request.sources.len();
+    let black_input = n_sources;
+    let silence_input = n_sources + if has_gap { 1 } else { 0 };
+    // Un rush muet dans un montage sonore a quand même besoin d'une piste audio,
+    // sinon `concat` reçoit un nombre de flux incohérent.
+    let needs_silence = request.has_audio
+        && (has_gap || request.sources.iter().any(|s| !s.has_audio));
+
+    // `concat` exige des flux homogènes : même définition, même format de pixel,
+    // même SAR, même format audio. On normalise chaque branche plutôt que de
+    // l'espérer — c'est indispensable dès que deux rushs diffèrent.
+    let (fw, fh) = (request.frame_width, request.frame_height);
+    let vfmt = format!(
+        "scale={fw}:{fh}:force_original_aspect_ratio=decrease,\
+         pad={fw}:{fh}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
+    );
+    const AFMT: &str = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo";
+    let mut graph = String::new();
+    let mut parts: Vec<usize> = Vec::new();
+    let mut next_label = 0usize;
+
+    for segment in &request.segments {
+        if segment.gap_before_ms > 0.0 {
+            let duration = segment.gap_before_ms / 1000.0;
+            let i = next_label;
+            graph += &format!(
+                "[{black_input}:v]trim=duration={duration:.3},setpts=PTS-STARTPTS,{vfmt}[v{i}];"
+            );
+            if request.has_audio {
+                graph += &format!(
+                    "[{silence_input}:a]atrim=duration={duration:.3},asetpts=PTS-STARTPTS,{AFMT}[a{i}];"
+                );
+            }
+            parts.push(i);
+            next_label += 1;
+        }
+        let start = segment.src_in_ms / 1000.0;
+        let end = segment.src_out_ms / 1000.0;
+        let input = segment.source_index;
+        let i = next_label;
+        graph += &format!(
+            "[{input}:v]trim=start={start:.3}:end={end:.3},setpts=PTS-STARTPTS,{vfmt}[v{i}];"
+        );
+        if request.has_audio {
+            if request.sources[input].has_audio {
+                graph += &format!(
+                    "[{input}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{AFMT}[a{i}];"
+                );
+            } else {
+                // Rush muet : on fabrique le silence de la bonne durée.
+                let duration = (segment.src_out_ms - segment.src_in_ms) / 1000.0;
+                graph += &format!(
+                    "[{silence_input}:a]atrim=duration={duration:.3},asetpts=PTS-STARTPTS,{AFMT}[a{i}];"
+                );
+            }
+        }
+        parts.push(i);
+        next_label += 1;
+    }
+
+    let n = parts.len();
+    if n > MAX_SEGMENTS {
+        return Err(format!("Trop de segments à assembler ({MAX_SEGMENTS} maximum)."));
+    }
+    for i in &parts {
+        graph += &format!("[v{i}]");
+        if request.has_audio {
+            graph += &format!("[a{i}]");
+        }
+    }
+    let audio_flag = if request.has_audio { 1 } else { 0 };
+    graph += &format!("concat=n={n}:v=1:a={audio_flag}[vc]");
+    if request.has_audio {
+        graph += "[ac]";
+    }
+    graph += ";";
+    match request.mode.as_str() {
+        "crop" => {
+            graph += "[vc]crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=1080:1920:flags=lanczos,setsar=1[vout]";
+        }
+        _ => {
+            graph += "[vc]split=2[bga][fga];\
+                [bga]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=24[bg];\
+                [fga]scale=1080:1920:force_original_aspect_ratio=decrease[fg];\
+                [bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[vout]";
+        }
+    }
+
+    let total_ms: f64 = request
+        .segments
+        .iter()
+        .map(|s| s.src_out_ms - s.src_in_ms + s.gap_before_ms)
+        .sum();
+
+    let partial = exports_dir.join(format!(".partial-{}.mp4", std::process::id()));
+    let _ = fs::remove_file(&partial);
+
+    let mut args: Vec<String> = str_args(&[
+        "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+    ]);
+    // Les rushs d'abord, dans l'ordre exact référencé par les segments.
+    for source in &request.sources {
+        args.extend(["-i".into(), source.path.clone()]);
+    }
+    if has_gap {
+        let fps = request.frame_fps;
+        args.extend([
+            "-f".into(), "lavfi".into(),
+            "-i".into(), format!("color=c=black:s={fw}x{fh}:r={fps:.3}"),
+        ]);
+    }
+    if needs_silence {
+        args.extend([
+            "-f".into(), "lavfi".into(),
+            "-i".into(), "anullsrc=channel_layout=stereo:sample_rate=48000".into(),
+        ]);
+    }
+    args.extend([
+        "-filter_complex".into(), graph,
+        "-map".into(), "[vout]".into(),
+    ]);
+    if request.has_audio {
+        args.extend(["-map".into(), "[ac]".into()]);
+    }
+    args.extend([
+        "-c:v".into(), "libx264".into(), "-preset".into(), "fast".into(), "-crf".into(), "19".into(),
+        "-pix_fmt".into(), "yuv420p".into(),
+    ]);
+    if request.has_audio {
+        args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
+    }
+    args.extend([
+        "-movflags".into(), "+faststart".into(),
+        "-f".into(), "mp4".into(),
+        "-progress".into(), "pipe:1".into(), "-nostats".into(),
+        partial.to_string_lossy().to_string(),
+    ]);
+
+    let emit = |percent: f64, done: bool, output_path: Option<String>| {
+        let _ = app.emit("export://progress", ExportProgress { percent, done, output_path });
+    };
+
+    emit(0.0, false, None);
+    run_ffmpeg_with_progress(&args, total_ms, |p| emit(p, false, None)).map_err(|e| {
+        let _ = fs::remove_file(&partial);
+        e
+    })?;
+
+    fs::rename(&partial, &output).map_err(|e| format!("Finalisation de l'export impossible : {e}"))?;
+    let output_str = output.to_string_lossy().to_string();
+    emit(100.0, true, Some(output_str.clone()));
+    Ok(output_str)
+}
+
+// --- Divers -------------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    let dir = if target.is_dir() {
+        target
+    } else {
+        target.parent().map(Path::to_path_buf).ok_or("Chemin invalide.")?
+    };
+    app.shell()
+        .open(dir.to_string_lossy().to_string(), None)
+        .map_err(|e| format!("Ouverture du dossier impossible : {e}"))
+}

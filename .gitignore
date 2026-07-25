@@ -1,52 +1,37 @@
-# JavaScript / TypeScript
+# Dépendances / builds
 node_modules/
 dist/
 coverage/
 *.tsbuildinfo
-apps/desktop/src-tauri/binaries/*.exe
-apps/desktop/src-tauri/target/
-apps/desktop/.sidecar-build/
+target/
+src-tauri/gen/schemas/
 
-# Python
+# Python (résidus legacy)
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
 
-# Local configuration and secrets
+# Archives legacy : caches et binaires lourds
+legacy/apps/desktop/.sidecar-build/
+legacy/**/binaries/*.exe
+
+# Configuration locale et secrets
 .env
 .env.*
 !.env.example
 *.key
 *.pem
 
-# Runtime data: keep only directory documentation
-data/inbox/*
-data/projects/*
-data/library/*
-data/cache/*
-data/temp/*
-data/backups/*
-data/datasets/*
-data/logs/*
-data/*.db
-data/*.db-*
-data/*.log
-data/*.mp4
-data/*.png
-data/phase*-qa-*/
-data/smoke-*/
-!data/**/.gitkeep
+# Données locales (médias, projets, caches) — jamais versionnées
+data/
 !data/README.md
 
-# Generated media
-*.proxy.mp4
-*.render.mp4
-*.waveform.json
-!tests/fixtures/*.mp4
+# Fixtures de tests legacy autorisées
+!legacy/tests/fixtures/*.mp4
 
-# Editors / OS
+# Éditeurs / OS
 .idea/
 .vscode/
 .DS_Store
