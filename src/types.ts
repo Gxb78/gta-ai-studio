@@ -252,13 +252,63 @@ export function flattenTracks(
   return flat;
 }
 
+export type TextStyle = "impact" | "caption" | "minimal";
+
+export interface TextOverlay {
+  id: string;
+  text: string;
+  timelineStartMs: number;
+  timelineEndMs: number;
+  /** Position du centre du texte dans le cadre de sortie, de 0 a 1. */
+  x: number;
+  y: number;
+  /** Taille dans la sortie 1080x1920, mise a l'echelle dans l'apercu. */
+  fontSizePx: number;
+  style: TextStyle;
+}
+
+export const MAX_TEXT_LENGTH = 200;
+export const MIN_TEXT_DURATION_MS = 100;
+export const MIN_TEXT_SIZE_PX = 36;
+export const MAX_TEXT_SIZE_PX = 180;
+
+const finiteOr = (value: number, fallback: number): number =>
+  Number.isFinite(value) ? value : fallback;
+
+export function normalizeTextOverlay(
+  overlay: TextOverlay,
+  durationMs: number,
+): TextOverlay {
+  const timelineStartMs = Math.max(0, Math.min(durationMs, finiteOr(overlay.timelineStartMs, 0)));
+  const timelineEndMs = Math.max(
+    Math.min(durationMs, timelineStartMs + MIN_TEXT_DURATION_MS),
+    Math.min(durationMs, finiteOr(overlay.timelineEndMs, timelineStartMs + 3000)),
+  );
+  return {
+    ...overlay,
+    text: overlay.text.slice(0, MAX_TEXT_LENGTH),
+    timelineStartMs,
+    timelineEndMs,
+    x: Math.max(0, Math.min(1, finiteOr(overlay.x, 0.5))),
+    y: Math.max(0, Math.min(1, finiteOr(overlay.y, 0.72))),
+    fontSizePx: Math.max(
+      MIN_TEXT_SIZE_PX,
+      Math.min(MAX_TEXT_SIZE_PX, finiteOr(overlay.fontSizePx, 88)),
+    ),
+    style: ["impact", "caption", "minimal"].includes(overlay.style)
+      ? overlay.style
+      : "impact",
+  };
+}
+
 export interface Project {
-  version: 4;
+  version: 5;
   id: string;
   name: string;
   /** Rushs du projet, indexés par leur empreinte. */
   sources: Record<string, SourceInfo>;
   clips: Clip[];
+  textOverlays: TextOverlay[];
   /** Passage au format vertical, partagé par l'aperçu et l'export. */
   framing: FramingMode;
   createdAt: string;
@@ -324,6 +374,7 @@ export interface ExportRequest {
   segments: ExportSegment[];
   /** Plan audio : ce qui s'entend. Indépendant du plan vidéo. */
   audioSegments: ExportSegment[];
+  textOverlays: TextOverlay[];
   mode: FramingMode;
   fileName: string;
   /** Vrai si au moins un rush a du son : les autres reçoivent du silence. */
@@ -629,8 +680,13 @@ export type StoredClip = Omit<
   cropX?: number | null;
 };
 
+type StoredTextOverlay = Partial<Omit<TextOverlay, "id" | "text">> & {
+  id?: string | null;
+  text?: string | null;
+};
+
 /** Forme d'un projet tel qu'il peut sortir du disque, tous formats confondus. */
-export type StoredProject = Omit<Project, "version" | "sources" | "clips" | "framing"> & {
+export type StoredProject = Omit<Project, "version" | "sources" | "clips" | "textOverlays" | "framing"> & {
   version: number;
   /** Format 1 et 2 : un seul rush, porté par le projet. */
   source?: SourceInfo | null;
@@ -639,6 +695,7 @@ export type StoredProject = Omit<Project, "version" | "sources" | "clips" | "fra
   /** Format 4 : le cadrage vertical appartient au projet. */
   framing?: FramingMode | null;
   clips: StoredClip[];
+  textOverlays?: StoredTextOverlay[] | null;
 };
 
 /**
@@ -690,8 +747,33 @@ export function migrateProject(stored: StoredProject): Project {
     });
   }
 
+  const durationMs = timelineDurationMs(clips);
+  const textOverlays = (stored.textOverlays ?? [])
+    .filter(
+      (overlay) =>
+        overlay &&
+        typeof overlay.id === "string" &&
+        typeof overlay.text === "string",
+    )
+    .map((overlay) =>
+      normalizeTextOverlay(
+        {
+          id: overlay.id as string,
+          text: overlay.text as string,
+          timelineStartMs: overlay.timelineStartMs ?? 0,
+          timelineEndMs: overlay.timelineEndMs ?? 3000,
+          x: overlay.x ?? 0.5,
+          y: overlay.y ?? 0.72,
+          fontSizePx: overlay.fontSizePx ?? 88,
+          style: overlay.style ?? "impact",
+        },
+        durationMs,
+      ),
+    )
+    .filter((overlay) => overlay.timelineEndMs > overlay.timelineStartMs);
+
   return {
-    version: 4,
+    version: 5,
     id: stored.id,
     name: stored.name,
     sources,
@@ -699,6 +781,7 @@ export function migrateProject(stored: StoredProject): Project {
     // ancien format, ou séquelle de l'incident des 76 pistes avant son
     // correctif) : on les compacte une fois pour toutes à l'entrée.
     clips: compactTrackIndices(clips),
+    textOverlays,
     // Projets antérieurs au cadrage porté par le projet : c'est le recadrage
     // centré qui était proposé par défaut dans la fenêtre d'export.
     framing: stored.framing === "blur" ? "blur" : "crop",

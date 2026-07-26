@@ -38,6 +38,8 @@ const ASSET_VERSION: u32 = 4;
 const THUMB_VERSION: u32 = 3;
 const WAVEFORM_VERSION: u32 = 1;
 const MAX_SEGMENTS: usize = 500;
+const MAX_TEXT_OVERLAYS: usize = 64;
+const MAX_TEXT_LENGTH: usize = 200;
 /// Un rush = une entrée FFmpeg ouverte simultanément. Au-delà, on sature les
 /// descripteurs de fichiers et la mémoire du décodeur.
 const MAX_SOURCES: usize = 32;
@@ -129,6 +131,92 @@ fn validate_segments(segments: &[ExportSegment], source_count: usize) -> Result<
         }
     }
     Ok(())
+}
+
+fn validate_text_overlays(overlays: &[ExportTextOverlay], duration_ms: f64) -> Result<(), String> {
+    if overlays.len() > MAX_TEXT_OVERLAYS {
+        return Err(format!("Trop de titres ({MAX_TEXT_OVERLAYS} maximum)."));
+    }
+    for overlay in overlays {
+        let text_length = overlay.text.chars().count();
+        if overlay.text.trim().is_empty() || text_length > MAX_TEXT_LENGTH {
+            return Err(format!(
+                "Texte de titre invalide (1 à {MAX_TEXT_LENGTH} caractères)."
+            ));
+        }
+        if overlay
+            .text
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+        {
+            return Err("Un titre contient un caractère de contrôle interdit.".into());
+        }
+        let numbers = [
+            overlay.timeline_start_ms,
+            overlay.timeline_end_ms,
+            overlay.x,
+            overlay.y,
+            overlay.font_size_px,
+        ];
+        if numbers.iter().any(|value| !value.is_finite()) {
+            return Err("Un titre contient une valeur non numérique.".into());
+        }
+        if overlay.timeline_start_ms < 0.0
+            || overlay.timeline_end_ms <= overlay.timeline_start_ms
+            || overlay.timeline_end_ms > duration_ms + 0.001
+        {
+            return Err("Timing de titre hors des bornes du montage.".into());
+        }
+        if !(0.0..=1.0).contains(&overlay.x)
+            || !(0.0..=1.0).contains(&overlay.y)
+            || !(36.0..=180.0).contains(&overlay.font_size_px)
+        {
+            return Err("Position ou taille de titre hors bornes.".into());
+        }
+        if !matches!(overlay.style.as_str(), "impact" | "caption" | "minimal") {
+            return Err("Style de titre inconnu.".into());
+        }
+    }
+    Ok(())
+}
+
+fn escape_filter_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .replace(':', "\\:")
+        .replace('\'', "\\'")
+}
+
+fn drawtext_filter(
+    overlay: &ExportTextOverlay,
+    text_path: &Path,
+    font_path: &Path,
+) -> String {
+    let style = match overlay.style.as_str() {
+        "impact" => "borderw=8:bordercolor=black",
+        "caption" => "box=1:boxcolor=black@0.72:boxborderw=20",
+        _ => "shadowx=3:shadowy=3:shadowcolor=black@0.90",
+    };
+    let start = overlay.timeline_start_ms / 1000.0;
+    let end = overlay.timeline_end_ms / 1000.0;
+    format!(
+        "drawtext=fontfile='{font}':textfile='{text}':expansion=none:fontcolor=white:fontsize={size:.3}:text_align=C:{style}:x='w*{x:.6}-text_w/2':y='h*{y:.6}-text_h/2':enable='between(t,{start:.6},{end:.6})':fix_bounds=1",
+        font = escape_filter_path(font_path),
+        text = escape_filter_path(text_path),
+        size = overlay.font_size_px,
+        x = overlay.x,
+        y = overlay.y,
+    )
+}
+
+struct TemporaryTextFiles(Vec<PathBuf>);
+
+impl Drop for TemporaryTextFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 /// Le montage a-t-il besoin d'une source de silence ?
@@ -288,6 +376,18 @@ pub struct ExportSource {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ExportTextOverlay {
+    pub text: String,
+    pub timeline_start_ms: f64,
+    pub timeline_end_ms: f64,
+    pub x: f64,
+    pub y: f64,
+    pub font_size_px: f64,
+    pub style: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExportRequest {
     pub sources: Vec<ExportSource>,
     /// Plan vidéo : ce qui se voit.
@@ -296,6 +396,8 @@ pub struct ExportRequest {
     /// surcouche muette laisse passer le son de la piste du dessous.
     #[serde(default)]
     pub audio_segments: Vec<ExportSegment>,
+    #[serde(default)]
+    pub text_overlays: Vec<ExportTextOverlay>,
     pub mode: String,
     pub file_name: String,
     /// Vrai si au moins un rush a du son : les autres reçoivent du silence.
@@ -789,6 +891,32 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     let timeline_ms = |s: &ExportSegment| (s.src_out_ms - s.src_in_ms) / s.playback_rate + s.gap_before_ms;
     let total_video_ms: f64 = request.segments.iter().map(timeline_ms).sum();
     let total_audio_ms: f64 = request.audio_segments.iter().map(timeline_ms).sum();
+    validate_text_overlays(&request.text_overlays, total_video_ms)?;
+
+    let (regular_font, bold_font) = if request.text_overlays.is_empty() {
+        (PathBuf::new(), PathBuf::new())
+    } else {
+        let windows_dir = std::env::var_os("WINDIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| "Dossier des polices Windows introuvable.".to_string())?;
+        let regular = windows_dir.join("Fonts").join("segoeui.ttf");
+        let bold = windows_dir.join("Fonts").join("segoeuib.ttf");
+        if !regular.is_file() || !bold.is_file() {
+            return Err("Police Segoe UI introuvable : impossible de rendre les titres.".into());
+        }
+        (regular, bold)
+    };
+
+    let mut temporary_text_files = TemporaryTextFiles(Vec::new());
+    for (index, overlay) in request.text_overlays.iter().enumerate() {
+        let path = exports_dir.join(format!(
+            ".title-{}-{index}.txt",
+            std::process::id()
+        ));
+        fs::write(&path, overlay.text.as_bytes())
+            .map_err(|e| format!("Écriture du titre temporaire impossible : {e}"))?;
+        temporary_text_files.0.push(path);
+    }
     // Le son doit couvrir toute la durée de l'image : on complète au silence.
     let audio_tail_ms = (total_video_ms - total_audio_ms).max(0.0);
 
@@ -900,7 +1028,22 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     }
     // Les segments sont déjà cadrés et normalisés : la concaténation produit
     // directement l'image finale.
-    graph += &format!("concat=n={n}:v=1:a=0[vout];");
+    graph += &format!("concat=n={n}:v=1:a=0[vbase];");
+
+    let mut video_output_label = "vbase".to_string();
+    for (index, overlay) in request.text_overlays.iter().enumerate() {
+        let next_label = format!("vtext{index}");
+        let font = if overlay.style == "impact" {
+            &bold_font
+        } else {
+            &regular_font
+        };
+        graph += &format!(
+            "[{video_output_label}]{}[{next_label}];",
+            drawtext_filter(overlay, &temporary_text_files.0[index], font),
+        );
+        video_output_label = next_label;
+    }
 
     if request.has_audio {
         let m = audio_parts.len();
@@ -945,7 +1088,7 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     }
     args.extend([
         "-filter_complex".into(), graph,
-        "-map".into(), "[vout]".into(),
+        "-map".into(), format!("[{video_output_label}]"),
     ]);
     if request.has_audio {
         args.extend(["-map".into(), "[ac]".into()]);
@@ -1038,6 +1181,18 @@ mod tests {
         vec![ExportSource { path: "a.mp4".into(), has_audio: true }]
     }
 
+    fn titre() -> ExportTextOverlay {
+        ExportTextOverlay {
+            text: "Titre éà\nDeuxième ligne".into(),
+            timeline_start_ms: 500.0,
+            timeline_end_ms: 2500.0,
+            x: 0.5,
+            y: 0.72,
+            font_size_px: 88.0,
+            style: "impact".into(),
+        }
+    }
+
     /// Le cas qui cassait l'export : image continue, son coupé au milieu, tous
     /// les rushs sonores. Le plan audio a besoin de silence alors que le plan
     /// vidéo n'a aucun trou — décider d'après la vidéo faisait référencer une
@@ -1096,6 +1251,34 @@ mod tests {
 
         let bornes_folles = ExportSegment { src_out_ms: 0.0, ..segment(0.0) };
         assert!(validate_segments(&[bornes_folles], 1).is_err(), "durée nulle refusée");
+    }
+
+    #[test]
+    fn les_titres_sont_valides_et_bornes() {
+        assert!(validate_text_overlays(&[titre()], 3000.0).is_ok());
+        let trop_tard = ExportTextOverlay {
+            timeline_end_ms: 3001.0,
+            ..titre()
+        };
+        assert!(validate_text_overlays(&[trop_tard], 3000.0).is_err());
+        let style_inconnu = ExportTextOverlay {
+            style: "arc-en-ciel".into(),
+            ..titre()
+        };
+        assert!(validate_text_overlays(&[style_inconnu], 3000.0).is_err());
+    }
+
+    #[test]
+    fn le_filtre_titre_echappe_les_chemins_windows() {
+        let filter = drawtext_filter(
+            &titre(),
+            Path::new(r"C:\Temp\mon titre.txt"),
+            Path::new(r"C:\Windows\Fonts\segoeuib.ttf"),
+        );
+        assert!(filter.contains("textfile='C\\:/Temp/mon titre.txt'"));
+        assert!(filter.contains("fontfile='C\\:/Windows/Fonts/segoeuib.ttf'"));
+        assert!(filter.contains("text_align=C"));
+        assert!(filter.contains("enable='between(t,0.500000,2.500000)'"));
     }
 
     #[test]

@@ -3,6 +3,8 @@ import { ExportDialog } from "./components/ExportDialog";
 import { ImportView } from "./components/ImportView";
 import { Inspector } from "./components/Inspector";
 import { MediaPanel } from "./components/MediaPanel";
+import { TextInspector } from "./components/TextInspector";
+import { TextPanel } from "./components/TextPanel";
 import { PreviewStage, type ViewMode } from "./components/PreviewStage";
 import { ProjectsDialog } from "./components/ProjectsDialog";
 import { ShortcutsPanel } from "./components/ShortcutsPanel";
@@ -35,6 +37,7 @@ import {
   ASSET_VERSION,
   frameMs,
   sourceAspect,
+  timelineDurationMs,
   timelineTimeToSourceTime,
 } from "./types";
 
@@ -52,6 +55,7 @@ export default function App() {
   const [pxPerSec, setPxPerSec] = useState(30);
   const [tool, setTool] = useState<Tool>("select");
   const [mediaOpen, setMediaOpen] = useState(true);
+  const [textOpen, setTextOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [viewMode, setViewMode] = useState<ViewMode>("output");
   const [showSafeZones, setShowSafeZones] = useState(false);
@@ -138,6 +142,7 @@ export default function App() {
     const project: Project = {
       ...state.project,
       clips: state.clips,
+      textOverlays: state.textOverlays,
       updatedAt: new Date().toISOString(),
     };
     const timer = setTimeout(() => {
@@ -151,7 +156,7 @@ export default function App() {
         });
     }, 600);
     return () => clearTimeout(timer);
-  }, [state.clips, state.project]);
+  }, [state.clips, state.project, state.textOverlays]);
 
   // Progression d'import, affichée dans le panneau Médias.
   useEffect(() => {
@@ -197,7 +202,7 @@ export default function App() {
     const now = new Date().toISOString();
     const baseName = source.originalPath.split(/[\\/]/).pop() ?? "rush";
     const project: Project = {
-      version: 4,
+      version: 5,
       // Distinct de l'empreinte du rush : deux projets créés depuis le même
       // fichier partageraient sinon le même identifiant, donc le même fichier
       // JSON, et s'écraseraient l'un l'autre.
@@ -220,6 +225,7 @@ export default function App() {
           playbackRate: 1,
         },
       ],
+      textOverlays: [],
       framing: "crop",
       createdAt: now,
       updatedAt: now,
@@ -312,12 +318,18 @@ export default function App() {
   }, [playback.clock]);
 
   const deleteSelected = useCallback(() => {
-    if (state.selectedClipId) dispatch({ type: "DELETE_CLIP", clipId: state.selectedClipId });
-  }, [state.selectedClipId]);
+    if (state.selectedTextOverlayId) {
+      dispatch({ type: "DELETE_TEXT", textOverlayId: state.selectedTextOverlayId });
+    } else if (state.selectedClipId) {
+      dispatch({ type: "DELETE_CLIP", clipId: state.selectedClipId });
+    }
+  }, [state.selectedClipId, state.selectedTextOverlayId]);
 
   // Cadence de référence pour les pas clavier : celle du clip sélectionné, à
   // défaut celle du premier rush. Deux rushs peuvent différer.
   const selectedClip = state.clips.find((clip) => clip.id === state.selectedClipId) ?? null;
+  const selectedTextOverlay =
+    state.textOverlays.find((overlay) => overlay.id === state.selectedTextOverlayId) ?? null;
   const referenceFps =
     (selectedClip ? sources[selectedClip.sourceId]?.probe.fps : undefined) ??
     Object.values(sources)[0]?.probe.fps ??
@@ -486,7 +498,15 @@ export default function App() {
           tool={tool}
           onToolChange={setTool}
           mediaOpen={mediaOpen}
-          onToggleMedia={() => setMediaOpen((open) => !open)}
+          onToggleMedia={() => {
+            setMediaOpen((open) => !open);
+            setTextOpen(false);
+          }}
+          textOpen={textOpen}
+          onToggleText={() => {
+            setTextOpen((open) => !open);
+            setMediaOpen(false);
+          }}
           inspectorOpen={inspectorOpen}
           onToggleInspector={() => setInspectorOpen((open) => !open)}
         />
@@ -510,6 +530,22 @@ export default function App() {
             onBeginDrag={(source) => setPendingSource(source)}
             onRelocate={(source) => void handleRelocate(source)}
             onCollapse={() => setMediaOpen(false)}
+          />
+        )}
+
+        {textOpen && (
+          <TextPanel
+            overlays={state.textOverlays}
+            selectedId={state.selectedTextOverlayId}
+            onAdd={() => {
+              dispatch({ type: "ADD_TEXT", atMs: playback.clock.getPlayheadMs() });
+              setInspectorOpen(true);
+            }}
+            onSelect={(textOverlayId) => {
+              dispatch({ type: "SELECT_TEXT", textOverlayId });
+              setInspectorOpen(true);
+            }}
+            onCollapse={() => setTextOpen(false)}
           />
         )}
 
@@ -539,9 +575,34 @@ export default function App() {
               ? (cropX) => dispatch({ type: "SET_CLIP_CROP_X", clipId: visibleClip.id, cropX })
               : null
           }
+          textOverlays={state.textOverlays}
+          selectedTextOverlayId={state.selectedTextOverlayId}
+          onSelectTextOverlay={(textOverlayId) => {
+            dispatch({ type: "SELECT_TEXT", textOverlayId });
+            setInspectorOpen(true);
+          }}
+          onCommitTextPosition={(textOverlayId, x, y) =>
+            dispatch({ type: "UPDATE_TEXT", textOverlayId, patch: { x, y } })
+          }
         />
 
-        {inspectorOpen && (
+        {inspectorOpen && selectedTextOverlay ? (
+          <TextInspector
+            overlay={selectedTextOverlay}
+            durationMs={timelineDurationMs(state.clips)}
+            onUpdate={(patch) =>
+              dispatch({
+                type: "UPDATE_TEXT",
+                textOverlayId: selectedTextOverlay.id,
+                patch,
+              })
+            }
+            onDelete={() =>
+              dispatch({ type: "DELETE_TEXT", textOverlayId: selectedTextOverlay.id })
+            }
+            onCollapse={() => setInspectorOpen(false)}
+          />
+        ) : inspectorOpen ? (
           <Inspector
             clip={selectedClip}
             source={selectedClip ? sources[selectedClip.sourceId] ?? null : null}
@@ -576,7 +637,7 @@ export default function App() {
             onDelete={deleteSelected}
             onCollapse={() => setInspectorOpen(false)}
           />
-        )}
+        ) : null}
       </div>
 
       <Timeline
@@ -632,6 +693,7 @@ export default function App() {
         <ExportDialog
           sources={sources}
           compiledTimeline={compiledTimeline}
+          textOverlays={state.textOverlays}
           framing={framing}
           onSetFraming={(next) => dispatch({ type: "SET_FRAMING", framing: next })}
           missingIds={missingIds}

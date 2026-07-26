@@ -14,7 +14,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
-import type { FramingMode } from "../types";
+import type { FramingMode, TextOverlay } from "../types";
 import { cropXPercent } from "../types";
 import type { PlaybackClock } from "../playback/usePlayback";
 import { PlaybackTimecode } from "./PlaybackTimecode";
@@ -67,6 +67,10 @@ interface Props {
    * déplacement ne remplit pas l'historique d'annulation.
    */
   onCommitCropX: ((cropX: number) => void) | null;
+  textOverlays: TextOverlay[];
+  selectedTextOverlayId: string | null;
+  onSelectTextOverlay: (id: string) => void;
+  onCommitTextPosition: (id: string, x: number, y: number) => void;
 }
 
 export function PreviewStage(props: Props) {
@@ -75,10 +79,12 @@ export function PreviewStage(props: Props) {
     videoA, videoB, audioA, audioB, activeIsA, inGap, framing, cropX, sourceAspect,
     viewMode, onViewModeChange, showSafeZones, onToggleSafeZones, playing, clock,
     durationMs, volume, onVolumeChange, onTogglePlay, onStepFrame, onCommitCropX,
+    textOverlays, selectedTextOverlayId, onSelectTextOverlay, onCommitTextPosition,
   } = props;
 
   const frameRef = useRef<HTMLDivElement | null>(null);
   const blurRef = useRef<HTMLCanvasElement | null>(null);
+  const textNodesRef = useRef(new Map<string, HTMLDivElement>());
   const outputView = viewMode === "output";
   const blurred = framing === "blur" && outputView;
   /** Cadrage en cours de déplacement : il prime sur la valeur du clip. */
@@ -183,6 +189,55 @@ export function PreviewStage(props: Props) {
     });
   }, [activeIsA, blurred, clock, inGap, videoA, videoB]);
 
+  useEffect(() => {
+    const updateVisibility = (playheadMs: number) => {
+      for (const overlay of textOverlays) {
+        const node = textNodesRef.current.get(overlay.id);
+        if (node) {
+          node.hidden =
+            !outputView ||
+            playheadMs < overlay.timelineStartMs ||
+            playheadMs >= overlay.timelineEndMs;
+        }
+      }
+    };
+    updateVisibility(clock.getPlayheadMs());
+    return clock.subscribe(updateVisibility);
+  }, [clock, outputView, textOverlays]);
+
+  const beginTextDrag = (event: React.PointerEvent, overlay: TextOverlay) => {
+    event.stopPropagation();
+    if (event.button !== 0 || !outputView) return;
+    onSelectTextOverlay(overlay.id);
+    const frame = frameRef.current;
+    const node = textNodesRef.current.get(overlay.id);
+    if (!frame || !node) return;
+    const bounds = frame.getBoundingClientRect();
+    const abort = new AbortController();
+    const options = { signal: abort.signal } as const;
+    let x = overlay.x;
+    let y = overlay.y;
+    window.addEventListener(
+      "pointermove",
+      (move: PointerEvent) => {
+        x = Math.max(0, Math.min(1, (move.clientX - bounds.left) / bounds.width));
+        y = Math.max(0, Math.min(1, (move.clientY - bounds.top) / bounds.height));
+        node.style.left = `${x * 100}%`;
+        node.style.top = `${y * 100}%`;
+      },
+      options,
+    );
+    window.addEventListener(
+      "pointerup",
+      () => {
+        abort.abort();
+        onCommitTextPosition(overlay.id, x, y);
+      },
+      options,
+    );
+    window.addEventListener("pointercancel", () => abort.abort(), options);
+  };
+
   const videoClass = (visible: boolean): string =>
     "preview-video" +
     (visible ? " visible" : "") +
@@ -259,6 +314,30 @@ export function PreviewStage(props: Props) {
               <span>Trou — écran noir</span>
             </div>
           )}
+
+          {outputView &&
+            textOverlays.map((overlay) => (
+              <div
+                key={overlay.id}
+                ref={(node) => {
+                  if (node) textNodesRef.current.set(overlay.id, node);
+                  else textNodesRef.current.delete(overlay.id);
+                }}
+                className={
+                  `preview-text text-${overlay.style}` +
+                  (overlay.id === selectedTextOverlayId ? " selected" : "")
+                }
+                style={{
+                  left: `${overlay.x * 100}%`,
+                  top: `${overlay.y * 100}%`,
+                  fontSize: `${(overlay.fontSizePx / 1080) * 100}cqw`,
+                }}
+                onPointerDown={(event) => beginTextDrag(event, overlay)}
+                onClick={(event) => event.stopPropagation()}
+              >
+                {overlay.text || "Titre vide"}
+              </div>
+            ))}
 
           {!outputView && (
             <div

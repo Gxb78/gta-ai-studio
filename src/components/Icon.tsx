@@ -170,6 +170,12 @@ const PATHS = {
     </>
   ),
   plus: <path d="M12 5v14M5 12h14" />,
+  text: (
+    <>
+      <path d="M4 5.5h16M12 5.5v13M8 18.5h8" />
+      <path d="M4 9V5.5M20 9V5.5" />
+    </>
+  ),
   projects: (
     <>
       <rect x="3" y="5" width="18" height="14.5" rx="2" />

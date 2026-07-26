@@ -211,6 +211,7 @@ input:focus { border-color: var(--accent); }
   background: var(--surface);
 }
 .panel-media { border-right: 1px solid var(--border); }
+.panel-text { border-right: 1px solid var(--border); }
 .panel-inspector { border-left: 1px solid var(--border); width: 288px; }
 .panel-head { display: flex; align-items: center; justify-content: space-between; }
 .panel h2 { margin: 0; font-size: 13px; font-weight: 650; letter-spacing: 0.2px; }
@@ -251,6 +252,36 @@ input:focus { border-color: var(--accent); }
   white-space: nowrap;
 }
 .media-add { flex: none; }
+
+.text-list { display: flex; flex-direction: column; gap: 6px; }
+.text-list-item {
+  min-width: 0;
+  height: auto;
+  min-height: 50px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 3px;
+  padding: 9px;
+  text-align: left;
+  white-space: normal;
+  background: var(--surface-2);
+  border-color: var(--border);
+}
+.text-list-item.selected { border-color: var(--accent); background: var(--accent-soft); }
+.text-list-copy {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+}
+.text-content-input { width: 100%; resize: vertical; min-height: 74px; }
+.text-time-grid { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.text-time-grid label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 11px; }
+.text-time-grid input { width: 100%; }
 
 .inspector-section { display: flex; flex-direction: column; gap: 9px; align-items: flex-start; }
 .inspector-section h3 {
@@ -441,6 +472,7 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
   cursor: pointer;
   border-radius: 6px;
   box-shadow: 0 0 0 1px var(--border);
+  container-type: inline-size;
 }
 .frame-output { aspect-ratio: 9 / 16; }
 /* Le cadrage se déplace en tirant l'image : le curseur l'annonce. */
@@ -462,6 +494,38 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
 /* cover = le recadrage 9:16 de l'export ; contain = le fond flou. */
 .preview-video.fit-cover { object-fit: cover; }
 .preview-video.fit-contain { object-fit: contain; }
+
+.preview-text {
+  position: absolute;
+  z-index: 4;
+  transform: translate(-50%, -50%);
+  color: #fff;
+  line-height: 1.08;
+  letter-spacing: 0;
+  text-align: center;
+  white-space: pre;
+  cursor: move;
+  user-select: none;
+  touch-action: none;
+}
+.preview-text.text-impact {
+  font-family: "Segoe UI", Arial, sans-serif;
+  font-weight: 800;
+  -webkit-text-stroke: 0.08em #000;
+  paint-order: stroke fill;
+}
+.preview-text.text-caption {
+  font-family: "Segoe UI", Arial, sans-serif;
+  font-weight: 650;
+  padding: 0.18em 0.28em;
+  background: rgba(0, 0, 0, 0.72);
+}
+.preview-text.text-minimal {
+  font-family: "Segoe UI", Arial, sans-serif;
+  font-weight: 500;
+  text-shadow: 0.04em 0.04em 0.05em rgba(0, 0, 0, 0.9);
+}
+.preview-text.selected { outline: 1px dashed rgba(122, 164, 255, 0.9); outline-offset: 5px; }
 
 /* Fond flou : un canvas minuscule, étiré et flouté. Le surdimensionnement évite
    que le flou laisse voir les bords. */

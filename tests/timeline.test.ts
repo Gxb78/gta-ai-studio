@@ -240,11 +240,12 @@ const source = (id: string): SourceInfo => ({
 const stateWith = (clips: Clip[], selectedClipId: string | null): EditorState => ({
   ...initialEditorState,
   project: {
-    version: 4,
+    version: 5,
     id: "p",
     name: "p",
     sources: { S0: source("S0"), S1: source("S1") },
     clips,
+    textOverlays: [],
     framing: "crop",
     createdAt: "",
     updatedAt: "",
@@ -252,6 +253,38 @@ const stateWith = (clips: Clip[], selectedClipId: string | null): EditorState =>
   clips,
   selectedClipId,
 });
+
+console.log("Titres superposés");
+const titleBase = stateWith([clip("base-titre", 0, 0, 0, 5000)], null);
+const titleAdded = editorReducer(titleBase, { type: "ADD_TEXT", atMs: 1000 });
+check("un titre est ajouté au playhead", titleAdded.textOverlays[0]?.timelineStartMs, 1000);
+check("sa durée par défaut est de trois secondes", titleAdded.textOverlays[0]?.timelineEndMs, 4000);
+check("le titre ajouté est sélectionné", titleAdded.selectedTextOverlayId, titleAdded.textOverlays[0]?.id);
+const titleUpdated = editorReducer(titleAdded, {
+  type: "UPDATE_TEXT",
+  textOverlayId: titleAdded.textOverlays[0].id,
+  patch: { text: "Mission réussie", x: 2, fontSizePx: 999 },
+});
+check("le texte est modifiable", titleUpdated.textOverlays[0]?.text, "Mission réussie");
+check("la position est bornée par le réducteur", titleUpdated.textOverlays[0]?.x, 1);
+check("la taille est bornée par le réducteur", titleUpdated.textOverlays[0]?.fontSizePx, 180);
+const titleUndo = editorReducer(titleUpdated, { type: "UNDO" });
+check("l'édition du titre est annulable", titleUndo.textOverlays[0]?.text, "Nouveau titre");
+const titleUndoAdd = editorReducer(titleUndo, { type: "UNDO" });
+check("l'ajout du titre est annulable", titleUndoAdd.textOverlays.length, 0);
+const titleRedoAdd = editorReducer(titleUndoAdd, { type: "REDO" });
+check("l'ajout du titre est rétablissable", titleRedoAdd.textOverlays.length, 1);
+const titleAtEnd = editorReducer(titleBase, { type: "ADD_TEXT", atMs: 4500 });
+const shortenedUnderTitle = editorReducer(titleAtEnd, {
+  type: "SET_CLIP_RATE",
+  clipId: "base-titre",
+  rate: 4,
+});
+check(
+  "un titre devenu entièrement hors montage est retiré",
+  shortenedUnderTitle.textOverlays.length,
+  0,
+);
 
 const covered = [clip("bas", 0, 0, 0, 20000), clip("haut", 1, 5000, 0, 10000)];
 
@@ -597,11 +630,12 @@ const migre = migrateProject({
   createdAt: "",
   updatedAt: "",
 });
-check("le projet est ramené au format 4", migre.version, 4);
+check("le projet est ramené au format 5", migre.version, 5);
 check("le cadrage par défaut est le recadrage", migre.framing, "crop");
 check("les clips sont recentrés", migre.clips[0].cropX, 0);
 check("les clips sans volume restent au niveau original", migre.clips[0].volume, 1);
 check("les anciens clips n'ont aucun fondu", [migre.clips[0].audioFadeInMs, migre.clips[0].audioFadeOutMs], [0, 0]);
+check("les anciens projets n'ont aucun titre inventé", migre.textOverlays.length, 0);
 
 console.log("Volume par clip");
 check("volume négatif écrêté", clampVolume(-0.5), 0);

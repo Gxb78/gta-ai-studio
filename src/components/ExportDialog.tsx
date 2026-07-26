@@ -3,7 +3,13 @@
 import { useEffect, useRef, useState } from "react";
 import { exportTimeline, onExportProgress, revealPath } from "../ipc";
 import { Icon } from "./Icon";
-import type { ExportRequest, ExportSegment, FramingMode, SourceInfo } from "../types";
+import type {
+  ExportRequest,
+  ExportSegment,
+  FramingMode,
+  SourceInfo,
+  TextOverlay,
+} from "../types";
 import type { CompiledSegment, CompiledTimeline } from "../timeline/compileTimeline";
 import {
   OUTPUT_HEIGHT,
@@ -79,6 +85,7 @@ interface Props {
   sources: Record<string, SourceInfo>;
   /** Plan vidéo. */
   compiledTimeline: CompiledTimeline;
+  textOverlays: TextOverlay[];
   /** Plan audio, indépendant du plan vidéo. */
   /**
    * Cadrage du projet. Il n'est PAS choisi ici : l'aperçu le montre déjà, et
@@ -96,8 +103,16 @@ interface Props {
 type Phase = "config" | "running" | "done" | "error";
 
 export function ExportDialog(props: Props) {
-  const { sources, compiledTimeline, framing, onSetFraming, missingIds, defaultName, onClose } =
-    props;
+  const {
+    sources,
+    compiledTimeline,
+    textOverlays,
+    framing,
+    onSetFraming,
+    missingIds,
+    defaultName,
+    onClose,
+  } = props;
   const clips = compiledTimeline.video.segments.map((segment) => segment.clip);
   const audioClips = compiledTimeline.audio.segments.map((segment) => segment.clip);
   const [fileName, setFileName] = useState(defaultName);
@@ -142,6 +157,7 @@ export function ExportDialog(props: Props) {
         ),
         mode: framing,
         fileName: sanitized,
+        textOverlays: textOverlays.filter((overlay) => overlay.text.trim().length > 0),
       });
       setOutputPath(path);
       setPhase("done");

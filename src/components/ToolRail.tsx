@@ -1,9 +1,7 @@
 // Barre d'outils verticale : le mode du pointeur sur la timeline, puis les
 // panneaux latéraux.
 //
-// On n'y met QUE des outils qui existent. Texte et transitions appartiennent à
-// la couche d'habillage (v0.3) : un bouton grisé pour chacun serait une promesse
-// que l'application ne tient pas.
+// On n'y met que des outils et panneaux réellement disponibles.
 
 import { Icon } from "./Icon";
 
@@ -14,6 +12,8 @@ interface Props {
   onToolChange: (tool: Tool) => void;
   mediaOpen: boolean;
   onToggleMedia: () => void;
+  textOpen: boolean;
+  onToggleText: () => void;
   inspectorOpen: boolean;
   onToggleInspector: () => void;
 }
@@ -50,6 +50,15 @@ export function ToolRail(props: Props) {
         aria-label="Panneau Médias"
       >
         <Icon name="folder" size={17} />
+      </button>
+      <button
+        type="button"
+        className={"icon-btn ghost" + (props.textOpen ? " active" : "")}
+        onClick={props.onToggleText}
+        title="Panneau Titres"
+        aria-label="Panneau Titres"
+      >
+        <Icon name="text" size={17} />
       </button>
       <button
         type="button"

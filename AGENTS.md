@@ -53,7 +53,7 @@ La fluidité d'édition prime sur tout le reste. Une fonctionnalité qui dégrad
 
 1. **v0.1 (actuelle)** : import d'un rush → cuts/trim/split/réorganisation/undo → export 1080×1920 (recadrage centré ou fond flou). Rien d'autre.
 2. **v0.2 (faite)** : confort — multi-rushs, vitesse par clip, son/volume/fondus par clip et par piste, glisser-déposer (fichiers sur la fenêtre, médias sur la timeline), projets récents, relocalisation d'un rush déplacé, panneau Médias, inspecteur, en-têtes de pistes.
-3. v0.3 : habillage — texte, musique, transitions simples, sous-titres automatiques (tâche de fond, jamais dans la boucle d'interaction).
+3. **v0.3 (en cours)** : habillage — faits : titres superposés (styles, position, taille, timing, aperçu direct et export FFmpeg). Restent : musique, transitions simples, sous-titres automatiques (tâche de fond, jamais dans la boucle d'interaction).
 4. v0.4+ : IA d'aide au montage — détection de moments forts, suggestions de cuts, brief → premier jet. La carte `docs/LEGACY_SALVAGE.md` recense les idées éventuellement récupérables sans réimporter l'ancienne architecture.
 
 Ne pas implémenter une couche future sans instruction explicite de l'utilisateur.

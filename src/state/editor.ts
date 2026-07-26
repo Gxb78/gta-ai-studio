@@ -6,7 +6,14 @@
 // Les clips ont une position explicite sur la timeline : ils ne se chevauchent
 // jamais, mais ils peuvent être disjoints (« trous »).
 
-import type { Clip, FramingMode, Project, SourceInfo, StoredProject } from "../types";
+import type {
+  Clip,
+  FramingMode,
+  Project,
+  SourceInfo,
+  StoredProject,
+  TextOverlay,
+} from "../types";
 import {
   MIN_CLIP_MS,
   applyRate,
@@ -21,12 +28,14 @@ import {
   compactTrackIndices,
   firstFreeTrack,
   migrateProject,
+  normalizeTextOverlay,
   neighbourLimits,
   resolveOverlaps,
   sortClips,
   timelineTimeToSourceTime,
   topClipAt,
   trackCount,
+  timelineDurationMs,
 } from "../types";
 
 const HISTORY_LIMIT = 100;
@@ -35,9 +44,11 @@ export interface EditorState {
   project: Project | null;
   /** Vérité committée (celle qu'on sauvegarde et exporte). */
   clips: Clip[];
+  textOverlays: TextOverlay[];
   /** Clips pendant un geste en cours (trim, déplacement), sinon null. */
   transientClips: Clip[] | null;
   selectedClipId: string | null;
+  selectedTextOverlayId: string | null;
   /**
    * Pistes masquées par leur en-tête. Un masquage retire la piste des DEUX
    * plans (image et son) : c'est un interrupteur de piste, pas un réglage
@@ -49,15 +60,22 @@ export interface EditorState {
   hiddenTracks: number[];
   /** Pistes verrouillées : aucun geste de timeline n'y touche. */
   lockedTracks: number[];
-  past: Clip[][];
-  future: Clip[][];
+  past: EditSnapshot[];
+  future: EditSnapshot[];
+}
+
+interface EditSnapshot {
+  clips: Clip[];
+  textOverlays: TextOverlay[];
 }
 
 export const initialEditorState: EditorState = {
   project: null,
   clips: [],
+  textOverlays: [],
   transientClips: null,
   selectedClipId: null,
+  selectedTextOverlayId: null,
   hiddenTracks: [],
   lockedTracks: [],
   past: [],
@@ -105,6 +123,14 @@ export type EditorAction =
   | { type: "SET_TRACK_AUDIO"; track: number; audioEnabled: boolean }
   | { type: "CLOSE" }
   | { type: "SELECT"; clipId: string | null }
+  | { type: "SELECT_TEXT"; textOverlayId: string | null }
+  | { type: "ADD_TEXT"; atMs: number }
+  | {
+      type: "UPDATE_TEXT";
+      textOverlayId: string;
+      patch: Partial<Pick<TextOverlay, "text" | "timelineStartMs" | "timelineEndMs" | "x" | "y" | "fontSizePx" | "style">>;
+    }
+  | { type: "DELETE_TEXT"; textOverlayId: string }
   | { type: "SPLIT_AT"; timelineMs: number }
   | { type: "DELETE_CLIP"; clipId: string }
   /** Trim en cours : aucune entrée d'historique. */
@@ -131,18 +157,41 @@ export const effectiveClips = (state: EditorState): Clip[] =>
 // principe que la borne de piste posée pendant un geste, appliqué une image
 // plus tard. Idempotent sur des indices déjà compacts, donc sans coût quand
 // il n'y a rien à faire.
-const pushHistory = (state: EditorState, nextClips: Clip[]): EditorState => ({
-  ...state,
-  clips: compactTrackIndices(nextClips),
-  transientClips: null,
-  past: [...state.past.slice(-(HISTORY_LIMIT - 1)), state.clips],
-  future: [],
+const snapshot = (state: EditorState): EditSnapshot => ({
+  clips: state.clips,
+  textOverlays: state.textOverlays,
 });
+
+const pushHistory = (
+  state: EditorState,
+  nextClips: Clip[],
+  nextTextOverlays = state.textOverlays,
+): EditorState => {
+  const clips = compactTrackIndices(nextClips);
+  const durationMs = timelineDurationMs(clips);
+  const textOverlays = nextTextOverlays
+    .map((overlay) => normalizeTextOverlay(overlay, durationMs))
+    .filter((overlay) => overlay.timelineEndMs > overlay.timelineStartMs);
+  return {
+    ...state,
+    clips,
+    textOverlays,
+    transientClips: null,
+    past: [...state.past.slice(-(HISTORY_LIMIT - 1)), snapshot(state)],
+    future: [],
+  };
+};
 
 let clipCounter = 0;
 export const newClipId = (): string => {
   clipCounter += 1;
   return `clip-${Date.now().toString(36)}-${clipCounter}`;
+};
+
+let textCounter = 0;
+const newTextOverlayId = (): string => {
+  textCounter += 1;
+  return `text-${Date.now().toString(36)}-${textCounter}`;
 };
 
 /** Ajoute ou retire une valeur d'une liste d'indices de pistes. */
@@ -190,6 +239,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         ...initialEditorState,
         project,
         clips: project.clips,
+        textOverlays: project.textOverlays,
       };
     }
 
@@ -339,7 +389,72 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       return initialEditorState;
 
     case "SELECT":
-      return { ...state, selectedClipId: action.clipId };
+      return { ...state, selectedClipId: action.clipId, selectedTextOverlayId: null };
+
+    case "SELECT_TEXT":
+      return { ...state, selectedClipId: null, selectedTextOverlayId: action.textOverlayId };
+
+    case "ADD_TEXT": {
+      const durationMs = timelineDurationMs(state.clips);
+      if (durationMs < MIN_CLIP_MS) return state;
+      const startMs = Math.max(0, Math.min(durationMs - MIN_CLIP_MS, action.atMs));
+      const overlay = normalizeTextOverlay(
+        {
+          id: newTextOverlayId(),
+          text: "Nouveau titre",
+          timelineStartMs: startMs,
+          timelineEndMs: Math.min(durationMs, startMs + 3000),
+          x: 0.5,
+          y: 0.72,
+          fontSizePx: 88,
+          style: "impact",
+        },
+        durationMs,
+      );
+      return {
+        ...pushHistory(state, state.clips, [...state.textOverlays, overlay]),
+        selectedClipId: null,
+        selectedTextOverlayId: overlay.id,
+      };
+    }
+
+    case "UPDATE_TEXT": {
+      const target = state.textOverlays.find((overlay) => overlay.id === action.textOverlayId);
+      if (!target) return state;
+      const next = normalizeTextOverlay(
+        { ...target, ...action.patch },
+        timelineDurationMs(state.clips),
+      );
+      if (
+        next.text === target.text &&
+        next.timelineStartMs === target.timelineStartMs &&
+        next.timelineEndMs === target.timelineEndMs &&
+        next.x === target.x &&
+        next.y === target.y &&
+        next.fontSizePx === target.fontSizePx &&
+        next.style === target.style
+      ) {
+        return state;
+      }
+      return pushHistory(
+        state,
+        state.clips,
+        state.textOverlays.map((overlay) => overlay.id === target.id ? next : overlay),
+      );
+    }
+
+    case "DELETE_TEXT": {
+      if (!state.textOverlays.some((overlay) => overlay.id === action.textOverlayId)) return state;
+      return {
+        ...pushHistory(
+          state,
+          state.clips,
+          state.textOverlays.filter((overlay) => overlay.id !== action.textOverlayId),
+        ),
+        selectedTextOverlayId:
+          state.selectedTextOverlayId === action.textOverlayId ? null : state.selectedTextOverlayId,
+      };
+    }
 
     case "SPLIT_AT": {
       // Un clip explicitement sélectionné prime, même s'il est recouvert :
@@ -496,10 +611,11 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       const previous = state.past[state.past.length - 1];
       return {
         ...state,
-        clips: previous,
+        clips: previous.clips,
+        textOverlays: previous.textOverlays,
         transientClips: null,
         past: state.past.slice(0, -1),
-        future: [state.clips, ...state.future],
+        future: [snapshot(state), ...state.future],
       };
     }
 
@@ -508,9 +624,10 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       const [next, ...rest] = state.future;
       return {
         ...state,
-        clips: next,
+        clips: next.clips,
+        textOverlays: next.textOverlays,
         transientClips: null,
-        past: [...state.past, state.clips],
+        past: [...state.past, snapshot(state)],
         future: rest,
       };
     }
