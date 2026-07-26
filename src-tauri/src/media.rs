@@ -70,6 +70,30 @@ fn legacy_asset_version() -> u32 {
     1
 }
 
+fn default_rate() -> f64 {
+    1.0
+}
+
+/// Chaîne de filtres `atempo` couvrant un facteur quelconque : chaque instance
+/// n'accepte que 0,5 à 2 sans dégradation, on décompose donc les valeurs
+/// extrêmes en plusieurs étages.
+fn atempo_chain(rate: f64) -> String {
+    let mut remaining = rate;
+    let mut parts: Vec<String> = Vec::new();
+    while remaining < 0.5 {
+        parts.push("atempo=0.5".into());
+        remaining /= 0.5;
+    }
+    while remaining > 2.0 {
+        parts.push("atempo=2.0".into());
+        remaining /= 2.0;
+    }
+    if (remaining - 1.0).abs() > 1e-6 {
+        parts.push(format!("atempo={remaining:.6}"));
+    }
+    if parts.is_empty() { "anull".into() } else { parts.join(",") }
+}
+
 #[derive(Serialize, Clone)]
 struct ImportProgress {
     stage: &'static str,
@@ -92,6 +116,9 @@ pub struct ExportSegment {
     pub source_index: usize,
     pub src_in_ms: f64,
     pub src_out_ms: f64,
+    /// Vitesse constante du segment (1 = temps réel).
+    #[serde(default = "default_rate")]
+    pub playback_rate: f64,
     /// Durée de noir silencieux à insérer AVANT ce segment (trou de la timeline).
     #[serde(default)]
     pub gap_before_ms: f64,
@@ -516,6 +543,9 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         if !segment.gap_before_ms.is_finite() || segment.gap_before_ms < 0.0 {
             return Err("Un trou a une durée invalide.".into());
         }
+        if !segment.playback_rate.is_finite() || !(0.25..=4.0).contains(&segment.playback_rate) {
+            return Err("Vitesse de clip hors bornes (0,25x à 4x).".into());
+        }
         if segment.source_index >= request.sources.len() {
             return Err("Un clip référence un rush inconnu.".into());
         }
@@ -561,16 +591,9 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     // Les entrées lavfi (noir, silence) ne sont ajoutées que si un trou existe.
     // Les deux plans sont assemblés séparément puis mappés ensemble : l'image
     // vient du plan vidéo, le son du plan audio.
-    let total_video_ms: f64 = request
-        .segments
-        .iter()
-        .map(|s| s.src_out_ms - s.src_in_ms + s.gap_before_ms)
-        .sum();
-    let total_audio_ms: f64 = request
-        .audio_segments
-        .iter()
-        .map(|s| s.src_out_ms - s.src_in_ms + s.gap_before_ms)
-        .sum();
+    let timeline_ms = |s: &ExportSegment| (s.src_out_ms - s.src_in_ms) / s.playback_rate + s.gap_before_ms;
+    let total_video_ms: f64 = request.segments.iter().map(timeline_ms).sum();
+    let total_audio_ms: f64 = request.audio_segments.iter().map(timeline_ms).sum();
     // Le son doit couvrir toute la durée de l'image : on complète au silence.
     let audio_tail_ms = (total_video_ms - total_audio_ms).max(0.0);
 
@@ -589,9 +612,14 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     // même SAR, même format audio. On normalise chaque branche plutôt que de
     // l'espérer — c'est indispensable dès que deux rushs diffèrent.
     let (fw, fh) = (request.frame_width, request.frame_height);
+    // `fps` en fin de chaîne : indispensable dès qu'un segment est accéléré ou
+    // qu'un rush a une autre cadence. Sans lui, chaque branche sort avec sa
+    // propre cadence et la durée d'un segment accéléré dérive de quelques
+    // images ; avec lui, elle vaut exactement durée_timeline × cadence.
+    let ffps = request.frame_fps;
     let vfmt = format!(
         "scale={fw}:{fh}:force_original_aspect_ratio=decrease,\
-         pad={fw}:{fh}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
+         pad={fw}:{fh}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,fps={ffps:.6}"
     );
     const AFMT: &str = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo";
     let mut graph = String::new();
@@ -612,9 +640,11 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         let start = segment.src_in_ms / 1000.0;
         let end = segment.src_out_ms / 1000.0;
         let input = segment.source_index;
+        let rate = segment.playback_rate;
         let i = next_label;
+        // setpts=PTS/rate : accélérer revient à rapprocher les horodatages.
         graph += &format!(
-            "[{input}:v]trim=start={start:.3}:end={end:.3},setpts=PTS-STARTPTS,{vfmt}[v{i}];"
+            "[{input}:v]trim=start={start:.3}:end={end:.3},setpts=(PTS-STARTPTS)/{rate:.6},{vfmt}[v{i}];"
         );
         parts.push(i);
         next_label += 1;
@@ -641,13 +671,15 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
             let input = segment.source_index;
             if request.sources[input].has_audio {
                 let i = next_audio;
+                let tempo = atempo_chain(segment.playback_rate);
                 graph += &format!(
-                    "[{input}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{AFMT}[a{i}];"
+                    "[{input}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo},{AFMT}[a{i}];"
                 );
                 audio_parts.push(i);
                 next_audio += 1;
             } else {
-                let duration = (segment.src_out_ms - segment.src_in_ms) / 1000.0;
+                // Rush muet : le silence est déjà à la bonne durée de timeline.
+                let duration = (segment.src_out_ms - segment.src_in_ms) / segment.playback_rate / 1000.0;
                 audio_parts.push(push_silence(&mut graph, duration, &mut next_audio));
             }
         }

@@ -21,6 +21,7 @@ function toSegments(clips: Clip[], indexOf: Map<string, number>): ExportSegment[
       sourceIndex: index,
       srcInMs: clip.srcInMs,
       srcOutMs: clip.srcOutMs,
+      playbackRate: clip.playbackRate,
       gapBeforeMs: Math.max(0, clip.timelineStartMs - cursor),
     });
     cursor = clipEndMs(clip);

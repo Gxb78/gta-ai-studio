@@ -24,6 +24,7 @@ import {
   quantizeToFrame,
   sortClips,
   sourceAspect,
+  timelineTimeToSourceTime,
   timelineDurationMs,
   timelineGaps,
   trackCount,
@@ -379,11 +380,9 @@ export function Timeline(props: Props) {
       const result = snapEdge(originEdge + deltaMs);
       value = result.value;
       snapped = result.snapped;
-      // Retour en temps source : c'est la seule vérité pour lire l'image.
-      const edgeSrcMs =
-        side === "left"
-          ? origin.srcInMs + (value - origin.timelineStartMs)
-          : origin.srcOutMs + (value - clipEndMs(origin));
+      // Retour en temps source par la conversion canonique : sans elle, un clip
+      // accéléré verrait son bord partir deux fois trop loin dans le rush.
+      const edgeSrcMs = timelineTimeToSourceTime(origin, value);
       if (value !== gesture.lastValueMs) {
         gesture.lastValueMs = value;
         dispatch({ type: "TRIM_TRANSIENT", clipId: gesture.clipId, side, edgeSrcMs });
@@ -744,6 +743,9 @@ const ClipView = memo(function ClipView(props: {
   // Le créneau a exactement le format du rush de CE clip : sans ça,
   // object-fit: cover rogne chaque image en une tranche verticale.
   const slotPx = Math.round(THUMB_STRIP_PX * sourceAspect(source.probe));
+  // Échelle du RUSH à l'écran : un clip accéléré comprime son propre temps,
+  // donc vignettes et forme d'onde doivent être comprimées d'autant.
+  const pxPerSourceMs = pxPerMs / clip.playbackRate;
   // Sur un clip très court, les poignées rétrécissent pour rester saisissables.
   const handlePx = Math.max(5, Math.min(14, widthPx / 3));
 
@@ -757,7 +759,7 @@ const ClipView = memo(function ClipView(props: {
         clip={clip}
         source={source}
         widthPx={widthPx}
-        pxPerMs={pxPerMs}
+        pxPerMs={pxPerSourceMs}
         slotPx={slotPx}
         windowFromPx={windowFromPx}
         windowToPx={windowToPx}
@@ -767,12 +769,17 @@ const ClipView = memo(function ClipView(props: {
           className="clip-wave"
           style={{
             backgroundImage: `url("${mediaUrl(source.waveformPath)}")`,
-            backgroundSize: `${source.probe.durationMs * pxPerMs}px 100%`,
-            backgroundPosition: `-${clip.srcInMs * pxPerMs}px 0`,
+            backgroundSize: `${source.probe.durationMs * pxPerSourceMs}px 100%`,
+            backgroundPosition: `-${clip.srcInMs * pxPerSourceMs}px 0`,
           }}
         />
       )}
       <span className="clip-duration">{formatTime(clipDurationMs(clip))}</span>
+      {clip.playbackRate !== 1 && (
+        <span className="clip-rate" title={`Vitesse ${clip.playbackRate}×`}>
+          {clip.playbackRate}×
+        </span>
+      )}
       {!clip.audioEnabled && (
         <span className="clip-muted" title="Son coupé — la piste du dessous continue de s'entendre">
           <Icon name="soundOff" size={13} />

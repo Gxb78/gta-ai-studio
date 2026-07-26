@@ -13,7 +13,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { Clip, SourceInfo } from "../types";
-import { clipAt, clipEndMs, nextClipIndex, sortClips, timelineDurationMs } from "../types";
+import {
+  clipAt,
+  clipEndMs,
+  nextClipIndex,
+  sortClips,
+  timelineDurationMs,
+  timelineTimeToSourceTime,
+} from "../types";
 import { mediaUrl } from "../ipc";
 
 /** Marge de détection de fin de clip (ms) pour anticiper le saut. */
@@ -70,8 +77,18 @@ function assign(media: HTMLMediaElement, source: SourceInfo, srcMs: number): voi
   seekWhenReady(media, Math.max(0, srcMs) / 1000);
 }
 
-/** Écart au-delà duquel on recale le son sur l'image plutôt que de le laisser dériver. */
-const AUDIO_DRIFT_MS = 120;
+/**
+ * Dérive du son par rapport à l'image, en trois zones.
+ *
+ * En dessous du seuil bas on ne touche à rien : réassigner `currentTime` en
+ * permanence s'entend plus que la dérive elle-même. Entre les deux seuils, on
+ * rattrape en douceur en jouant très légèrement plus vite ou moins vite — un
+ * écart de 3 % est inaudible. Au-delà du seuil haut, on saute franchement.
+ */
+const AUDIO_DRIFT_OK_MS = 40;
+const AUDIO_DRIFT_HARD_MS = 80;
+/** Écart de vitesse appliqué pour rattraper en douceur. */
+const AUDIO_NUDGE = 0.03;
 
 export function usePlayback(
   videoA: React.RefObject<HTMLVideoElement | null>,
@@ -149,6 +166,7 @@ export function usePlayback(
       if (!idle || !source) return;
       primedClipIdRef.current = upcoming.id;
       idle.pause();
+      idle.playbackRate = upcoming.playbackRate;
       assign(idle, source, upcoming.srcInMs);
     },
     [getIdle],
@@ -163,7 +181,10 @@ export function usePlayback(
       if (position) {
         const clip = sorted[position.clipIndex];
         const source = sourcesRef.current[clip.sourceId];
-        if (active && source) assign(active, source, clip.srcInMs + position.offsetMs);
+        if (active && source) {
+          active.playbackRate = clip.playbackRate;
+          assign(active, source, timelineTimeToSourceTime(clip, timelineMs));
+        }
         setInGap(false);
         ensurePrimed(sorted[position.clipIndex + 1]);
       } else {
@@ -185,7 +206,7 @@ export function usePlayback(
    * pendant qu'une surcouche muette occupe l'écran.
    */
   const syncAudio = useCallback(
-    (timelineMs: number, shouldPlay: boolean) => {
+    (timelineMs: number, shouldPlay: boolean, force = false) => {
       const elements = [audioA.current, audioB.current];
       const sorted = sortClips(audioClipsRef.current);
       const position = clipAt(sorted, timelineMs);
@@ -213,12 +234,27 @@ export function usePlayback(
       const idle = audioActiveIsARef.current ? audioB.current : audioA.current;
       if (!active) return;
 
-      const targetMs = clip.srcInMs + position.offsetMs;
-      if (active.dataset.clipId !== clip.id) {
+      const targetMs = timelineTimeToSourceTime(clip, timelineMs);
+      // La vitesse du son suit celle du clip ; le rattrapage de dérive vient en plus.
+      const baseRate = clip.playbackRate;
+      if (active.dataset.clipId !== clip.id || force) {
+        // Changement de segment, ou recalage forcé après un seek ou une pause :
+        // on repositionne sans état d'âme, il n'y a rien à préserver.
         active.dataset.clipId = clip.id;
+        active.playbackRate = baseRate;
         assign(active, source, targetMs);
-      } else if (Math.abs(active.currentTime * 1000 - targetMs) > AUDIO_DRIFT_MS) {
-        seekWhenReady(active, targetMs / 1000);
+      } else {
+        const driftMs = active.currentTime * 1000 - targetMs;
+        const drift = Math.abs(driftMs);
+        if (drift > AUDIO_DRIFT_HARD_MS) {
+          active.playbackRate = baseRate;
+          seekWhenReady(active, targetMs / 1000);
+        } else if (drift > AUDIO_DRIFT_OK_MS) {
+          // En retard on accélère, en avance on ralentit, très légèrement.
+          active.playbackRate = baseRate * (driftMs < 0 ? 1 + AUDIO_NUDGE : 1 - AUDIO_NUDGE);
+        } else if (active.playbackRate !== baseRate) {
+          active.playbackRate = baseRate;
+        }
       }
 
       if (shouldPlay && active.paused) void active.play().catch(() => undefined);
@@ -232,6 +268,7 @@ export function usePlayback(
         if (nextSource) {
           primedAudioIdRef.current = upcoming.id;
           idle.dataset.clipId = upcoming.id;
+          idle.playbackRate = upcoming.playbackRate;
           assign(idle, nextSource, upcoming.srcInMs);
         }
       }
@@ -243,7 +280,8 @@ export function usePlayback(
     (timelineMs: number) => {
       const clamped = Math.max(0, Math.min(timelineMs, timelineDurationMs(clipsRef.current)));
       applyPosition(clamped);
-      syncAudio(clamped, false);
+      // Après un seek, le son est recalé d'autorité : aucune dérive à rattraper.
+      syncAudio(clamped, false, true);
       setPlayhead(clamped);
     },
     [applyPosition, setPlayhead, syncAudio],
@@ -304,7 +342,8 @@ export function usePlayback(
           ensurePrimed(upcoming === -1 ? undefined : sorted[upcoming]);
         }
       } else {
-        setPlayhead(clip.timelineStartMs + Math.max(0, sourceMs - clip.srcInMs));
+        // Conversion inverse : le temps source lu donne le temps timeline.
+        setPlayhead(clip.timelineStartMs + Math.max(0, sourceMs - clip.srcInMs) / clip.playbackRate);
         if (active.paused) void active.play().catch(() => undefined);
         setInGap(false);
       }

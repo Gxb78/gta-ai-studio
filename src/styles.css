@@ -559,6 +559,36 @@ body.moving, body.moving * { cursor: grabbing !important; }
   z-index: 2;
 }
 
+/* Vitesse non nominale : signalée en clair sur le clip. */
+.clip-rate {
+  position: absolute;
+  top: 5px;
+  left: 62px;
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-hi);
+  background: rgba(8, 10, 15, 0.72);
+  border-radius: 5px;
+  padding: 2px 6px;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Sélecteur de vitesse de la barre de transport. */
+.rate-select {
+  font: inherit;
+  font-size: 13px;
+  height: 34px;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 8px;
+  cursor: pointer;
+}
+.rate-select:disabled { opacity: 0.35; cursor: default; }
+
 /* Clip dont le son ne participe pas au montage. */
 .clip-muted {
   position: absolute;

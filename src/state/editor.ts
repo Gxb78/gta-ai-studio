@@ -9,6 +9,7 @@
 import type { Clip, Project, SourceInfo, StoredProject } from "../types";
 import {
   MIN_CLIP_MS,
+  applyRate,
   applyTrim,
   clipDurationMs,
   clipEndMs,
@@ -19,6 +20,7 @@ import {
   neighbourLimits,
   resolveOverlaps,
   sortClips,
+  timelineTimeToSourceTime,
   topClipAt,
 } from "../types";
 
@@ -64,6 +66,8 @@ export type EditorAction =
   | { type: "TRIM_EDGE"; clipId: string; side: "left" | "right"; edgeSrcMs: number }
   /** Fait entrer ou sortir un clip du montage sonore. */
   | { type: "TOGGLE_CLIP_AUDIO"; clipId: string }
+  /** Vitesse constante du clip. Une seule entrée d'historique. */
+  | { type: "SET_CLIP_RATE"; clipId: string; rate: number }
   | { type: "CLOSE_GAPS" }
   | { type: "UNDO" }
   | { type: "REDO" };
@@ -151,6 +155,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         srcOutMs: action.source.probe.durationMs,
         // Une surcouche arrive muette : elle ne doit pas couper le son du dessous.
         audioEnabled: track === 0,
+        playbackRate: 1,
       };
       return {
         ...pushHistory(state, [...state.clips, clip]),
@@ -181,7 +186,9 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       if (offsetMs <= MIN_CLIP_MS || offsetMs >= clipDurationMs(clip) - MIN_CLIP_MS) {
         return state;
       }
-      const cutSrc = clip.srcInMs + offsetMs;
+      // Le point de coupe dans le RUSH passe par la conversion canonique :
+      // avec une vitesse de 2, une seconde de montage vaut deux secondes de rush.
+      const cutSrc = timelineTimeToSourceTime(clip, action.timelineMs);
       const left: Clip = { ...clip, srcOutMs: cutSrc };
       const right: Clip = {
         id: newClipId(),
@@ -191,6 +198,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         srcInMs: cutSrc,
         srcOutMs: clip.srcOutMs,
         audioEnabled: clip.audioEnabled,
+        playbackRate: clip.playbackRate,
       };
       const next = state.clips.map((c) => (c.id === clip.id ? left : c));
       next.push(right);
@@ -251,6 +259,14 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
     case "TRIM_EDGE": {
       const next = withGesture(state.clips, action.clipId, (clip, limits) =>
         applyTrim(clip, action.side, action.edgeSrcMs, { ...limits, sourceDurationMs: durationOf(clip) }),
+      );
+      if (!next) return state;
+      return pushHistory(state, next);
+    }
+
+    case "SET_CLIP_RATE": {
+      const next = withGesture(state.clips, action.clipId, (clip, limits) =>
+        applyRate(clip, action.rate, limits),
       );
       if (!next) return state;
       return pushHistory(state, next);

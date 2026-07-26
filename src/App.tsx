@@ -87,6 +87,7 @@ export default function App() {
           srcInMs: 0,
           srcOutMs: source.probe.durationMs,
           audioEnabled: true,
+          playbackRate: 1,
         },
       ],
       createdAt: now,
@@ -228,6 +229,10 @@ export default function App() {
         hasSelection={state.selectedClipId !== null}
         selectionAudible={selectedClip?.audioEnabled ?? true}
         onToggleClipAudio={toggleClipAudio}
+        selectionRate={selectedClip?.playbackRate ?? 1}
+        onSetClipRate={(rate) => {
+          if (state.selectedClipId) dispatch({ type: "SET_CLIP_RATE", clipId: state.selectedClipId, rate });
+        }}
         onTogglePlay={playback.toggle}
         onSplit={splitAtPlayhead}
         onShowShortcuts={() => setShowShortcuts(true)}

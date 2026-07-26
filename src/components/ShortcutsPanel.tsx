@@ -28,6 +28,7 @@ const GROUPS: { title: string; rows: Row[] }[] = [
     rows: [
       { keys: ["S"], label: "Couper au playhead" },
       { keys: ["Suppr"], label: "Supprimer le clip sélectionné" },
+      { keys: ["M"], label: "Couper ou rendre le son du clip" },
       { keys: ["I"], label: "Début du clip au playhead" },
       { keys: ["O"], label: "Fin du clip au playhead" },
       { keys: ["Alt", "←→"], label: "Ajuster la fin, une image à la fois" },

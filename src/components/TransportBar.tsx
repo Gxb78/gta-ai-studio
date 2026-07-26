@@ -16,6 +16,9 @@ interface Props {
   /** Le clip sélectionné participe-t-il au montage sonore ? */
   selectionAudible: boolean;
   onToggleClipAudio: () => void;
+  /** Vitesse du clip sélectionné. */
+  selectionRate: number;
+  onSetClipRate: (rate: number) => void;
   showGuide: boolean;
   onTogglePlay: () => void;
   onSplit: () => void;
@@ -91,6 +94,20 @@ export function TransportBar(props: Props) {
         >
           <Icon name={props.playing ? "pause" : "play"} size={20} />
         </button>
+
+        <select
+          className="rate-select"
+          value={props.selectionRate}
+          onChange={(e) => props.onSetClipRate(Number(e.target.value))}
+          disabled={!props.hasSelection}
+          title="Vitesse du clip sélectionné"
+        >
+          {[0.25, 0.5, 1, 1.5, 2, 3, 4].map((rate) => (
+            <option key={rate} value={rate}>
+              {rate}×
+            </option>
+          ))}
+        </select>
 
         <div className="time">
           <span className="time-now">{formatTime(props.playheadMs)}</span>

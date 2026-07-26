@@ -2,12 +2,16 @@
 // aplatissement déterministe, et parité entre ce que consomment le lecteur et
 // l'export.
 import {
+  clampRate,
+  clipDurationMs,
   clipEndMs,
+  clipSourceDurationMs,
   firstFreeTrack,
   flattenTracks,
   resolveAudioPlan,
   resolveVideoPlan,
   timelineGaps,
+  timelineTimeToSourceTime,
   type Clip,
   type SourceInfo,
 } from "../src/types";
@@ -32,6 +36,7 @@ const clip = (
   srcInMs: srcIn,
   srcOutMs: srcIn + dur,
   audioEnabled: track === 0,
+  playbackRate: 1,
 });
 
 let failures = 0;
@@ -45,6 +50,9 @@ function check(label: string, actual: unknown, expected: unknown): void {
     console.log(`  ÉCHEC ${label}\n        attendu ${e}\n        obtenu  ${a}`);
   }
 }
+
+const sortClipsById = (clips: Clip[]) =>
+  [...clips].sort((a, b) => a.timelineStartMs - b.timelineStartMs);
 
 const summary = (clips: Clip[]) =>
   clips.map((c) => `${c.sourceId}:${c.timelineStartMs}-${clipEndMs(c)}@${c.srcInMs}`);
@@ -267,6 +275,82 @@ check(
 );
 
 // --- Parité lecteur / export -------------------------------------------------
+
+// --- Vitesse par clip --------------------------------------------------------
+
+const withRate = (c: Clip, rate: number): Clip => ({ ...c, playbackRate: rate });
+
+console.log("Durée occupée sur la timeline");
+check("1x : la durée source", clipDurationMs(clip("a", 0, 0, 0, 10000)), 10000);
+check("2x : deux fois moins", clipDurationMs(withRate(clip("a", 0, 0, 0, 10000), 2)), 5000);
+check("0,5x : deux fois plus", clipDurationMs(withRate(clip("a", 0, 0, 0, 10000), 0.5)), 20000);
+
+console.log("Conversion timeline vers source");
+const rapide = withRate(clip("a", 0, 4000, 1000, 10000), 2);
+check("au début du clip", timelineTimeToSourceTime(rapide, 4000), 1000);
+check("au milieu, la source avance deux fois plus vite", timelineTimeToSourceTime(rapide, 5000), 3000);
+check("à la fin", timelineTimeToSourceTime(rapide, clipEndMs(rapide)), 11000);
+
+console.log("Bornes de vitesse");
+check("écrêtée en haut", clampRate(12), 4);
+check("écrêtée en bas", clampRate(0.01), 0.25);
+check("valeur aberrante ramenée à 1", clampRate(Number.NaN), 1);
+
+console.log("Principale accélérée sous une surcouche");
+// Principale à 2x : 20 s de rush occupent 10 s de timeline.
+// Surcouche à 1x de 3 s à 6 s.
+const socleRapide = withRate(clip("bas", 0, 0, 0, 20000), 2);
+const planRapide = flattenTracks([socleRapide, clip("haut", 1, 3000, 0, 3000)]);
+check(
+  "la principale reprend au temps source qu'elle aurait atteint",
+  summary(planRapide),
+  ["S0:0-3000@0", "S1:3000-6000@0", "S0:6000-10000@12000"],
+);
+check("les vitesses sont conservées segment par segment", planRapide.map((s) => s.playbackRate), [2, 1, 2]);
+
+console.log("Surcouche accélérée");
+const surcoucheRapide = flattenTracks([
+  clip("bas", 0, 0, 0, 20000),
+  withRate(clip("haut", 1, 5000, 0, 8000), 4),
+]);
+check(
+  "elle n'occupe que 2 s de montage",
+  summary(surcoucheRapide),
+  ["S0:0-5000@0", "S1:5000-7000@0", "S0:7000-20000@7000"],
+);
+
+console.log("Découpe d'un clip accéléré");
+const coupeRapide = editorReducer(stateWith([socleRapide], "bas"), {
+  type: "SPLIT_AT",
+  timelineMs: 4000,
+});
+const morceaux = sortClipsById(coupeRapide.clips);
+check("deux morceaux", morceaux.length, 2);
+check("le second démarre au bon temps source", morceaux[1].srcInMs, 8000);
+check("la vitesse est héritée", morceaux[1].playbackRate, 2);
+check(
+  "la durée totale de montage est conservée",
+  morceaux.reduce((sum, c) => sum + clipDurationMs(c), 0),
+  10000,
+);
+
+console.log("Changement de vitesse borné par le voisin");
+const serre = [clip("a", 0, 0, 0, 5000), clip("b", 0, 5000, 0, 5000)];
+const ralenti = editorReducer(stateWith(serre, "a"), { type: "SET_CLIP_RATE", clipId: "a", rate: 0.5 });
+const aRalenti = ralenti.clips.find((c) => c.id === "a")!;
+check("le clip ne déborde pas sur le suivant", clipDurationMs(aRalenti), 5000);
+check("la portion de rush utilisée est raccourcie", aRalenti.srcOutMs, 2500);
+
+console.log("Parité lecture / export avec vitesse");
+// L'export reçoit exactement les segments du plan : mêmes bornes source, même
+// vitesse. On vérifie que la durée de montage reconstituée correspond.
+const dureeMontage = planRapide.reduce((sum, s) => sum + clipDurationMs(s), 0);
+check("durée totale identique au montage", dureeMontage, 10000);
+check(
+  "chaque segment a une durée source cohérente avec sa vitesse",
+  planRapide.every((s) => Math.abs(clipSourceDurationMs(s) / s.playbackRate - clipDurationMs(s)) < 0.001),
+  true,
+);
 
 // --- Plans vidéo et audio ----------------------------------------------------
 

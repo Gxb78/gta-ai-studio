@@ -67,7 +67,34 @@ export interface Clip {
    * un plan de coupe ne doit pas couper le son de ce qui se joue en dessous.
    */
   audioEnabled: boolean;
+  /**
+   * Vitesse de lecture constante. 1 = temps réel, 2 = deux fois plus rapide.
+   *
+   * `srcInMs`/`srcOutMs` restent exprimés dans le temps du RUSH ; la vitesse ne
+   * change que la durée occupée sur la timeline.
+   */
+  playbackRate: number;
 }
+
+/** Bornes de vitesse. Au-delà, le décodage et `atempo` deviennent hasardeux. */
+export const MIN_RATE = 0.25;
+export const MAX_RATE = 4;
+
+export const clampRate = (rate: number): number =>
+  Number.isFinite(rate) && rate > 0 ? Math.min(MAX_RATE, Math.max(MIN_RATE, rate)) : 1;
+
+/**
+ * Conversion canonique temps timeline → temps source.
+ *
+ * TOUT ce qui doit savoir « quelle image du rush à cet instant du montage »
+ * passe par ici : lecture, aplatissement, découpe, export. Dupliquer ce calcul
+ * ailleurs, c'est garantir une divergence entre l'aperçu et le rendu final.
+ */
+export const timelineTimeToSourceTime = (clip: Clip, timelineMs: number): number =>
+  clip.srcInMs + (timelineMs - clip.timelineStartMs) * clip.playbackRate;
+
+/** Durée du morceau de rush consommé, indépendamment de la vitesse. */
+export const clipSourceDurationMs = (clip: Clip): number => clip.srcOutMs - clip.srcInMs;
 
 /** Nombre de pistes à afficher : la plus haute occupée, plus une vide au-dessus. */
 export const trackCount = (clips: Clip[]): number =>
@@ -116,15 +143,17 @@ export function flattenTracks(
     }
     if (!top) continue;
 
-    const offset = from - top.timelineStartMs;
+    // Les bornes source passent par la conversion canonique : avec une vitesse
+    // différente de 1, un décalage de timeline ne vaut pas le même décalage de rush.
     const segment: Clip = {
       id: `${top.id}@${Math.round(from)}`,
       sourceId: top.sourceId,
       track: top.track,
       timelineStartMs: from,
-      srcInMs: top.srcInMs + offset,
-      srcOutMs: top.srcInMs + offset + (to - from),
+      srcInMs: timelineTimeToSourceTime(top, from),
+      srcOutMs: timelineTimeToSourceTime(top, to),
       audioEnabled: top.audioEnabled,
+      playbackRate: top.playbackRate,
     };
 
     // Deux tronçons consécutifs du même rush qui se suivent aussi dans le temps
@@ -133,6 +162,7 @@ export function flattenTracks(
     if (
       previous &&
       previous.sourceId === segment.sourceId &&
+      previous.playbackRate === segment.playbackRate &&
       Math.abs(clipEndMs(previous) - segment.timelineStartMs) < 0.001 &&
       Math.abs(previous.srcOutMs - segment.srcInMs) < 0.001
     ) {
@@ -185,6 +215,8 @@ export interface ExportSegment {
   sourceIndex: number;
   srcInMs: number;
   srcOutMs: number;
+  /** Vitesse constante appliquée au segment. */
+  playbackRate: number;
   /** Durée de noir à insérer avant ce segment (trou de la timeline). */
   gapBeforeMs: number;
 }
@@ -222,7 +254,13 @@ export const MIN_CLIP_MS = 66;
 /** En dessous, un intervalle entre deux clips est un artefact d'arrondi, pas un trou. */
 export const GAP_EPSILON_MS = 1;
 
-export const clipDurationMs = (clip: Clip): number => clip.srcOutMs - clip.srcInMs;
+/**
+ * Durée occupée sur la TIMELINE. C'est le sens attendu partout : positions,
+ * chevauchements, trous, largeur à l'écran. Avec une vitesse de 2, un clip de
+ * 10 s de rush n'occupe que 5 s de montage.
+ */
+export const clipDurationMs = (clip: Clip): number =>
+  (clip.srcOutMs - clip.srcInMs) / clip.playbackRate;
 
 export const clipEndMs = (clip: Clip): number => clip.timelineStartMs + clipDurationMs(clip);
 
@@ -361,27 +399,45 @@ export interface TrimLimits {
  * Le résultat respecte toujours le rush, la durée minimale et les voisins.
  */
 export function applyTrim(clip: Clip, side: "left" | "right", edgeSrcMs: number, limits: TrimLimits): Clip {
+  const rate = clip.playbackRate;
+  // Durée SOURCE minimale correspondant à la durée timeline minimale.
+  const minSource = MIN_CLIP_MS * rate;
+
   if (side === "left") {
-    let srcInMs = Math.max(0, Math.min(edgeSrcMs, clip.srcOutMs - MIN_CLIP_MS));
-    let timelineStartMs = clip.timelineStartMs + (srcInMs - clip.srcInMs);
+    let srcInMs = Math.max(0, Math.min(edgeSrcMs, clip.srcOutMs - minSource));
+    // Un décalage de rush se traduit en décalage de timeline divisé par la vitesse.
+    let timelineStartMs = clip.timelineStartMs + (srcInMs - clip.srcInMs) / rate;
     if (timelineStartMs < limits.minStartMs) {
       // On bute sur le clip précédent (ou sur zéro) : le bord s'arrête là.
-      srcInMs += limits.minStartMs - timelineStartMs;
-      srcInMs = Math.max(0, Math.min(srcInMs, clip.srcOutMs - MIN_CLIP_MS));
-      timelineStartMs = clip.timelineStartMs + (srcInMs - clip.srcInMs);
+      srcInMs += (limits.minStartMs - timelineStartMs) * rate;
+      srcInMs = Math.max(0, Math.min(srcInMs, clip.srcOutMs - minSource));
+      timelineStartMs = clip.timelineStartMs + (srcInMs - clip.srcInMs) / rate;
     }
     return { ...clip, srcInMs, timelineStartMs };
   }
 
-  let srcOutMs = Math.min(
-    limits.sourceDurationMs,
-    Math.max(edgeSrcMs, clip.srcInMs + MIN_CLIP_MS),
-  );
-  const maxDuration = limits.maxEndMs - clip.timelineStartMs;
-  if (srcOutMs - clip.srcInMs > maxDuration) {
-    srcOutMs = Math.max(clip.srcInMs + MIN_CLIP_MS, clip.srcInMs + maxDuration);
+  let srcOutMs = Math.min(limits.sourceDurationMs, Math.max(edgeSrcMs, clip.srcInMs + minSource));
+  const maxTimelineDuration = limits.maxEndMs - clip.timelineStartMs;
+  if ((srcOutMs - clip.srcInMs) / rate > maxTimelineDuration) {
+    srcOutMs = Math.max(clip.srcInMs + minSource, clip.srcInMs + maxTimelineDuration * rate);
   }
   return { ...clip, srcOutMs };
+}
+
+/**
+ * Change la vitesse d'un clip en gardant son point d'entrée.
+ *
+ * La durée sur la timeline change donc, et peut empiéter sur le voisin : on la
+ * borne, quitte à raccourcir la portion de rush utilisée.
+ */
+export function applyRate(clip: Clip, rate: number, limits: { maxEndMs: number }): Clip {
+  const playbackRate = clampRate(rate);
+  const maxTimelineDuration = limits.maxEndMs - clip.timelineStartMs;
+  let srcOutMs = clip.srcOutMs;
+  if (clipSourceDurationMs(clip) / playbackRate > maxTimelineDuration) {
+    srcOutMs = clip.srcInMs + maxTimelineDuration * playbackRate;
+  }
+  return { ...clip, playbackRate, srcOutMs };
 }
 
 /**
@@ -438,6 +494,7 @@ export type StoredClip = Omit<
   sourceId?: string | null;
   track?: number | null;
   audioEnabled?: boolean | null;
+  playbackRate?: number | null;
 };
 
 /** Forme d'un projet tel qu'il peut sortir du disque, tous formats confondus. */
@@ -484,6 +541,8 @@ export function migrateProject(stored: StoredProject): Project {
       // Projets antérieurs au son par clip : la piste principale s'entend,
       // les surcouches sont muettes, ce qui reconduit leur comportement.
       audioEnabled: typeof clip.audioEnabled === "boolean" ? clip.audioEnabled : track === 0,
+      // Projets antérieurs à la vitesse par clip : temps réel.
+      playbackRate: clampRate(clip.playbackRate ?? 1),
     });
   }
 
