@@ -3,8 +3,16 @@
 import { useEffect, useRef, useState } from "react";
 import { exportTimeline, onExportProgress, revealPath } from "../ipc";
 import { Icon } from "./Icon";
-import type { Clip, ExportMode, ExportRequest, ExportSegment, SourceInfo } from "../types";
-import { clipEndMs, formatTime, sortClips, timelineGaps, usedSources } from "../types";
+import type { Clip, ExportRequest, ExportSegment, FramingMode, SourceInfo } from "../types";
+import {
+  OUTPUT_HEIGHT,
+  OUTPUT_WIDTH,
+  clipEndMs,
+  formatTime,
+  sortClips,
+  timelineGaps,
+  usedSources,
+} from "../types";
 
 /**
  * Ordre temporel : une entrée FFmpeg par rush utilisé, chaque segment pointant
@@ -23,6 +31,7 @@ function toSegments(clips: Clip[], indexOf: Map<string, number>): ExportSegment[
       srcOutMs: clip.srcOutMs,
       playbackRate: clip.playbackRate,
       gapBeforeMs: Math.max(0, clip.timelineStartMs - cursor),
+      cropX: clip.cropX,
     });
     cursor = clipEndMs(clip);
   }
@@ -33,18 +42,15 @@ function buildRequest(
   sources: Record<string, SourceInfo>,
   clips: Clip[],
   audioClips: Clip[],
-): Pick<
-  ExportRequest,
-  "sources" | "segments" | "audioSegments" | "hasAudio" | "frameWidth" | "frameHeight" | "frameFps"
-> {
+): Pick<ExportRequest, "sources" | "segments" | "audioSegments" | "hasAudio" | "frameFps"> {
   // Les deux plans partagent la même liste de rushs : les index concordent.
   const used = usedSources(sources, clips.concat(audioClips));
   const indexOf = new Map(used.map((source, index) => [source.id, index]));
   const segments = toSegments(clips, indexOf);
   const audioSegments = toSegments(audioClips, indexOf);
 
-  // Le format de sortie est imposé par le premier rush : tous les autres y sont
-  // ramenés avant concaténation, sinon FFmpeg refuse d'assembler les flux.
+  // La définition de sortie est imposée (1080×1920) et appliquée segment par
+  // segment ; seule la cadence se cale sur le premier rush.
   const reference = used[0];
   return {
     sources: used.map((source) => ({ path: source.originalPath, hasAudio: source.probe.hasAudio })),
@@ -52,8 +58,6 @@ function buildRequest(
     audioSegments,
     // Un montage sans aucun clip sonore sort muet, plutôt que du silence encodé.
     hasAudio: audioSegments.length > 0 && used.some((source) => source.probe.hasAudio),
-    frameWidth: reference?.probe.width ?? 1920,
-    frameHeight: reference?.probe.height ?? 1080,
     frameFps: reference?.probe.fps ?? 30,
   };
 }
@@ -64,14 +68,24 @@ interface Props {
   clips: Clip[];
   /** Plan audio, indépendant du plan vidéo. */
   audioClips: Clip[];
+  /**
+   * Cadrage du projet. Il n'est PAS choisi ici : l'aperçu le montre déjà, et
+   * deux valeurs distinctes rendraient l'aperçu menteur. On peut le changer
+   * depuis cette fenêtre, mais c'est bien le projet qu'on change.
+   */
+  framing: FramingMode;
+  onSetFraming: (framing: FramingMode) => void;
+  /** Rushs dont le fichier d'origine est introuvable : l'export échouerait. */
+  missingIds: ReadonlySet<string>;
   defaultName: string;
   onClose: () => void;
 }
 
 type Phase = "config" | "running" | "done" | "error";
 
-export function ExportDialog({ sources, clips, audioClips, defaultName, onClose }: Props) {
-  const [mode, setMode] = useState<ExportMode>("crop");
+export function ExportDialog(props: Props) {
+  const { sources, clips, audioClips, framing, onSetFraming, missingIds, defaultName, onClose } =
+    props;
   const [fileName, setFileName] = useState(defaultName);
   const [phase, setPhase] = useState<Phase>("config");
   const [percent, setPercent] = useState(0);
@@ -96,15 +110,19 @@ export function ExportDialog({ sources, clips, audioClips, defaultName, onClose 
   const sanitized = fileName.replace(/[^A-Za-z0-9 _-]/g, "").trim();
   const gaps = timelineGaps(clips);
   const gapTotalMs = gaps.reduce((sum, gap) => sum + (gap.endMs - gap.startMs), 0);
+  // Un rush introuvable fait échouer FFmpeg : autant le dire avant de lancer.
+  const missingUsed = usedSources(sources, clips.concat(audioClips)).filter((source) =>
+    missingIds.has(source.id),
+  );
 
   const start = async () => {
-    if (!sanitized) return;
+    if (!sanitized || missingUsed.length > 0) return;
     setPhase("running");
     setPercent(0);
     try {
       const path = await exportTimeline({
         ...buildRequest(sources, clips, audioClips),
-        mode,
+        mode: framing,
         fileName: sanitized,
       });
       setOutputPath(path);
@@ -119,7 +137,9 @@ export function ExportDialog({ sources, clips, audioClips, defaultName, onClose 
     <div className="modal-backdrop" onClick={phase === "running" ? undefined : onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
-          <h2>Exporter en 1080×1920</h2>
+          <h2>
+            Exporter en {OUTPUT_WIDTH}×{OUTPUT_HEIGHT}
+          </h2>
           {phase !== "running" && (
             <button className="icon-btn ghost" onClick={onClose} title="Fermer">
               <Icon name="close" />
@@ -139,22 +159,37 @@ export function ExportDialog({ sources, clips, audioClips, defaultName, onClose 
               />
             </label>
             <div className="field">
-              <span>Passage au format vertical</span>
+              <span>Passage au format vertical — réglage du projet</span>
               <div className="option-grid">
-                <label className={"option" + (mode === "crop" ? " selected" : "")}>
-                  <input type="radio" checked={mode === "crop"} onChange={() => setMode("crop")} />
+                <label className={"option" + (framing === "crop" ? " selected" : "")}>
+                  <input
+                    type="radio"
+                    checked={framing === "crop"}
+                    onChange={() => onSetFraming("crop")}
+                  />
                   <span className="option-preview option-crop" aria-hidden="true" />
-                  <span className="option-label">Recadrage centré</span>
+                  <span className="option-label">Recadrage</span>
                   <span className="option-note muted">Plein écran, coupe les côtés</span>
                 </label>
-                <label className={"option" + (mode === "blur" ? " selected" : "")}>
-                  <input type="radio" checked={mode === "blur"} onChange={() => setMode("blur")} />
+                <label className={"option" + (framing === "blur" ? " selected" : "")}>
+                  <input
+                    type="radio"
+                    checked={framing === "blur"}
+                    onChange={() => onSetFraming("blur")}
+                  />
                   <span className="option-preview option-blur" aria-hidden="true" />
                   <span className="option-label">Fond flou</span>
                   <span className="option-note muted">Image entière conservée</span>
                 </label>
               </div>
             </div>
+            {missingUsed.length > 0 && (
+              <p className="error">
+                {missingUsed.length} rush introuvable sur le disque. Retrouve-le dans le
+                panneau Médias avant d'exporter : l'export lit les fichiers d'origine, pas
+                les proxys.
+              </p>
+            )}
             {gaps.length > 0 && (
               <p className="warn">
                 {gaps.length} trou{gaps.length > 1 ? "s" : ""} dans la timeline (
@@ -164,7 +199,11 @@ export function ExportDialog({ sources, clips, audioClips, defaultName, onClose 
             )}
             <div className="modal-actions">
               <button className="ghost" onClick={onClose}>Annuler</button>
-              <button className="primary" onClick={() => void start()} disabled={!sanitized}>
+              <button
+                className="primary"
+                onClick={() => void start()}
+                disabled={!sanitized || missingUsed.length > 0}
+              >
                 Lancer l'export
               </button>
             </div>

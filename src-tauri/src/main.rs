@@ -18,6 +18,9 @@ fn main() {
             media::reveal_path,
             project::save_project,
             project::load_last_project,
+            project::load_project,
+            project::list_projects,
+            project::paths_exist,
         ])
         .run(tauri::generate_context!())
         .expect("erreur au lancement de GTA Studio");

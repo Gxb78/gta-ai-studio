@@ -74,24 +74,113 @@ fn default_rate() -> f64 {
     1.0
 }
 
+/// Contrôle d'un plan avant construction du graphe. Les deux plans y passent :
+/// tout ce qui finit dans une commande FFmpeg doit être validé.
+fn validate_segments(segments: &[ExportSegment], source_count: usize) -> Result<(), String> {
+    if segments.len() > MAX_SEGMENTS {
+        return Err(format!("Trop de segments ({MAX_SEGMENTS} maximum)."));
+    }
+    for segment in segments {
+        if !segment.src_in_ms.is_finite() || !segment.src_out_ms.is_finite() {
+            return Err("Un segment a des bornes non numériques.".into());
+        }
+        if segment.src_in_ms < 0.0 || segment.src_out_ms <= segment.src_in_ms {
+            return Err("Un segment a des bornes invalides.".into());
+        }
+        if !segment.gap_before_ms.is_finite() || segment.gap_before_ms < 0.0 {
+            return Err("Un trou a une durée invalide.".into());
+        }
+        if !segment.playback_rate.is_finite() || !(0.25..=4.0).contains(&segment.playback_rate) {
+            return Err("Vitesse de segment hors bornes (0,25x à 4x).".into());
+        }
+        if segment.source_index >= source_count {
+            return Err("Un segment référence un rush inconnu.".into());
+        }
+    }
+    Ok(())
+}
+
+/// Le montage a-t-il besoin d'une source de silence ?
+///
+/// Extrait pour être testable : c'est la décision qui, mal prise, produisait un
+/// graphe FFmpeg référençant une entrée inexistante.
+fn needs_silence_input(
+    has_audio: bool,
+    audio_segments: &[ExportSegment],
+    audio_tail_ms: f64,
+    sources: &[ExportSource],
+) -> bool {
+    has_audio
+        && (audio_segments.iter().any(|s| s.gap_before_ms > 0.0)
+            || audio_tail_ms > 1.0
+            || sources.iter().any(|s| !s.has_audio))
+}
+
+/// Format de sortie, imposé : c'est le format TikTok/Reels/Shorts.
+/// Doit rester aligné sur OUTPUT_WIDTH / OUTPUT_HEIGHT dans src/types.ts.
+const OUT_WIDTH: u32 = 1080;
+const OUT_HEIGHT: u32 = 1920;
+
+/// Bruite le décalage de cadrage : hors de [−1, 1] il n'a aucun sens, et il
+/// finit dans une expression de filtre — il est validé avant, pas espéré.
+fn sane_crop_x(crop_x: f64) -> f64 {
+    if crop_x.is_finite() {
+        crop_x.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Passage d'un segment au format vertical, du brut `[raw{i}]` vers `[v{i}]`.
+///
+/// C'est ici que se joue la promesse « l'aperçu montre exactement l'export » :
+///   - `crop` : la fenêtre 9:16 la plus large possible, glissée horizontalement
+///     par `cropX` (−1 = collée à gauche, +1 = collée à droite) ;
+///   - `blur` : l'image entière, posée sur une copie élargie et floutée.
+fn framing_chain(mode: &str, crop_x: f64, i: usize, vtail: &str) -> String {
+    if mode == "crop" {
+        // x = centre + cropX × marge disponible. Avec cropX = 0 on retrouve
+        // exactement le recadrage centré d'avant le cadrage par clip.
+        let offset = sane_crop_x(crop_x);
+        format!(
+            "[raw{i}]crop='min(iw,ih*9/16)':'min(ih,iw*16/9)':\
+             '(iw-out_w)/2+({offset:.4})*(iw-out_w)/2':'(ih-out_h)/2',\
+             scale={OUT_WIDTH}:{OUT_HEIGHT}:flags=lanczos,{vtail}[v{i}];"
+        )
+    } else {
+        format!(
+            "[raw{i}]split=2[bga{i}][fga{i}];\
+             [bga{i}]scale={OUT_WIDTH}:{OUT_HEIGHT}:force_original_aspect_ratio=increase,\
+             crop={OUT_WIDTH}:{OUT_HEIGHT},gblur=sigma=24[bg{i}];\
+             [fga{i}]scale={OUT_WIDTH}:{OUT_HEIGHT}:force_original_aspect_ratio=decrease[fg{i}];\
+             [bg{i}][fg{i}]overlay=(W-w)/2:(H-h)/2,{vtail}[v{i}];"
+        )
+    }
+}
+
 /// Chaîne de filtres `atempo` couvrant un facteur quelconque : chaque instance
 /// n'accepte que 0,5 à 2 sans dégradation, on décompose donc les valeurs
 /// extrêmes en plusieurs étages.
 fn atempo_chain(rate: f64) -> String {
+    let stage = |value: f64| format!("atempo={value:.6}");
     let mut remaining = rate;
     let mut parts: Vec<String> = Vec::new();
     while remaining < 0.5 {
-        parts.push("atempo=0.5".into());
+        parts.push(stage(0.5));
         remaining /= 0.5;
     }
     while remaining > 2.0 {
-        parts.push("atempo=2.0".into());
+        parts.push(stage(2.0));
         remaining /= 2.0;
     }
     if (remaining - 1.0).abs() > 1e-6 {
-        parts.push(format!("atempo={remaining:.6}"));
+        parts.push(stage(remaining));
     }
-    if parts.is_empty() { "anull".into() } else { parts.join(",") }
+    if parts.is_empty() {
+        "anull".into()
+    } else {
+        parts.join(",")
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -122,6 +211,9 @@ pub struct ExportSegment {
     /// Durée de noir silencieux à insérer AVANT ce segment (trou de la timeline).
     #[serde(default)]
     pub gap_before_ms: f64,
+    /// Décalage horizontal du cadrage 9:16, de −1 à +1 (0 = centré).
+    #[serde(default)]
+    pub crop_x: f64,
 }
 
 #[derive(Deserialize)]
@@ -145,10 +237,9 @@ pub struct ExportRequest {
     pub file_name: String,
     /// Vrai si au moins un rush a du son : les autres reçoivent du silence.
     pub has_audio: bool,
-    /// Format de sortie du montage. Tous les rushs y sont ramenés avant
-    /// concaténation, sinon le filtre `concat` refuse d'assembler les flux.
-    pub frame_width: u32,
-    pub frame_height: u32,
+    /// Cadence de sortie. La définition, elle, est imposée : c'est le format
+    /// vertical `OUT_WIDTH`×`OUT_HEIGHT`, auquel chaque segment est ramené
+    /// individuellement — c'est ce qui rend les flux homogènes pour `concat`.
     pub frame_fps: f64,
 }
 
@@ -536,23 +627,11 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     if request.sources.len() > MAX_SOURCES {
         return Err(format!("Trop de rushs ({MAX_SOURCES} maximum)."));
     }
-    for segment in &request.segments {
-        if segment.src_in_ms < 0.0 || segment.src_out_ms <= segment.src_in_ms {
-            return Err("Un clip a des bornes invalides.".into());
-        }
-        if !segment.gap_before_ms.is_finite() || segment.gap_before_ms < 0.0 {
-            return Err("Un trou a une durée invalide.".into());
-        }
-        if !segment.playback_rate.is_finite() || !(0.25..=4.0).contains(&segment.playback_rate) {
-            return Err("Vitesse de clip hors bornes (0,25x à 4x).".into());
-        }
-        if segment.source_index >= request.sources.len() {
-            return Err("Un clip référence un rush inconnu.".into());
-        }
-    }
-    if !(16..=7680).contains(&request.frame_width) || !(16..=7680).contains(&request.frame_height) {
-        return Err("Dimensions de sortie invalides.".into());
-    }
+    // Les DEUX plans sont validés : le plan audio finit lui aussi dans le graphe
+    // FFmpeg, le laisser passer sans contrôle reviendrait à faire confiance à
+    // l'appelant pour construire une commande.
+    validate_segments(&request.segments, request.sources.len())?;
+    validate_segments(&request.audio_segments, request.sources.len())?;
     if !request.frame_fps.is_finite() || request.frame_fps <= 0.0 || request.frame_fps > 480.0 {
         return Err("Cadence de sortie invalide.".into());
     }
@@ -597,30 +676,34 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     // Le son doit couvrir toute la durée de l'image : on complète au silence.
     let audio_tail_ms = (total_video_ms - total_audio_ms).max(0.0);
 
+    // Le noir dépend du plan VIDÉO, le silence du plan AUDIO. Les confondre
+    // faisait référencer une entrée `anullsrc` jamais ajoutée à la commande dès
+    // qu'on coupait le son d'un clip au milieu d'une image continue : FFmpeg
+    // échouait alors sur « Invalid file index ».
     let has_gap = request.segments.iter().any(|s| s.gap_before_ms > 0.0);
+    let needs_silence = needs_silence_input(
+        request.has_audio,
+        &request.audio_segments,
+        audio_tail_ms,
+        &request.sources,
+    );
+
     // Les rushs occupent les entrées 0..n ; les sources synthétiques (noir,
-    // silence) viennent juste après.
+    // silence) viennent juste après, dans cet ordre.
     let n_sources = request.sources.len();
     let black_input = n_sources;
     let silence_input = n_sources + if has_gap { 1 } else { 0 };
-    // Un rush muet dans un montage sonore a quand même besoin d'une piste audio,
-    // sinon `concat` reçoit un nombre de flux incohérent.
-    let needs_silence = request.has_audio
-        && (has_gap || request.sources.iter().any(|s| !s.has_audio));
 
     // `concat` exige des flux homogènes : même définition, même format de pixel,
-    // même SAR, même format audio. On normalise chaque branche plutôt que de
-    // l'espérer — c'est indispensable dès que deux rushs diffèrent.
-    let (fw, fh) = (request.frame_width, request.frame_height);
+    // même SAR, même format audio. Chaque segment est donc amené AU FORMAT DE
+    // SORTIE avant d'être concaténé, cadrage compris : le décalage de cadrage
+    // appartient au clip, il ne peut pas s'appliquer après l'assemblage.
     // `fps` en fin de chaîne : indispensable dès qu'un segment est accéléré ou
     // qu'un rush a une autre cadence. Sans lui, chaque branche sort avec sa
     // propre cadence et la durée d'un segment accéléré dérive de quelques
     // images ; avec lui, elle vaut exactement durée_timeline × cadence.
     let ffps = request.frame_fps;
-    let vfmt = format!(
-        "scale={fw}:{fh}:force_original_aspect_ratio=decrease,\
-         pad={fw}:{fh}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,fps={ffps:.6}"
-    );
+    let vtail = format!("setsar=1,format=yuv420p,fps={ffps:.6}");
     const AFMT: &str = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo";
     let mut graph = String::new();
 
@@ -631,8 +714,9 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         if segment.gap_before_ms > 0.0 {
             let duration = segment.gap_before_ms / 1000.0;
             let i = next_label;
+            // Le noir est déjà produit au format de sortie : rien à cadrer.
             graph += &format!(
-                "[{black_input}:v]trim=duration={duration:.3},setpts=PTS-STARTPTS,{vfmt}[v{i}];"
+                "[{black_input}:v]trim=duration={duration:.3},setpts=PTS-STARTPTS,{vtail}[v{i}];"
             );
             parts.push(i);
             next_label += 1;
@@ -644,8 +728,9 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         let i = next_label;
         // setpts=PTS/rate : accélérer revient à rapprocher les horodatages.
         graph += &format!(
-            "[{input}:v]trim=start={start:.3}:end={end:.3},setpts=(PTS-STARTPTS)/{rate:.6},{vfmt}[v{i}];"
+            "[{input}:v]trim=start={start:.3}:end={end:.3},setpts=(PTS-STARTPTS)/{rate:.6}[raw{i}];"
         );
+        graph += &framing_chain(&request.mode, segment.crop_x, i, &vtail);
         parts.push(i);
         next_label += 1;
     }
@@ -696,7 +781,9 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     for i in &parts {
         graph += &format!("[v{i}]");
     }
-    graph += &format!("concat=n={n}:v=1:a=0[vc];");
+    // Les segments sont déjà cadrés et normalisés : la concaténation produit
+    // directement l'image finale.
+    graph += &format!("concat=n={n}:v=1:a=0[vout];");
 
     if request.has_audio {
         let m = audio_parts.len();
@@ -708,16 +795,9 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         }
         graph += &format!("concat=n={m}:v=0:a=1[ac];");
     }
-    match request.mode.as_str() {
-        "crop" => {
-            graph += "[vc]crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=1080:1920:flags=lanczos,setsar=1[vout]";
-        }
-        _ => {
-            graph += "[vc]split=2[bga][fga];\
-                [bga]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=24[bg];\
-                [fga]scale=1080:1920:force_original_aspect_ratio=decrease[fg];\
-                [bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[vout]";
-        }
+    // Un point-virgule final ferait échouer FFmpeg sur une chaîne de filtres vide.
+    while graph.ends_with(';') {
+        graph.pop();
     }
 
     let total_ms = total_video_ms;
@@ -736,7 +816,8 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         let fps = request.frame_fps;
         args.extend([
             "-f".into(), "lavfi".into(),
-            "-i".into(), format!("color=c=black:s={fw}x{fh}:r={fps:.3}"),
+            "-i".into(),
+            format!("color=c=black:s={OUT_WIDTH}x{OUT_HEIGHT}:r={fps:.3}"),
         ]);
     }
     if needs_silence {
@@ -795,4 +876,77 @@ pub async fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
     app.shell()
         .open(dir.to_string_lossy().to_string(), None)
         .map_err(|e| format!("Ouverture du dossier impossible : {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(gap_before_ms: f64) -> ExportSegment {
+        ExportSegment {
+            source_index: 0,
+            src_in_ms: 0.0,
+            src_out_ms: 1000.0,
+            playback_rate: 1.0,
+            crop_x: 0.0,
+            gap_before_ms,
+        }
+    }
+
+    fn sonore() -> Vec<ExportSource> {
+        vec![ExportSource { path: "a.mp4".into(), has_audio: true }]
+    }
+
+    /// Le cas qui cassait l'export : image continue, son coupé au milieu, tous
+    /// les rushs sonores. Le plan audio a besoin de silence alors que le plan
+    /// vidéo n'a aucun trou — décider d'après la vidéo faisait référencer une
+    /// entrée FFmpeg jamais ajoutée.
+    #[test]
+    fn le_silence_est_decide_par_le_plan_audio() {
+        assert!(
+            needs_silence_input(true, &[segment(0.0)], 10_000.0, &sonore()),
+            "un plan audio plus court que l'image réclame du silence"
+        );
+        assert!(
+            needs_silence_input(true, &[segment(2_000.0)], 0.0, &sonore()),
+            "un trou au milieu du plan audio réclame du silence"
+        );
+    }
+
+    #[test]
+    fn un_rush_muet_reclame_du_silence() {
+        let muet = vec![ExportSource { path: "b.mp4".into(), has_audio: false }];
+        assert!(needs_silence_input(true, &[segment(0.0)], 0.0, &muet));
+    }
+
+    #[test]
+    fn un_montage_plein_et_sonore_ne_reclame_rien() {
+        assert!(!needs_silence_input(true, &[segment(0.0)], 0.0, &sonore()));
+        assert!(
+            !needs_silence_input(false, &[segment(5_000.0)], 9_000.0, &sonore()),
+            "un montage muet n'a pas de branche audio du tout"
+        );
+    }
+
+    #[test]
+    fn les_deux_plans_sont_validés() {
+        assert!(validate_segments(&[segment(0.0)], 1).is_ok());
+
+        let hors_bornes = ExportSegment { playback_rate: 12.0, ..segment(0.0) };
+        assert!(validate_segments(&[hors_bornes], 1).is_err(), "vitesse aberrante refusée");
+
+        let rush_inconnu = ExportSegment { source_index: 7, ..segment(0.0) };
+        assert!(validate_segments(&[rush_inconnu], 1).is_err(), "rush inexistant refusé");
+
+        let bornes_folles = ExportSegment { src_out_ms: 0.0, ..segment(0.0) };
+        assert!(validate_segments(&[bornes_folles], 1).is_err(), "durée nulle refusée");
+    }
+
+    #[test]
+    fn la_chaine_atempo_couvre_les_bornes() {
+        assert_eq!(atempo_chain(1.0), "anull");
+        assert_eq!(atempo_chain(2.0), "atempo=2.000000");
+        assert_eq!(atempo_chain(4.0), "atempo=2.000000,atempo=2.000000");
+        assert_eq!(atempo_chain(0.25), "atempo=0.500000,atempo=0.500000");
+    }
 }

@@ -106,6 +106,89 @@ const PATHS = {
     </>
   ),
   close: <path d="M6 6l12 12M18 6 6 18" />,
+  eye: (
+    <>
+      <path d="M2.5 12S6 6.5 12 6.5 21.5 12 21.5 12S18 17.5 12 17.5 2.5 12 2.5 12z" />
+      <circle cx="12" cy="12" r="2.8" />
+    </>
+  ),
+  eyeOff: (
+    <>
+      <path d="M4 5l16 14" />
+      <path d="M9.2 7.1A9.4 9.4 0 0 1 12 6.5c6 0 9.5 5.5 9.5 5.5a17 17 0 0 1-3 3.6" />
+      <path d="M6.3 8.6A16.6 16.6 0 0 0 2.5 12S6 17.5 12 17.5c1 0 1.9-.15 2.8-.4" />
+    </>
+  ),
+  lock: (
+    <>
+      <rect x="5" y="10.5" width="14" height="9.5" rx="2" />
+      <path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5" />
+    </>
+  ),
+  unlock: (
+    <>
+      <rect x="5" y="10.5" width="14" height="9.5" rx="2" />
+      <path d="M8.5 10.5V8a3.5 3.5 0 0 1 6.6-1.7" />
+    </>
+  ),
+  settings: (
+    <>
+      <circle cx="12" cy="12" r="3" />
+      <path d="M12 3v2.4M12 18.6V21M4.2 7.5l2 1.2M17.8 15.3l2 1.2M4.2 16.5l2-1.2M17.8 8.7l2-1.2" />
+    </>
+  ),
+  cursor: <path d="M6 3.5 18.5 13H12l-2.2 7.5z" />,
+  blade: (
+    <>
+      <path d="M7 3.5v10.8l4.5 3V6.5z" />
+      <path d="M11.5 17.3 20 20.5" />
+    </>
+  ),
+  volume: (
+    <>
+      <path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z" />
+      <path d="M15.5 9.2a4 4 0 0 1 0 5.6" />
+    </>
+  ),
+  fullscreen: <path d="M3.5 9V3.5H9M15 3.5h5.5V9M20.5 15v5.5H15M9 20.5H3.5V15" />,
+  stepBack: (
+    <>
+      <path d="M17.5 5v14L7 12z" fill="currentColor" stroke="none" />
+      <path d="M5.5 4.5v15" />
+    </>
+  ),
+  stepForward: (
+    <>
+      <path d="M6.5 5v14L17 12z" fill="currentColor" stroke="none" />
+      <path d="M18.5 4.5v15" />
+    </>
+  ),
+  crop: (
+    <>
+      <path d="M6.5 3v14.5H21" />
+      <path d="M3 6.5h14.5V21" />
+    </>
+  ),
+  plus: <path d="M12 5v14M5 12h14" />,
+  projects: (
+    <>
+      <rect x="3" y="5" width="18" height="14.5" rx="2" />
+      <path d="M3 9.5h18M8.5 5v4.5" />
+    </>
+  ),
+  alert: (
+    <>
+      <path d="M12 4 21 19.5H3z" />
+      <path d="M12 9.5v4.5M12 16.6h.01" />
+    </>
+  ),
+  saved: <path d="M5 12.5 10 17.5 19.5 7" />,
+  safe: (
+    <>
+      <rect x="4" y="3.5" width="16" height="17" rx="2" />
+      <path d="M4 8h16M4 16h16" strokeDasharray="3 3" />
+    </>
+  ),
 } as const;
 
 export type IconName = keyof typeof PATHS;

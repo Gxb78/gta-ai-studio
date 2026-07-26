@@ -52,6 +52,12 @@ export interface Clip {
   /** Rush dont ce clip est extrait (clé dans `Project.sources`). */
   sourceId: string;
   /**
+   * Décalage horizontal du cadrage 9:16, de −1 (bord gauche du rush) à +1 (bord
+   * droit), 0 = centré. N'a d'effet qu'en cadrage « recadrage » : le fond flou
+   * conserve l'image entière, il n'y a rien à décaler.
+   */
+  cropX: number;
+  /**
    * Piste vidéo. 0 = piste principale, en bas. Plus l'indice est élevé, plus la
    * piste est haute et prioritaire visuellement.
    */
@@ -82,6 +88,26 @@ export const MAX_RATE = 4;
 
 export const clampRate = (rate: number): number =>
   Number.isFinite(rate) && rate > 0 ? Math.min(MAX_RATE, Math.max(MIN_RATE, rate)) : 1;
+
+/**
+ * Passage du rush au format vertical. C'est un réglage du PROJET, pas de la
+ * fenêtre d'export : l'aperçu affiche exactement ce que l'export produira, donc
+ * les deux doivent lire la même valeur.
+ */
+export type FramingMode = "crop" | "blur";
+
+/** Format de sortie, imposé : c'est le format TikTok/Reels/Shorts. */
+export const OUTPUT_WIDTH = 1080;
+export const OUTPUT_HEIGHT = 1920;
+
+export const clampCropX = (value: number): number =>
+  Number.isFinite(value) ? Math.min(1, Math.max(-1, value)) : 0;
+
+/**
+ * Position du cadrage exprimée en pourcentage, telle que l'attend
+ * `object-position` dans l'aperçu. −1 → 0 % (bord gauche), +1 → 100 %.
+ */
+export const cropXPercent = (cropX: number): number => 50 + clampCropX(cropX) * 50;
 
 /**
  * Conversion canonique temps timeline → temps source.
@@ -148,6 +174,7 @@ export function flattenTracks(
     const segment: Clip = {
       id: `${top.id}@${Math.round(from)}`,
       sourceId: top.sourceId,
+      cropX: top.cropX,
       track: top.track,
       timelineStartMs: from,
       srcInMs: timelineTimeToSourceTime(top, from),
@@ -163,6 +190,9 @@ export function flattenTracks(
       previous &&
       previous.sourceId === segment.sourceId &&
       previous.playbackRate === segment.playbackRate &&
+      // Deux cadrages différents doivent rester deux segments : ils ne
+      // produisent pas la même image à l'export.
+      previous.cropX === segment.cropX &&
       Math.abs(clipEndMs(previous) - segment.timelineStartMs) < 0.001 &&
       Math.abs(previous.srcOutMs - segment.srcInMs) < 0.001
     ) {
@@ -175,14 +205,26 @@ export function flattenTracks(
 }
 
 export interface Project {
-  version: 3;
+  version: 4;
   id: string;
   name: string;
   /** Rushs du projet, indexés par leur empreinte. */
   sources: Record<string, SourceInfo>;
   clips: Clip[];
+  /** Passage au format vertical, partagé par l'aperçu et l'export. */
+  framing: FramingMode;
   createdAt: string;
   updatedAt: string;
+}
+
+/** Fiche d'un projet enregistré, telle qu'affichée dans « Projets récents ». */
+export interface ProjectSummary {
+  id: string;
+  name: string;
+  updatedAt: string;
+  clipCount: number;
+  /** Vignette du premier rush, si elle est encore sur le disque. */
+  thumbPath: string | null;
 }
 
 /** Rush d'un clip. Ne doit jamais manquer : la migration garantit la cohérence. */
@@ -203,8 +245,6 @@ export function usedSources(sources: Record<string, SourceInfo>, clips: Clip[]):
   return list;
 }
 
-export type ExportMode = "crop" | "blur";
-
 export interface ExportSource {
   path: string;
   hasAudio: boolean;
@@ -219,6 +259,8 @@ export interface ExportSegment {
   playbackRate: number;
   /** Durée de noir à insérer avant ce segment (trou de la timeline). */
   gapBeforeMs: number;
+  /** Décalage du cadrage 9:16 de ce segment (voir `Clip.cropX`). */
+  cropX: number;
 }
 
 export interface ExportRequest {
@@ -227,13 +269,11 @@ export interface ExportRequest {
   segments: ExportSegment[];
   /** Plan audio : ce qui s'entend. Indépendant du plan vidéo. */
   audioSegments: ExportSegment[];
-  mode: ExportMode;
+  mode: FramingMode;
   fileName: string;
   /** Vrai si au moins un rush a du son : les autres reçoivent du silence. */
   hasAudio: boolean;
-  /** Format de sortie du montage, imposé à tous les rushs avant concaténation. */
-  frameWidth: number;
-  frameHeight: number;
+  /** Cadence de sortie. La définition, elle, est imposée (1080×1920). */
   frameFps: number;
 }
 
@@ -488,22 +528,25 @@ export function closeGaps(clips: Clip[]): Clip[] {
 /** Forme d'un clip tel qu'il peut sortir du disque, tous formats confondus. */
 export type StoredClip = Omit<
   Clip,
-  "timelineStartMs" | "sourceId" | "track" | "audioEnabled"
+  "timelineStartMs" | "sourceId" | "track" | "audioEnabled" | "cropX"
 > & {
   timelineStartMs?: number | null;
   sourceId?: string | null;
   track?: number | null;
   audioEnabled?: boolean | null;
   playbackRate?: number | null;
+  cropX?: number | null;
 };
 
 /** Forme d'un projet tel qu'il peut sortir du disque, tous formats confondus. */
-export type StoredProject = Omit<Project, "version" | "sources" | "clips"> & {
+export type StoredProject = Omit<Project, "version" | "sources" | "clips" | "framing"> & {
   version: number;
   /** Format 1 et 2 : un seul rush, porté par le projet. */
   source?: SourceInfo | null;
   /** Format 3 : plusieurs rushs indexés par empreinte. */
   sources?: Record<string, SourceInfo> | null;
+  /** Format 4 : le cadrage vertical appartient au projet. */
+  framing?: FramingMode | null;
   clips: StoredClip[];
 };
 
@@ -512,6 +555,7 @@ export type StoredProject = Omit<Project, "version" | "sources" | "clips"> & {
  *
  * Format 1 : clips enchaînés sans trou, position déduite du cumul des durées.
  * Format 2 : positions explicites, mais un seul rush pour tout le projet.
+ * Format 3 : multi-rush, mais le cadrage vertical était choisi à l'export.
  * Les clips orphelins (rush absent) sont écartés plutôt que de faire planter
  * la lecture sur une source introuvable.
  */
@@ -543,15 +587,20 @@ export function migrateProject(stored: StoredProject): Project {
       audioEnabled: typeof clip.audioEnabled === "boolean" ? clip.audioEnabled : track === 0,
       // Projets antérieurs à la vitesse par clip : temps réel.
       playbackRate: clampRate(clip.playbackRate ?? 1),
+      // Projets antérieurs au cadrage par clip : recadrage centré.
+      cropX: clampCropX(clip.cropX ?? 0),
     });
   }
 
   return {
-    version: 3,
+    version: 4,
     id: stored.id,
     name: stored.name,
     sources,
     clips,
+    // Projets antérieurs au cadrage porté par le projet : c'est le recadrage
+    // centré qui était proposé par défaut dans la fenêtre d'export.
+    framing: stored.framing === "blur" ? "blur" : "crop",
     createdAt: stored.createdAt,
     updatedAt: stored.updatedAt,
   };

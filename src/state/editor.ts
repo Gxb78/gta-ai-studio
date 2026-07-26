@@ -6,10 +6,11 @@
 // Les clips ont une position explicite sur la timeline : ils ne se chevauchent
 // jamais, mais ils peuvent être disjoints (« trous »).
 
-import type { Clip, Project, SourceInfo, StoredProject } from "../types";
+import type { Clip, FramingMode, Project, SourceInfo, StoredProject } from "../types";
 import {
   MIN_CLIP_MS,
   applyRate,
+  clampCropX,
   applyTrim,
   clipDurationMs,
   clipEndMs,
@@ -33,6 +34,17 @@ export interface EditorState {
   /** Clips pendant un geste en cours (trim, déplacement), sinon null. */
   transientClips: Clip[] | null;
   selectedClipId: string | null;
+  /**
+   * Pistes masquées par leur en-tête. Un masquage retire la piste des DEUX
+   * plans (image et son) : c'est un interrupteur de piste, pas un réglage
+   * d'opacité — et l'export doit montrer exactement ce que l'aperçu montre.
+   *
+   * État de session, non enregistré : masquer une piste sert à travailler, pas
+   * à décrire le montage.
+   */
+  hiddenTracks: number[];
+  /** Pistes verrouillées : aucun geste de timeline n'y touche. */
+  lockedTracks: number[];
   past: Clip[][];
   future: Clip[][];
 }
@@ -42,6 +54,8 @@ export const initialEditorState: EditorState = {
   clips: [],
   transientClips: null,
   selectedClipId: null,
+  hiddenTracks: [],
+  lockedTracks: [],
   past: [],
   future: [],
 };
@@ -50,8 +64,25 @@ export type EditorAction =
   | { type: "LOAD"; project: StoredProject }
   /** Fichiers dérivés régénérés : on remplace le rush, jamais le montage. */
   | { type: "REFRESH_SOURCE"; source: SourceInfo }
-  /** Nouveau rush ajouté au projet : ses clips se posent à la suite. */
-  | { type: "ADD_SOURCE"; source: SourceInfo; atMs: number }
+  /**
+   * Nouveau rush ajouté au projet. Sans `track`, il cherche la première piste
+   * libre ; avec, il se pose exactement là — c'est le cas du dépôt à la souris.
+   */
+  | { type: "ADD_SOURCE"; source: SourceInfo; atMs: number; track?: number }
+  /**
+   * Rush retrouvé après un déplacement sur le disque : son empreinte a changé,
+   * donc les clips doivent être rattachés au nouvel identifiant.
+   */
+  | { type: "RELINK_SOURCE"; missingId: string; source: SourceInfo }
+  | { type: "RENAME_PROJECT"; name: string }
+  /** Cadrage vertical du projet : l'aperçu et l'export lisent la même valeur. */
+  | { type: "SET_FRAMING"; framing: FramingMode }
+  /** Décalage horizontal du cadrage d'un clip. */
+  | { type: "SET_CLIP_CROP_X"; clipId: string; cropX: number }
+  | { type: "TOGGLE_TRACK_HIDDEN"; track: number }
+  | { type: "TOGGLE_TRACK_LOCKED"; track: number }
+  /** Son de tous les clips d'une piste, d'un coup (bouton M de l'en-tête). */
+  | { type: "SET_TRACK_AUDIO"; track: number; audioEnabled: boolean }
   | { type: "CLOSE" }
   | { type: "SELECT"; clipId: string | null }
   | { type: "SPLIT_AT"; timelineMs: number }
@@ -90,6 +121,10 @@ export const newClipId = (): string => {
   return `clip-${Date.now().toString(36)}-${clipCounter}`;
 };
 
+/** Ajoute ou retire une valeur d'une liste d'indices de pistes. */
+const toggleTrack = (tracks: number[], track: number): number[] =>
+  tracks.includes(track) ? tracks.filter((t) => t !== track) : [...tracks, track];
+
 const sameBounds = (a: Clip, b: Clip): boolean =>
   a.timelineStartMs === b.timelineStartMs && a.srcInMs === b.srcInMs && a.srcOutMs === b.srcOutMs;
 
@@ -121,12 +156,9 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
     case "LOAD": {
       const project = migrateProject(action.project);
       return {
+        ...initialEditorState,
         project,
         clips: project.clips,
-        transientClips: null,
-        selectedClipId: null,
-        past: [],
-        future: [],
       };
     }
 
@@ -145,10 +177,14 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       const startMs = Math.max(0, action.atMs);
       const endMs = startMs + action.source.probe.durationMs;
       const fromTrack = state.clips.find((c) => c.id === state.selectedClipId)?.track ?? 0;
-      const track = firstFreeTrack(state.clips, startMs, endMs, fromTrack);
+      const track =
+        action.track !== undefined
+          ? Math.max(0, Math.floor(action.track))
+          : firstFreeTrack(state.clips, startMs, endMs, fromTrack);
       const clip: Clip = {
         id: newClipId(),
         sourceId: action.source.id,
+        cropX: 0,
         track,
         timelineStartMs: startMs,
         srcInMs: 0,
@@ -157,11 +193,75 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         audioEnabled: track === 0,
         playbackRate: 1,
       };
+      // Piste imposée (dépôt à la souris) : les clips déjà présents s'écartent,
+      // comme lors d'un déplacement, plutôt que de créer un chevauchement.
+      const next =
+        action.track === undefined
+          ? [...state.clips, clip]
+          : resolveOverlaps([...state.clips, clip], clip.id);
       return {
-        ...pushHistory(state, [...state.clips, clip]),
+        ...pushHistory(state, next),
         project: { ...state.project, sources },
         selectedClipId: clip.id,
       };
+    }
+
+    case "RELINK_SOURCE": {
+      if (!state.project) return state;
+      const sources = { ...state.project.sources };
+      delete sources[action.missingId];
+      sources[action.source.id] = action.source;
+      // Le rush retrouvé peut être plus court que l'original : on borne les
+      // clips plutôt que de laisser un srcOutMs pointer dans le vide.
+      const limit = action.source.probe.durationMs;
+      const clips = state.clips.map((clip) =>
+        clip.sourceId === action.missingId
+          ? {
+              ...clip,
+              sourceId: action.source.id,
+              srcInMs: Math.min(clip.srcInMs, Math.max(0, limit - MIN_CLIP_MS)),
+              srcOutMs: Math.min(clip.srcOutMs, limit),
+            }
+          : clip,
+      );
+      return { ...pushHistory(state, clips), project: { ...state.project, sources } };
+    }
+
+    case "RENAME_PROJECT": {
+      if (!state.project) return state;
+      const name = action.name.trim();
+      if (!name || name === state.project.name) return state;
+      return { ...state, project: { ...state.project, name } };
+    }
+
+    case "SET_FRAMING": {
+      if (!state.project || state.project.framing === action.framing) return state;
+      return { ...state, project: { ...state.project, framing: action.framing } };
+    }
+
+    case "SET_CLIP_CROP_X": {
+      const target = state.clips.find((clip) => clip.id === action.clipId);
+      const cropX = clampCropX(action.cropX);
+      if (!target || target.cropX === cropX) return state;
+      const clips = state.clips.map((clip) =>
+        clip.id === action.clipId ? { ...clip, cropX } : clip,
+      );
+      return pushHistory(state, clips);
+    }
+
+    case "TOGGLE_TRACK_HIDDEN":
+      return { ...state, hiddenTracks: toggleTrack(state.hiddenTracks, action.track) };
+
+    case "TOGGLE_TRACK_LOCKED":
+      return { ...state, lockedTracks: toggleTrack(state.lockedTracks, action.track) };
+
+    case "SET_TRACK_AUDIO": {
+      const concerned = state.clips.filter((clip) => clip.track === action.track);
+      if (concerned.every((clip) => clip.audioEnabled === action.audioEnabled)) return state;
+      const clips = state.clips.map((clip) =>
+        clip.track === action.track ? { ...clip, audioEnabled: action.audioEnabled } : clip,
+      );
+      return pushHistory(state, clips);
     }
 
     case "CLOSE":
@@ -193,6 +293,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       const right: Clip = {
         id: newClipId(),
         sourceId: clip.sourceId,
+        cropX: clip.cropX,
         track: clip.track,
         timelineStartMs: action.timelineMs,
         srcInMs: cutSrc,
@@ -231,7 +332,9 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       const target = state.clips.find((clip) => clip.id === action.clipId);
       if (!target) return state;
       const timelineStartMs = Math.max(0, action.timelineStartMs);
-      const track = Math.max(0, Math.floor(action.track));
+      const wanted = Math.max(0, Math.floor(action.track));
+      // Une piste verrouillée n'accepte rien : le clip reste sur la sienne.
+      const track = state.lockedTracks.includes(wanted) ? target.track : wanted;
       const moved = { ...target, timelineStartMs, track };
       const next = resolveOverlaps(
         state.clips.map((clip) => (clip.id === action.clipId ? moved : clip)),

@@ -16,9 +16,13 @@ const STAGE_LABELS: Record<ImportProgress["stage"], string> = {
 
 interface Props {
   onImported: (source: SourceInfo) => void;
+  onOpenProjects: () => void;
+  /** Import déclenché par un dépôt de fichiers, piloté par App. */
+  droppedBusy: boolean;
+  droppedProgress: ImportProgress | null;
 }
 
-export function ImportView({ onImported }: Props) {
+export function ImportView({ onImported, onOpenProjects, droppedBusy, droppedProgress }: Props) {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<ImportProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -53,6 +57,11 @@ export function ImportView({ onImported }: Props) {
     }
   };
 
+  // L'import peut aussi venir d'un dépôt de fichiers, piloté par App : les deux
+  // sources d'occupation alimentent le même affichage.
+  const working = busy || droppedBusy;
+  const shown = droppedBusy ? droppedProgress : progress;
+
   return (
     <div className="import-view">
       <div className="import-card">
@@ -61,34 +70,38 @@ export function ImportView({ onImported }: Props) {
         </span>
         <h1>GTA Studio</h1>
         <p className="lead muted">
-          Choisis un rush : je prépare un proxy de montage ultra réactif, puis tu coupes.
-          Ton fichier d'origine n'est jamais modifié.
+          Choisis un rush ou lâche-le dans la fenêtre : je prépare un proxy de montage ultra
+          réactif, puis tu coupes. Ton fichier d'origine n'est jamais modifié.
         </p>
 
-        {!busy && (
+        {!working && (
           <>
             <button className="primary big" onClick={() => void handlePick()}>
               <Icon name="folder" size={18} />
               Choisir un rush
             </button>
+            <button className="ghost small" onClick={onOpenProjects}>
+              <Icon name="projects" size={15} />
+              Projets récents
+            </button>
             <ul className="import-facts muted">
               <li>Lecture et coupes 100 % locales, sans latence</li>
-              <li>Export vertical 1080×1920, prêt pour TikTok</li>
-              <li>MP4, MOV, MKV, M4V</li>
+              <li>Aperçu vertical 9:16 identique à l'export</li>
+              <li>MP4, MOV, MKV, M4V — glisser-déposer accepté</li>
             </ul>
           </>
         )}
 
-        {busy && progress && (
+        {working && shown && (
           <div className="import-progress">
             <div className="progress-track">
               <div
                 className="progress-fill"
-                style={{ width: `${Math.round(progress.percent)}%` }}
+                style={{ width: `${Math.round(shown.percent)}%` }}
               />
             </div>
             <span className="muted">
-              {STAGE_LABELS[progress.stage]} {Math.round(progress.percent)} %
+              {STAGE_LABELS[shown.stage]} {Math.round(shown.percent)} %
             </span>
           </div>
         )}

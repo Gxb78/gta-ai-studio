@@ -2,8 +2,11 @@
 // aplatissement déterministe, et parité entre ce que consomment le lecteur et
 // l'export.
 import {
+  clampCropX,
   clampRate,
   clipDurationMs,
+  cropXPercent,
+  migrateProject,
   clipEndMs,
   clipSourceDurationMs,
   firstFreeTrack,
@@ -37,6 +40,7 @@ const clip = (
   srcOutMs: srcIn + dur,
   audioEnabled: track === 0,
   playbackRate: 1,
+  cropX: 0,
 });
 
 let failures = 0;
@@ -221,11 +225,12 @@ const source = (id: string): SourceInfo => ({
 const stateWith = (clips: Clip[], selectedClipId: string | null): EditorState => ({
   ...initialEditorState,
   project: {
-    version: 3,
+    version: 4,
     id: "p",
     name: "p",
     sources: { S0: source("S0"), S1: source("S1") },
     clips,
+    framing: "crop",
     createdAt: "",
     updatedAt: "",
   },
@@ -407,6 +412,122 @@ for (const segment of flat) {
 }
 check("les segments s'enchaînent sans discontinuité", contiguous, true);
 check("la durée totale est conservée", cursor, 20000);
+
+// --- Cadrage vertical --------------------------------------------------------
+// Le cadrage vit dans le modèle, pas dans la fenêtre d'export : c'est ce qui
+// permet à l'aperçu de montrer exactement la sortie.
+
+console.log("Décalage de cadrage");
+check("écrêté à droite", clampCropX(3), 1);
+check("écrêté à gauche", clampCropX(-7), -1);
+check("valeur aberrante recentrée", clampCropX(Number.NaN), 0);
+check("centré = 50 %", cropXPercent(0), 50);
+check("collé à droite = 100 %", cropXPercent(1), 100);
+check("collé à gauche = 0 %", cropXPercent(-1), 0);
+
+const cadre = editorReducer(stateWith(covered, "haut"), {
+  type: "SET_CLIP_CROP_X",
+  clipId: "haut",
+  cropX: 0.5,
+});
+check("le réducteur écrit le cadrage du clip", cadre.clips.find((c) => c.id === "haut")?.cropX, 0.5);
+check("et crée une entrée d'historique", cadre.past.length, 1);
+check(
+  "le cadrage traverse l'aplatissement",
+  resolveVideoPlan(cadre.clips)
+    .filter((segment) => segment.track === 1)
+    .every((segment) => segment.cropX === 0.5),
+  true,
+);
+
+// Deux morceaux du même rush, jointifs dans le temps source mais cadrés
+// différemment, ne doivent PAS fusionner : ils ne produisent pas la même image.
+const cadragesDifferents = [
+  { ...clip("a", 0, 0, 0, 5000), cropX: 0 },
+  { ...clip("b", 0, 5000, 5000, 5000, "S0"), cropX: 1 },
+];
+check(
+  "deux cadrages différents restent deux segments",
+  resolveVideoPlan(cadragesDifferents).length,
+  2,
+);
+
+console.log("Migration d'un projet antérieur au cadrage");
+const migre = migrateProject({
+  version: 3,
+  id: "p",
+  name: "p",
+  sources: { S0: source("S0") },
+  clips: [{ id: "a", sourceId: "S0", srcInMs: 0, srcOutMs: 1000, playbackRate: 1 }],
+  createdAt: "",
+  updatedAt: "",
+});
+check("le projet est ramené au format 4", migre.version, 4);
+check("le cadrage par défaut est le recadrage", migre.framing, "crop");
+check("les clips sont recentrés", migre.clips[0].cropX, 0);
+
+// --- Pistes : désactivation et son -------------------------------------------
+
+console.log("En-têtes de pistes");
+const masque = editorReducer(stateWith(covered, null), { type: "TOGGLE_TRACK_HIDDEN", track: 1 });
+check("la piste est notée masquée", masque.hiddenTracks, [1]);
+check(
+  "une piste masquée disparaît de l'image",
+  summary(resolveVideoPlan(masque.clips, new Set(masque.hiddenTracks))),
+  ["S0:0-20000@0"],
+);
+check(
+  "et du son : l'aperçu et l'export voient la même chose",
+  resolveAudioPlan(masque.clips, new Set(masque.hiddenTracks)).length,
+  1,
+);
+check("aucune entrée d'historique pour un masquage", masque.past.length, 0);
+
+const verrou = editorReducer(stateWith(covered, "haut"), { type: "TOGGLE_TRACK_LOCKED", track: 0 });
+const versVerrou = editorReducer(verrou, {
+  type: "MOVE_TRANSIENT",
+  clipId: "haut",
+  timelineStartMs: 7000,
+  track: 0,
+});
+const deplace = (versVerrou.transientClips ?? []).find((c) => c.id === "haut");
+check("un clip ne tombe pas sur une piste verrouillée", deplace?.track, 1);
+check("mais son déplacement horizontal, lui, s'applique", deplace?.timelineStartMs, 7000);
+
+const pisteMuette = editorReducer(stateWith(covered, null), {
+  type: "SET_TRACK_AUDIO",
+  track: 0,
+  audioEnabled: false,
+});
+check(
+  "couper le son d'une piste coupe tous ses clips",
+  pisteMuette.clips.filter((c) => c.track === 0 && c.audioEnabled).length,
+  0,
+);
+
+// --- Rush retrouvé après déplacement ----------------------------------------
+
+console.log("Relocalisation d'un rush");
+const court: SourceInfo = {
+  ...source("S2"),
+  probe: { ...source("S2").probe, durationMs: 8000 },
+};
+const relie = editorReducer(stateWith(covered, null), {
+  type: "RELINK_SOURCE",
+  missingId: "S0",
+  source: court,
+});
+check(
+  "les clips pointent vers le rush retrouvé",
+  relie.clips.filter((c) => c.sourceId === "S2").length,
+  1,
+);
+check(
+  "les bornes sont ramenées dans la durée du nouveau fichier",
+  relie.clips.find((c) => c.sourceId === "S2")?.srcOutMs,
+  8000,
+);
+check("l'ancien rush est retiré du projet", relie.project?.sources.S0, undefined);
 
 // Une exception suffit à faire sortir Node en erreur : pas besoin de `process`,
 // donc pas besoin des types Node juste pour ce fichier.

@@ -24,6 +24,13 @@ const GROUPS: { title: string; rows: Row[] }[] = [
     ],
   },
   {
+    title: "Outils",
+    rows: [
+      { keys: ["V"], label: "Outil sélection" },
+      { keys: ["B"], label: "Outil lame — couper au clic" },
+    ],
+  },
+  {
     title: "Montage",
     rows: [
       { keys: ["S"], label: "Couper au playhead" },

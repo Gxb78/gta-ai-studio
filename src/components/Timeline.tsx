@@ -14,6 +14,7 @@
 
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type { EditorAction } from "../state/editor";
+import type { Tool } from "./ToolRail";
 import type { Clip, SourceInfo } from "../types";
 import {
   clipDurationMs,
@@ -77,6 +78,18 @@ interface Props {
   onPause: () => void;
   /** Recolle tous les clips bout à bout. */
   onCloseGaps: () => void;
+  /** Pistes masquées et pistes verrouillées, pilotées par les en-têtes. */
+  hiddenTracks: ReadonlySet<number>;
+  lockedTracks: ReadonlySet<number>;
+  /** Outil courant : la lame coupe au clic au lieu de déplacer. */
+  tool: Tool;
+  /** Média en cours de dépôt depuis le panneau Médias, sinon null. */
+  pendingSource: SourceInfo | null;
+  onDropSource: (source: SourceInfo, atMs: number, track: number) => void;
+  onCancelDrop: () => void;
+  /** Hauteur de la zone timeline, ajustable par la poignée du haut. */
+  height: number;
+  onHeightChange: (height: number) => void;
   dispatch: (action: EditorAction) => void;
 }
 
@@ -114,10 +127,14 @@ interface GestureHud {
 export function Timeline(props: Props) {
   const {
     clips, anchorClips, sources, pxPerSec, onPxPerSecChange, playheadMs, playing,
-    selectedClipId, onSeek, onSelect, onPreviewFrame, onPause, onCloseGaps, dispatch,
+    selectedClipId, onSeek, onSelect, onPreviewFrame, onPause, onCloseGaps,
+    hiddenTracks, lockedTracks, tool, pendingSource, onDropSource, onCancelDrop,
+    height, onHeightChange, dispatch,
   } = props;
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  /** Colonne des en-têtes : hors du défilement horizontal, recalée en vertical. */
+  const headersRef = useRef<HTMLDivElement | null>(null);
   const [viewport, setViewport] = useState({ scrollLeft: 0, width: 1000 });
   const [hud, setHud] = useState<GestureHud | null>(null);
   const gestureRef = useRef<Gesture | null>(null);
@@ -128,13 +145,16 @@ export function Timeline(props: Props) {
   const totalMs = timelineDurationMs(clips);
   const totalPx = totalMs * pxPerMs;
   // Un trou, c'est un instant où RIEN n'est visible : il se lit sur le montage
-  // aplati, pas sur la seule piste principale.
-  const gaps = timelineGaps(flattenTracks(clips));
+  // aplati, pas sur la seule piste principale — et sans les pistes désactivées,
+  // sinon la timeline annoncerait des trous que l'export n'a pas, ou l'inverse.
+  const gaps = timelineGaps(flattenTracks(clips, hiddenTracks));
   const sourceCount = new Set(clips.map((clip) => clip.sourceId)).size;
   // Une piste vide n'est proposée que pendant un déplacement : le reste du
   // temps elle ne ferait qu'occuper de la hauteur pour rien.
   const occupied = trackCount(clips);
-  const dropTrackVisible = hud?.kind === "move";
+  // Piste vide proposée pendant un déplacement OU pendant le dépôt d'un média :
+  // c'est le seul moyen de poser une surcouche sur une piste neuve.
+  const dropTrackVisible = hud?.kind === "move" || pendingSource !== null;
   const tracks = occupied + (dropTrackVisible ? 1 : 0);
   const trackOrder = Array.from({ length: tracks }, (_, i) => tracks - 1 - i);
 
@@ -146,6 +166,11 @@ export function Timeline(props: Props) {
   const syncViewport = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
+    // Les en-têtes suivent le défilement VERTICAL des pistes sans passer par
+    // l'état React : une écriture directe de transform, donc rien à recalculer.
+    if (headersRef.current) {
+      headersRef.current.style.transform = `translateY(${-el.scrollTop}px)`;
+    }
     setViewport((previous) =>
       previous.scrollLeft === el.scrollLeft && previous.width === el.clientWidth
         ? previous
@@ -424,9 +449,22 @@ export function Timeline(props: Props) {
       if (event.button !== 0) return;
       event.stopPropagation();
       event.preventDefault();
+      // Piste verrouillée : rien ne bouge, on ne sélectionne même pas — c'est
+      // tout l'intérêt du verrou.
+      if (lockedTracks.has(clip.track)) return;
       if (gestureRef.current) finishGesture(true);
       onPause();
       onSelect(clip.id);
+
+      // Outil lame : on coupe là où on clique, et aucun geste ne démarre.
+      if (tool === "blade" && kind === "move") {
+        const el = scrollRef.current;
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        const timelineMs = (el.scrollLeft + event.clientX - rect.left) / liveRef.current.pxPerMs;
+        dispatch({ type: "SPLIT_AT", timelineMs });
+        return;
+      }
 
       const abort = new AbortController();
       const gesture: Gesture = {
@@ -476,7 +514,7 @@ export function Timeline(props: Props) {
 
       gesture.raf = requestAnimationFrame(runGestureFrame);
     },
-    [finishGesture, onPause, onSelect, runGestureFrame],
+    [dispatch, finishGesture, lockedTracks, onPause, onSelect, runGestureFrame, tool],
   );
 
   // Filet de sécurité : jamais de geste orphelin au démontage.
@@ -486,6 +524,92 @@ export function Timeline(props: Props) {
       document.body.classList.remove("trimming", "moving");
     };
   }, []);
+
+  // --- Dépôt d'un média venu du panneau Médias --------------------------------
+  // Le geste est démarré par le panneau, mais c'est la timeline qui connaît la
+  // géométrie : c'est donc elle qui suit le pointeur et décide de la position.
+  const [dropTarget, setDropTarget] = useState<{ atMs: number; track: number } | null>(null);
+
+  useEffect(() => {
+    if (!pendingSource) {
+      setDropTarget(null);
+      return;
+    }
+    const abort = new AbortController();
+    const options = { signal: abort.signal } as const;
+
+    /** Position visée, ou null si le pointeur n'est pas sur la timeline. */
+    const resolve = (event: PointerEvent): { atMs: number; track: number } | null => {
+      const el = scrollRef.current;
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      if (
+        event.clientX < rect.left ||
+        event.clientX > rect.right ||
+        event.clientY < rect.top ||
+        event.clientY > rect.bottom
+      ) {
+        return null;
+      }
+      const atMs = Math.max(
+        0,
+        (el.scrollLeft + event.clientX - rect.left) / liveRef.current.pxPerMs,
+      );
+      const track = trackUnderPointer(event.clientY, 0);
+      return lockedTracks.has(track) ? null : { atMs, track };
+    };
+
+    window.addEventListener(
+      "pointermove",
+      (event: PointerEvent) => setDropTarget(resolve(event)),
+      options,
+    );
+    window.addEventListener(
+      "pointerup",
+      (event: PointerEvent) => {
+        const target = resolve(event);
+        if (target) onDropSource(pendingSource, target.atMs, target.track);
+        else onCancelDrop();
+      },
+      options,
+    );
+    window.addEventListener(
+      "keydown",
+      (event: KeyboardEvent) => {
+        if (event.key === "Escape") onCancelDrop();
+      },
+      options,
+    );
+    return () => abort.abort();
+  }, [lockedTracks, onCancelDrop, onDropSource, pendingSource, trackUnderPointer]);
+
+  // --- Hauteur de la zone timeline ---------------------------------------------
+  const beginResize = useCallback(
+    (event: React.PointerEvent) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      const startY = event.clientY;
+      const startHeight = height;
+      const abort = new AbortController();
+      const options = { signal: abort.signal } as const;
+      document.body.classList.add("resizing-v");
+      window.addEventListener(
+        "pointermove",
+        (move: PointerEvent) => {
+          // Tirer vers le haut agrandit la timeline : elle grandit vers l'aperçu.
+          onHeightChange(startHeight + (startY - move.clientY));
+        },
+        options,
+      );
+      const stop = () => {
+        document.body.classList.remove("resizing-v");
+        abort.abort();
+      };
+      window.addEventListener("pointerup", stop, options);
+      window.addEventListener("pointercancel", stop, options);
+    },
+    [height, onHeightChange],
+  );
 
   // --- Règle ------------------------------------------------------------------
   const stepS = RULER_STEPS_S.find((s) => s * pxPerSec >= 70) ?? 120;
@@ -525,11 +649,86 @@ export function Timeline(props: Props) {
           "--drop-h": `${DROP_TRACK_PX}px`,
           // La zone de pistes grandit avec leur nombre, jusqu'à un plafond
           // au-delà duquel elle défile verticalement.
-          height: `${Math.min(3, occupied) * (TRACK_HEIGHT_PX + TRACK_GAP_PX) + 92}px`,
+          height: `${height}px`,
         } as React.CSSProperties
       }
     >
-      <div className="timeline-scroll" ref={scrollRef} onScroll={syncViewport}>
+      <div
+        className="timeline-grip"
+        onPointerDown={beginResize}
+        title="Ajuster la hauteur de la timeline"
+        role="separator"
+        aria-orientation="horizontal"
+      />
+
+      <div className="timeline-body">
+        {/* Colonne d'en-têtes : hors du défilement horizontal, donc toujours
+            lisible, mais recalée sur le défilement vertical des pistes. */}
+        <div className="track-headers">
+          <div className="headers-inner" ref={headersRef}>
+            <div className="headers-spacer" />
+            {trackOrder.map((track) => {
+              if (track >= occupied) {
+                return <div key={`head-drop-${track}`} className="track-head track-head-drop" />;
+              }
+              const onTrack = clipsOnTrack(clips, track);
+              const audible = onTrack.some((clip) => clip.audioEnabled);
+              const hidden = hiddenTracks.has(track);
+              const locked = lockedTracks.has(track);
+              return (
+                <div
+                  key={`head-${track}`}
+                  className={
+                    "track-head" +
+                    (track === 0 ? " track-head-base" : "") +
+                    (hidden ? " is-hidden" : "") +
+                    (locked ? " is-locked" : "")
+                  }
+                >
+                  <span className="track-label">V{track + 1}</span>
+                  <div className="track-buttons">
+                    <button
+                      type="button"
+                      className={"icon-btn ghost tiny" + (hidden ? " active" : "")}
+                      onClick={() => dispatch({ type: "TOGGLE_TRACK_HIDDEN", track })}
+                      title={
+                        hidden
+                          ? "Réactiver la piste (image et son)"
+                          : "Désactiver la piste : elle disparaît de l'aperçu ET de l'export"
+                      }
+                      aria-label={hidden ? "Réactiver la piste" : "Désactiver la piste"}
+                    >
+                      <Icon name={hidden ? "eyeOff" : "eye"} size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      className={"icon-btn ghost tiny" + (locked ? " active" : "")}
+                      onClick={() => dispatch({ type: "TOGGLE_TRACK_LOCKED", track })}
+                      title={locked ? "Déverrouiller la piste" : "Verrouiller la piste"}
+                      aria-label={locked ? "Déverrouiller la piste" : "Verrouiller la piste"}
+                    >
+                      <Icon name={locked ? "lock" : "unlock"} size={14} />
+                    </button>
+                    <button
+                      type="button"
+                      className={"icon-btn ghost tiny" + (audible ? "" : " active")}
+                      onClick={() =>
+                        dispatch({ type: "SET_TRACK_AUDIO", track, audioEnabled: !audible })
+                      }
+                      disabled={onTrack.length === 0}
+                      title={audible ? "Couper le son de la piste" : "Rendre le son à la piste"}
+                      aria-label={audible ? "Couper le son de la piste" : "Rendre le son à la piste"}
+                    >
+                      <Icon name={audible ? "sound" : "soundOff"} size={14} />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="timeline-scroll" ref={scrollRef} onScroll={syncViewport}>
         <div className="timeline-content" style={{ width: contentWidth }}>
           <div className="ruler" onPointerDown={handleScrubDown} onPointerMove={handleScrubMove}>
             {ticks.map((tick) => (
@@ -552,7 +751,9 @@ export function Timeline(props: Props) {
             className={
               "track" +
               (track === 0 ? " track-base" : "") +
-              (track >= occupied ? " track-drop" : "")
+              (track >= occupied ? " track-drop" : "") +
+              (hiddenTracks.has(track) ? " track-hidden" : "") +
+              (lockedTracks.has(track) ? " track-locked" : "")
             }
             onPointerDown={(e) => {
               if (e.target === e.currentTarget) {
@@ -564,6 +765,20 @@ export function Timeline(props: Props) {
               if (e.target === e.currentTarget) handleScrubMove(e);
             }}
           >
+            {/* Repère de dépôt : la durée réelle du média, à l'endroit exact où
+                il tombera si on relâche maintenant. */}
+            {dropTarget && pendingSource && dropTarget.track === track && (
+              <div
+                className="drop-ghost"
+                style={{
+                  left: Math.round(dropTarget.atMs * pxPerMs),
+                  width: Math.max(3, Math.round(pendingSource.probe.durationMs * pxPerMs)),
+                }}
+              >
+                <span>{formatTime(dropTarget.atMs)}</span>
+              </div>
+            )}
+
             {track === 0 &&
               gaps.map((gap) => (
                 <div
@@ -650,6 +865,7 @@ export function Timeline(props: Props) {
           ))}
 
           <div className="playhead" style={{ left: Math.round(playheadMs * pxPerMs) }} />
+        </div>
         </div>
       </div>
       <div className="timeline-bar">
