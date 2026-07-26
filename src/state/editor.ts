@@ -16,6 +16,7 @@ import {
   clipEndMs,
   clipsOnTrack,
   closeGaps,
+  compactTrackIndices,
   firstFreeTrack,
   migrateProject,
   neighbourLimits,
@@ -108,9 +109,13 @@ export type EditorAction =
 export const effectiveClips = (state: EditorState): Clip[] =>
   state.transientClips ?? state.clips;
 
+// Compacté à CHAQUE commit, jamais sur l'état transitoire : c'est le même
+// principe que la borne de piste posée pendant un geste, appliqué une image
+// plus tard. Idempotent sur des indices déjà compacts, donc sans coût quand
+// il n'y a rien à faire.
 const pushHistory = (state: EditorState, nextClips: Clip[]): EditorState => ({
   ...state,
-  clips: nextClips,
+  clips: compactTrackIndices(nextClips),
   transientClips: null,
   past: [...state.past.slice(-(HISTORY_LIMIT - 1)), state.clips],
   future: [],

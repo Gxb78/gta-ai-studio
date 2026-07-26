@@ -377,6 +377,31 @@ export function firstFreeTrack(clips: Clip[], startMs: number, endMs: number, fr
   return ceiling;
 }
 
+/**
+ * Ramène les indices de piste utilisés à une plage contiguë 0…n-1, en
+ * préservant leur ordre relatif.
+ *
+ * `Clip.track` n'a de sens que par sa position RELATIVE aux autres pistes : la
+ * priorité visuelle vient de « plus haut que », pas de la valeur numérique
+ * elle-même. Rien n'empêche donc un indice de piste de dériver loin au-dessus
+ * des pistes réellement occupées (un geste mal borné l'a d'ailleurs déjà fait :
+ * voir l'incident des 76 pistes). Cette fonction compacte l'écart sans rien
+ * changer de ce que le montage montre : mêmes horodatages, même son, même
+ * cadrage, même vitesse — seul le numéro de piste bouge, et seulement pour
+ * combler les trous.
+ *
+ * Pure et sans effet de bord : n'écrit rien, ne doit être appliquée qu'aux
+ * clips COMMITTÉS. L'appliquer à un état transitoire romprait le principe
+ * qui a corrigé l'incident : un geste ne doit jamais redéfinir ses propres
+ * limites pendant qu'il est en cours.
+ */
+export function compactTrackIndices(clips: Clip[]): Clip[] {
+  const usedTracks = [...new Set(clips.map((clip) => clip.track))].sort((a, b) => a - b);
+  if (usedTracks.every((track, index) => track === index)) return clips; // déjà compact
+  const mapping = new Map(usedTracks.map((track, index) => [track, index]));
+  return clips.map((clip) => ({ ...clip, track: mapping.get(clip.track) ?? 0 }));
+}
+
 /** Clip visible à cet instant : celui de la piste la plus haute qui le couvre. */
 export function topClipAt(clips: Clip[], timelineMs: number): Clip | null {
   let top: Clip | null = null;
@@ -528,7 +553,7 @@ export function closeGaps(clips: Clip[]): Clip[] {
 /** Forme d'un clip tel qu'il peut sortir du disque, tous formats confondus. */
 export type StoredClip = Omit<
   Clip,
-  "timelineStartMs" | "sourceId" | "track" | "audioEnabled" | "cropX"
+  "timelineStartMs" | "sourceId" | "track" | "audioEnabled" | "cropX" | "playbackRate"
 > & {
   timelineStartMs?: number | null;
   sourceId?: string | null;
@@ -597,7 +622,10 @@ export function migrateProject(stored: StoredProject): Project {
     id: stored.id,
     name: stored.name,
     sources,
-    clips,
+    // Un projet du disque peut porter des indices de piste creux (import d'un
+    // ancien format, ou séquelle de l'incident des 76 pistes avant son
+    // correctif) : on les compacte une fois pour toutes à l'entrée.
+    clips: compactTrackIndices(clips),
     // Projets antérieurs au cadrage porté par le projet : c'est le recadrage
     // centré qui était proposé par défaut dans la fenêtre d'export.
     framing: stored.framing === "blur" ? "blur" : "crop",

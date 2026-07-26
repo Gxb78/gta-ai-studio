@@ -5,6 +5,7 @@ import {
   clampCropX,
   clampRate,
   clipDurationMs,
+  compactTrackIndices,
   cropXPercent,
   migrateProject,
   clipEndMs,
@@ -297,6 +298,81 @@ check(
   "la piste est ramenée au plus à une piste neuve (trackCount des clips committés)",
   (versUnePisteAbsurde.transientClips ?? []).find((c) => c.id === "haut")?.track,
   2,
+);
+
+// --- Compaction des indices de piste -----------------------------------------
+
+// `Clip.track` n'a de sens que par sa position RELATIVE aux autres pistes.
+// Rien n'empêche un indice de dériver loin au-dessus des pistes réellement
+// occupées (voir l'incident des 76 pistes, ci-dessus) : cette fonction
+// referme l'écart sans rien changer d'autre.
+console.log("Compaction des indices de piste");
+const withTracks = (tracks: number[]): Clip[] =>
+  tracks.map((track, i) => clip(`c${i}`, track, i * 1000, 0, 500, `S${track}-${i}`));
+
+check(
+  "un trou isolé loin au-dessus est refermé",
+  compactTrackIndices(withTracks([0, 1, 75])).map((c) => c.track),
+  [0, 1, 2],
+);
+check(
+  "les doublons de piste comptent pour un seul cran",
+  compactTrackIndices(withTracks([4, 4, 12])).map((c) => c.track),
+  [0, 0, 1],
+);
+check(
+  "l'ordre relatif est préservé, y compris avec des doublons multiples",
+  compactTrackIndices(withTracks([0, 2, 2, 8])).map((c) => c.track),
+  [0, 1, 1, 2],
+);
+check(
+  "un montage déjà compact ressort inchangé",
+  compactTrackIndices(withTracks([0, 1, 2])).map((c) => c.track),
+  [0, 1, 2],
+);
+check("un montage vide ressort vide", compactTrackIndices([]), []);
+
+check(
+  "rien d'autre qu'un numéro de piste ne bouge",
+  (() => {
+    const troue = { ...clip("solo", 75, 3000, 1200, 900), audioEnabled: false, cropX: -0.4 };
+    const [compacte] = compactTrackIndices([troue]);
+    return {
+      timelineStartMs: compacte.timelineStartMs,
+      srcInMs: compacte.srcInMs,
+      srcOutMs: compacte.srcOutMs,
+      audioEnabled: compacte.audioEnabled,
+      cropX: compacte.cropX,
+      playbackRate: compacte.playbackRate,
+    };
+  })(),
+  { timelineStartMs: 3000, srcInMs: 1200, srcOutMs: 2100, audioEnabled: false, cropX: -0.4, playbackRate: 1 },
+);
+
+console.log("Compaction au chargement d'un projet corrompu (round-trip complet)");
+const projetCorrompu = {
+  version: 4 as const,
+  id: "p-corrompu",
+  name: "corrompu",
+  sources: { S75: source("S75") },
+  clips: [{ id: "c1", sourceId: "S75", track: 75, timelineStartMs: 0, srcInMs: 0, srcOutMs: 1000 }],
+  createdAt: "",
+  updatedAt: "",
+};
+const apresChargement = migrateProject(projetCorrompu);
+check("la première ouverture referme déjà le trou", apresChargement.clips[0]?.track, 0);
+check("une seule piste subsiste", Math.max(...apresChargement.clips.map((c) => c.track)) + 1, 1);
+
+// La sauvegarde est un passe-plat strict (voir project.rs) : « sauvegarder
+// puis recharger » revient donc à repasser le même document par
+// migrateProject. Le résultat doit rester stable — la compaction est
+// idempotente, un second passage ne doit plus rien changer.
+const resauvegarde = JSON.parse(JSON.stringify(apresChargement));
+const apresRechargement = migrateProject(resauvegarde);
+check(
+  "un second chargement ne change plus rien (idempotence)",
+  apresRechargement.clips.map((c) => c.track),
+  apresChargement.clips.map((c) => c.track),
 );
 
 // --- Parité lecteur / export -------------------------------------------------
