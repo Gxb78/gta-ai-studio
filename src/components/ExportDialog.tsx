@@ -4,13 +4,13 @@ import { useEffect, useRef, useState } from "react";
 import { exportTimeline, onExportProgress, revealPath } from "../ipc";
 import { Icon } from "./Icon";
 import type { Clip, ExportRequest, ExportSegment, FramingMode, SourceInfo } from "../types";
+import type { CompiledTimeline } from "../timeline/compileTimeline";
 import {
   OUTPUT_HEIGHT,
   OUTPUT_WIDTH,
   clipEndMs,
   formatTime,
   sortClips,
-  timelineGaps,
   usedSources,
 } from "../types";
 
@@ -30,6 +30,7 @@ function toSegments(clips: Clip[], indexOf: Map<string, number>): ExportSegment[
       srcInMs: clip.srcInMs,
       srcOutMs: clip.srcOutMs,
       playbackRate: clip.playbackRate,
+      volume: clip.volume,
       gapBeforeMs: Math.max(0, clip.timelineStartMs - cursor),
       cropX: clip.cropX,
     });
@@ -65,9 +66,8 @@ function buildRequest(
 interface Props {
   sources: Record<string, SourceInfo>;
   /** Plan vidéo. */
-  clips: Clip[];
+  compiledTimeline: CompiledTimeline;
   /** Plan audio, indépendant du plan vidéo. */
-  audioClips: Clip[];
   /**
    * Cadrage du projet. Il n'est PAS choisi ici : l'aperçu le montre déjà, et
    * deux valeurs distinctes rendraient l'aperçu menteur. On peut le changer
@@ -84,8 +84,10 @@ interface Props {
 type Phase = "config" | "running" | "done" | "error";
 
 export function ExportDialog(props: Props) {
-  const { sources, clips, audioClips, framing, onSetFraming, missingIds, defaultName, onClose } =
+  const { sources, compiledTimeline, framing, onSetFraming, missingIds, defaultName, onClose } =
     props;
+  const clips = compiledTimeline.video.segments.map((segment) => segment.clip);
+  const audioClips = compiledTimeline.audio.segments.map((segment) => segment.clip);
   const [fileName, setFileName] = useState(defaultName);
   const [phase, setPhase] = useState<Phase>("config");
   const [percent, setPercent] = useState(0);
@@ -108,7 +110,7 @@ export function ExportDialog(props: Props) {
   }, []);
 
   const sanitized = fileName.replace(/[^A-Za-z0-9 _-]/g, "").trim();
-  const gaps = timelineGaps(clips);
+  const gaps = compiledTimeline.gaps;
   const gapTotalMs = gaps.reduce((sum, gap) => sum + (gap.endMs - gap.startMs), 0);
   // Un rush introuvable fait échouer FFmpeg : autant le dire avant de lancer.
   const missingUsed = usedSources(sources, clips.concat(audioClips)).filter((source) =>

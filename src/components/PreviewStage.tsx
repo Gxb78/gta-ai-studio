@@ -15,7 +15,9 @@
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
 import type { FramingMode } from "../types";
-import { cropXPercent, formatTime } from "../types";
+import { cropXPercent } from "../types";
+import type { PlaybackClock } from "../playback/usePlayback";
+import { PlaybackTimecode } from "./PlaybackTimecode";
 
 /** Définition du fond flou. Volontairement minuscule : il est flouté ensuite. */
 const BLUR_W = 90;
@@ -52,7 +54,7 @@ interface Props {
   showSafeZones: boolean;
   onToggleSafeZones: () => void;
   playing: boolean;
-  playheadMs: number;
+  clock: PlaybackClock;
   durationMs: number;
   volume: number;
   onVolumeChange: (volume: number) => void;
@@ -68,9 +70,10 @@ interface Props {
 }
 
 export function PreviewStage(props: Props) {
+  if (import.meta.env.DEV) console.count("[render] PreviewStage");
   const {
     videoA, videoB, audioA, audioB, activeIsA, inGap, framing, cropX, sourceAspect,
-    viewMode, onViewModeChange, showSafeZones, onToggleSafeZones, playing, playheadMs,
+    viewMode, onViewModeChange, showSafeZones, onToggleSafeZones, playing, clock,
     durationMs, volume, onVolumeChange, onTogglePlay, onStepFrame, onCommitCropX,
   } = props;
 
@@ -158,7 +161,27 @@ export function PreviewStage(props: Props) {
     const width = video.videoWidth * scale;
     const height = video.videoHeight * scale;
     context.drawImage(video, (BLUR_W - width) / 2, (BLUR_H - height) / 2, width, height);
-  }, [activeIsA, blurred, inGap, playheadMs, videoA, videoB]);
+    return clock.subscribe(() => {
+      const currentCanvas = blurRef.current;
+      const currentVideo = (activeIsA ? videoA.current : videoB.current) ?? null;
+      if (!currentCanvas || !currentVideo || currentVideo.readyState < 2) return;
+      const currentContext = currentCanvas.getContext("2d");
+      if (!currentContext) return;
+      const currentScale = Math.max(
+        BLUR_W / currentVideo.videoWidth,
+        BLUR_H / currentVideo.videoHeight,
+      );
+      const currentWidth = currentVideo.videoWidth * currentScale;
+      const currentHeight = currentVideo.videoHeight * currentScale;
+      currentContext.drawImage(
+        currentVideo,
+        (BLUR_W - currentWidth) / 2,
+        (BLUR_H - currentHeight) / 2,
+        currentWidth,
+        currentHeight,
+      );
+    });
+  }, [activeIsA, blurred, clock, inGap, videoA, videoB]);
 
   const videoClass = (visible: boolean): string =>
     "preview-video" +
@@ -293,11 +316,7 @@ export function PreviewStage(props: Props) {
           >
             <Icon name="stepForward" size={16} />
           </button>
-          <div className="time">
-            <span className="time-now">{formatTime(playheadMs)}</span>
-            <span className="time-sep">/</span>
-            <span className="time-total">{formatTime(durationMs)}</span>
-          </div>
+          <PlaybackTimecode clock={clock} durationMs={durationMs} />
         </div>
 
         <div className="viewer-group">

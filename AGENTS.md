@@ -1,6 +1,6 @@
 # GTA Studio — Instructions permanentes
 
-Ce fichier est la constitution du dépôt depuis la refonte du 25 juillet 2026. L'ancienne application et son ancienne constitution sont archivées dans `legacy/` (lecture seule).
+Ce fichier est la constitution du dépôt depuis la refonte du 25 juillet 2026. L'ancienne application a été retirée de la branche active après audit ; son dernier état complet reste accessible via le tag Git `legacy-v0.7.2-archive`.
 
 ## Mission
 
@@ -12,7 +12,7 @@ La fluidité d'édition prime sur tout le reste. Une fonctionnalité qui dégrad
 
 - Lecture, scrubbing, cuts, trims, réorganisation : **100 % côté client**, sur un proxy 720p à GOP courtes, via une balise vidéo et une EDL (liste de segments virtuels).
 - FFmpeg n'intervient que pour : l'import (proxy, vignettes, waveform) et l'export final. Jamais pendant l'édition.
-- Interdits tant qu'un besoin n'est pas démontré et mesuré : serveur HTTP local, SQLite, file de jobs, workers, sidecar Python, microservices. C'est cette machinerie qui a tué la v0.x (voir `legacy/`).
+- Interdits tant qu'un besoin n'est pas démontré et mesuré : serveur HTTP local, SQLite, file de jobs, workers, sidecar Python, microservices. C'est cette machinerie qui a tué la v0.x (voir `docs/LEGACY_SALVAGE.md`).
 
 ## Architecture
 
@@ -54,13 +54,13 @@ La fluidité d'édition prime sur tout le reste. Une fonctionnalité qui dégrad
 1. **v0.1 (actuelle)** : import d'un rush → cuts/trim/split/réorganisation/undo → export 1080×1920 (recadrage centré ou fond flou). Rien d'autre.
 2. **v0.2 (en cours)** : confort — faits : multi-rushs, vitesse par clip, son par clip et par piste, glisser-déposer (fichiers sur la fenêtre, médias sur la timeline), projets récents, relocalisation d'un rush déplacé, panneau Médias, inspecteur, en-têtes de pistes. Restent : volume par clip et fondus audio.
 3. v0.3 : habillage — texte, musique, transitions simples, sous-titres automatiques (tâche de fond, jamais dans la boucle d'interaction).
-4. v0.4+ : IA d'aide au montage — détection de moments forts, suggestions de cuts, brief → premier jet. S'inspirer des idées de `legacy/` sans réimporter son architecture.
+4. v0.4+ : IA d'aide au montage — détection de moments forts, suggestions de cuts, brief → premier jet. La carte `docs/LEGACY_SALVAGE.md` recense les idées éventuellement récupérables sans réimporter l'ancienne architecture.
 
 Ne pas implémenter une couche future sans instruction explicite de l'utilisateur.
 
-## Legacy et données
+## Historique et données
 
-- `legacy/` : archive consultable de l'ancienne app (source d'idées : patterns FFmpeg dans `legacy/services/api/src/gta_studio_api/media.py` et `render.py`). Ne pas builder, ne pas modifier, ne pas réintroduire.
+- L'ancienne app n'est plus présente dans la branche active. Pour une consultation historique exceptionnelle, utiliser le tag `legacy-v0.7.2-archive` et la carte `docs/LEGACY_SALVAGE.md` ; ne jamais recopier son architecture dans la base actuelle.
 - `data/` à la racine : résidu de l'ancien pipeline, contient des copies de rushs. Ne pas supprimer sans accord explicite de l'utilisateur.
 
 ## Vérifications avant de déclarer terminé

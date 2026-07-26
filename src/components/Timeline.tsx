@@ -14,21 +14,19 @@
 
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type { EditorAction } from "../state/editor";
+import type { PlaybackClock } from "../playback/usePlayback";
+import type { CompiledTimeline } from "../timeline/compileTimeline";
 import type { Tool } from "./ToolRail";
 import type { Clip, SourceInfo } from "../types";
 import {
   clipDurationMs,
   clipEndMs,
   clipsOnTrack,
-  flattenTracks,
   formatTime,
   quantizeToFrame,
   sortClips,
   sourceAspect,
   timelineTimeToSourceTime,
-  timelineDurationMs,
-  timelineGaps,
-  trackCount,
 } from "../types";
 import { mediaUrl } from "../ipc";
 import { Icon } from "./Icon";
@@ -67,8 +65,8 @@ interface Props {
   sources: Record<string, SourceInfo>;
   pxPerSec: number;
   onPxPerSecChange: (next: number) => void;
-  playheadMs: number;
-  playing: boolean;
+  compiledTimeline: CompiledTimeline;
+  clock: PlaybackClock;
   selectedClipId: string | null;
   onSeek: (timelineMs: number) => void;
   onSelect: (clipId: string | null) => void;
@@ -125,8 +123,9 @@ interface GestureHud {
 }
 
 export function Timeline(props: Props) {
+  if (import.meta.env.DEV) console.count("[render] Timeline");
   const {
-    clips, anchorClips, sources, pxPerSec, onPxPerSecChange, playheadMs, playing,
+    clips, anchorClips, sources, pxPerSec, onPxPerSecChange, compiledTimeline, clock,
     selectedClipId, onSeek, onSelect, onPreviewFrame, onPause, onCloseGaps,
     hiddenTracks, lockedTracks, tool, pendingSource, onDropSource, onCancelDrop,
     height, onHeightChange, dispatch,
@@ -139,16 +138,17 @@ export function Timeline(props: Props) {
   const [hud, setHud] = useState<GestureHud | null>(null);
   const gestureRef = useRef<Gesture | null>(null);
   const zoomAnchorRef = useRef<{ timeMs: number; viewportX: number } | null>(null);
+  const playheadElementRef = useRef<HTMLDivElement | null>(null);
 
   const pxPerMs = pxPerSec / 1000;
   const sorted = sortClips(clips);
-  const totalMs = timelineDurationMs(clips);
+  const totalMs = compiledTimeline.video.durationMs;
   const totalPx = totalMs * pxPerMs;
   // Un trou, c'est un instant où RIEN n'est visible : il se lit sur le montage
   // aplati, pas sur la seule piste principale — et sans les pistes désactivées,
   // sinon la timeline annoncerait des trous que l'export n'a pas, ou l'inverse.
-  const gaps = timelineGaps(flattenTracks(clips, hiddenTracks));
-  const sourceCount = new Set(clips.map((clip) => clip.sourceId)).size;
+  const gaps = compiledTimeline.gaps;
+  const sourceCount = compiledTimeline.sourceCount;
   // Une piste vide n'est proposée que pendant un déplacement : le reste du
   // temps elle ne ferait qu'occuper de la hauteur pour rien.
   //
@@ -158,7 +158,7 @@ export function Timeline(props: Props) {
   // piste fantôme d'autant — si le pointeur ne bouge pas, il se retrouve
   // de nouveau dessus l'image suivante, et ainsi de suite. Un montage s'est
   // retrouvé avec 76 pistes de cette façon en moins de deux secondes.
-  const occupied = trackCount(anchorClips);
+  const occupied = compiledTimeline.trackCount;
   // Piste vide proposée pendant un déplacement OU pendant le dépôt d'un média :
   // c'est le seul moyen de poser une surcouche sur une piste neuve. Toujours
   // UNE seule, jamais plus, quel que soit l'endroit où le pointeur traîne.
@@ -167,8 +167,8 @@ export function Timeline(props: Props) {
   const trackOrder = Array.from({ length: tracks }, (_, i) => tracks - 1 - i);
 
   // Valeurs fraîches lisibles depuis la boucle rAF sans la faire dépendre du rendu.
-  const liveRef = useRef({ pxPerMs, playheadMs, anchorClips, sources, maxTrack: occupied });
-  liveRef.current = { pxPerMs, playheadMs, anchorClips, sources, maxTrack: occupied };
+  const liveRef = useRef({ pxPerMs, anchorClips, sources, maxTrack: occupied });
+  liveRef.current = { pxPerMs, anchorClips, sources, maxTrack: occupied };
 
   // --- Fenêtre visible -------------------------------------------------------
   const syncViewport = useCallback(() => {
@@ -241,6 +241,7 @@ export function Timeline(props: Props) {
       if (next === pxPerSec) return;
       const el = scrollRef.current;
       if (el) {
+        const playheadMs = clock.getPlayheadMs();
         const anchorPx = playheadMs * pxPerMs - el.scrollLeft;
         zoomAnchorRef.current = {
           timeMs: playheadMs,
@@ -249,7 +250,7 @@ export function Timeline(props: Props) {
       }
       onPxPerSecChange(next);
     },
-    [onPxPerSecChange, playheadMs, pxPerMs, pxPerSec],
+    [clock, onPxPerSecChange, pxPerMs, pxPerSec],
   );
 
   const zoomToFit = useCallback(() => {
@@ -260,17 +261,25 @@ export function Timeline(props: Props) {
     onPxPerSecChange(Math.min(MAX_PX_PER_SEC, Math.max(MIN_PX_PER_SEC, target)));
   }, [onPxPerSecChange, totalMs]);
 
-  // --- Suivi du playhead pendant la lecture ----------------------------------
   useEffect(() => {
-    if (!playing) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    const playheadPx = playheadMs * pxPerMs;
-    if (playheadPx < el.scrollLeft + 40 || playheadPx > el.scrollLeft + el.clientWidth - 120) {
-      el.scrollLeft = Math.max(0, playheadPx - el.clientWidth / 3);
-      syncViewport();
-    }
-  }, [playing, playheadMs, pxPerMs, syncViewport]);
+    let lastViewportSync = 0;
+    return clock.subscribe((playheadMs) => {
+      const playheadPx = playheadMs * pxPerMs;
+      if (playheadElementRef.current) {
+        playheadElementRef.current.style.transform = `translate3d(${playheadPx}px, 0, 0)`;
+      }
+      const el = scrollRef.current;
+      if (!el) return;
+      if (playheadPx < el.scrollLeft + 40 || playheadPx > el.scrollLeft + el.clientWidth - 120) {
+        el.scrollLeft = Math.max(0, playheadPx - el.clientWidth / 3);
+        const now = performance.now();
+        if (now - lastViewportSync >= 33) {
+          lastViewportSync = now;
+          syncViewport();
+        }
+      }
+    });
+  }, [clock, pxPerMs, syncViewport]);
 
   // --- Scrub (règle et fond de piste) ----------------------------------------
   const scrubTo = useCallback(
@@ -320,8 +329,9 @@ export function Timeline(props: Props) {
   const runGestureFrame = useCallback(() => {
     const gesture = gestureRef.current;
     if (!gesture) return;
-    const { pxPerMs: livePx, playheadMs: livePlayhead, anchorClips: liveAnchors, sources: liveSources } =
+    const { pxPerMs: livePx, anchorClips: liveAnchors, sources: liveSources } =
       liveRef.current;
+    const livePlayhead = clock.getPlayheadMs();
     // Le calage image dépend de la cadence du rush travaillé, pas du projet :
     // deux rushs peuvent avoir des cadences différentes.
     const liveFps = liveSources[gesture.origin.sourceId]?.probe.fps || 30;
@@ -877,7 +887,7 @@ export function Timeline(props: Props) {
           </div>
           ))}
 
-          <div className="playhead" style={{ left: Math.round(playheadMs * pxPerMs) }} />
+          <div className="playhead" ref={playheadElementRef} style={{ left: 0 }} />
         </div>
         </div>
       </div>

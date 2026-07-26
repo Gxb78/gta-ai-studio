@@ -7,6 +7,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type {
   ExportProgress,
   ExportRequest,
+  HardwareCapabilities,
   ImportProgress,
   Project,
   ProjectSummary,
@@ -68,6 +69,9 @@ export async function onFilesDropped(
 
 export const importSource = (path: string): Promise<SourceInfo> =>
   invoke<SourceInfo>("import_source", { path });
+
+export const getHardwareCapabilities = (): Promise<HardwareCapabilities> =>
+  invoke<HardwareCapabilities>("hardware_capabilities");
 
 export const saveProject = (project: Project): Promise<void> =>
   invoke<void>("save_project", { project });

@@ -4,6 +4,7 @@
 import {
   clampCropX,
   clampRate,
+  clampVolume,
   clipDurationMs,
   compactTrackIndices,
   cropXPercent,
@@ -24,6 +25,11 @@ import {
   initialEditorState,
   type EditorState,
 } from "../src/state/editor";
+import {
+  compileTimeline,
+  findSegmentIndex,
+} from "../src/timeline/compileTimeline";
+import { createPlaybackClock } from "../src/playback/usePlayback";
 
 const clip = (
   id: string,
@@ -40,6 +46,7 @@ const clip = (
   srcInMs: srcIn,
   srcOutMs: srcIn + dur,
   audioEnabled: track === 0,
+  volume: 1,
   playbackRate: 1,
   cropX: 0,
 });
@@ -61,6 +68,9 @@ const sortClipsById = (clips: Clip[]) =>
 
 const summary = (clips: Clip[]) =>
   clips.map((c) => `${c.sourceId}:${c.timelineStartMs}-${clipEndMs(c)}@${c.srcInMs}`);
+
+const compiledSummary = (clips: readonly { clip: Clip }[]) =>
+  summary(clips.map((segment) => segment.clip));
 
 // --- Noyau d'aplatissement ---------------------------------------------------
 
@@ -567,6 +577,11 @@ check(
   resolveVideoPlan(cadragesDifferents).length,
   2,
 );
+check(
+  "le cadrage ne découpe pas le plan audio",
+  resolveAudioPlan(cadragesDifferents).length,
+  1,
+);
 
 console.log("Migration d'un projet antérieur au cadrage");
 const migre = migrateProject({
@@ -581,6 +596,37 @@ const migre = migrateProject({
 check("le projet est ramené au format 4", migre.version, 4);
 check("le cadrage par défaut est le recadrage", migre.framing, "crop");
 check("les clips sont recentrés", migre.clips[0].cropX, 0);
+check("les clips sans volume restent au niveau original", migre.clips[0].volume, 1);
+
+console.log("Volume par clip");
+check("volume négatif écrêté", clampVolume(-0.5), 0);
+check("volume supérieur à l'original écrêté", clampVolume(3), 1);
+check("volume non numérique ramené à l'original", clampVolume(Number.NaN), 1);
+const volumeModifie = editorReducer(stateWith(covered, "haut"), {
+  type: "SET_CLIP_VOLUME",
+  clipId: "haut",
+  volume: 0.35,
+});
+check(
+  "le réducteur applique le volume",
+  volumeModifie.clips.find((clip) => clip.id === "haut")?.volume,
+  0.35,
+);
+check("le réglage de volume est annulable", volumeModifie.past.length, 1);
+const volumesDifferents = [
+  { ...clip("a", 0, 0, 0, 5000), volume: 1 },
+  { ...clip("b", 0, 5000, 5000, 5000, "S0"), volume: 0.5 },
+];
+check(
+  "deux volumes différents restent deux segments audio",
+  resolveAudioPlan(volumesDifferents).map((segment) => segment.volume),
+  [1, 0.5],
+);
+check(
+  "le volume ne découpe pas le plan vidéo",
+  resolveVideoPlan(volumesDifferents).length,
+  1,
+);
 
 // --- Pistes : désactivation et son -------------------------------------------
 
@@ -648,4 +694,99 @@ check("l'ancien rush est retiré du projet", relie.project?.sources.S0, undefine
 // Une exception suffit à faire sortir Node en erreur : pas besoin de `process`,
 // donc pas besoin des types Node juste pour ce fichier.
 if (failures > 0) throw new Error(`${failures} échec(s) — voir ci-dessus`);
+console.log("Compilation centrale de la timeline");
+const compileClips = [
+  { ...withRate(clip("base", 0, 0, 0, 20000), 2), cropX: -0.25 },
+  { ...clip("overlay", 1, 3000, 0, 4000), audioEnabled: false, cropX: 0.75 },
+  clip("tail", 0, 12000, 0, 2000, "S2"),
+];
+const compiled = compileTimeline(compileClips, new Set());
+check(
+  "plan video compile identique",
+  compiledSummary(compiled.video.segments),
+  summary(resolveVideoPlan(compileClips)),
+);
+check(
+  "plan audio compile identique",
+  compiledSummary(compiled.audio.segments),
+  summary(resolveAudioPlan(compileClips)),
+);
+check(
+  "le volume est conservé dans le plan audio compilé",
+  compiled.audio.segments.map((segment) => segment.clip.volume),
+  resolveAudioPlan(compileClips).map((segment) => segment.volume),
+);
+check("trous compiles", compiled.gaps, timelineGaps(resolveVideoPlan(compileClips)));
+check("pistes indexees", [...compiled.clipsByTrack.keys()], [0, 1]);
+check("nombre de pistes", compiled.trackCount, 2);
+check("nombre de sources", compiled.sourceCount, 3);
+
+const compiledHidden = compileTimeline(compileClips, new Set([1]));
+check(
+  "piste masquee absente des deux plans",
+  {
+    video: compiledHidden.video.segments.some((segment) => segment.clip.track === 1),
+    audio: compiledHidden.audio.segments.some((segment) => segment.clip.track === 1),
+  },
+  { video: false, audio: false },
+);
+
+const emptyCompiled = compileTimeline([], new Set());
+check(
+  "montage vide",
+  {
+    video: emptyCompiled.video.segments.length,
+    audio: emptyCompiled.audio.segments.length,
+    durationMs: emptyCompiled.video.durationMs,
+    gaps: emptyCompiled.gaps,
+  },
+  { video: 0, audio: 0, durationMs: 0, gaps: [] },
+);
+
+console.log("Recherche binaire");
+const indexedSegments = compileTimeline(
+  [clip("first", 0, 1000, 0, 1000), clip("second", 0, 2500, 0, 1000)],
+  new Set(),
+).video.segments;
+check("avant le premier", findSegmentIndex(indexedSegments, 999), -1);
+check("debut exact", findSegmentIndex(indexedSegments, 1000), 0);
+check("juste avant la fin", findSegmentIndex(indexedSegments, 1999.999), 0);
+check("fin exclusive", findSegmentIndex(indexedSegments, 2000), -1);
+check("dans un trou", findSegmentIndex(indexedSegments, 2250), -1);
+check("frontiere suivante", findSegmentIndex(indexedSegments, 2500), 1);
+check("apres le dernier", findSegmentIndex(indexedSegments, 3500), -1);
+
+console.log("Regression audio partiel");
+const image20Sound10 = compileTimeline(
+  [
+    { ...clip("image", 0, 0, 0, 20000), audioEnabled: false },
+    { ...clip("sound", 1, 0, 0, 10000, "S1"), audioEnabled: true },
+  ],
+  new Set(),
+);
+check("image continue 20 s", image20Sound10.video.durationMs, 20000);
+check(
+  "son actif 10 s puis silence 10 s",
+  {
+    audioEnd: image20Sound10.audio.segments.at(-1)?.endMs,
+    at9999: findSegmentIndex(image20Sound10.audio.segments, 9999),
+    at10000: findSegmentIndex(image20Sound10.audio.segments, 10000),
+  },
+  { audioEnd: 10000, at9999: 0, at10000: -1 },
+);
+
+console.log("Horloge imperative");
+const clockController = createPlaybackClock(125);
+const clockNotifications: number[] = [];
+const unsubscribeClock = clockController.clock.subscribe((playheadMs) => {
+  clockNotifications.push(playheadMs);
+});
+clockController.publish(456.789);
+check("temps exact lisible", clockController.clock.getPlayheadMs(), 456.789);
+check("seek publie immediatement", clockNotifications, [125, 456.789]);
+unsubscribeClock();
+clockController.publish(900);
+check("aucune notification apres desabonnement", clockNotifications, [125, 456.789]);
+
+if (failures > 0) throw new Error(`${failures} echec(s) dans la compilation`);
 console.log("\nTOUT PASSE");

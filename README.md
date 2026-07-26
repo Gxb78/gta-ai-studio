@@ -6,7 +6,8 @@ Le principe : à l'import, l'app prépare un proxy 720p à GOP courtes. Ensuite,
 
 ## Prérequis
 
-- Windows, Node ≥ 22, Rust (toolchain MSVC), FFmpeg + FFprobe dans le PATH
+- Windows, Node ≥ 22 et Rust (toolchain MSVC)
+- Pour le développement : FFmpeg + FFprobe dans le `PATH`
 
 ## Démarrer
 
@@ -14,6 +15,17 @@ Le principe : à l'import, l'app prépare un proxy 720p à GOP courtes. Ensuite,
 npm install
 npm run tauri dev
 ```
+
+## Construire l'installateur
+
+```powershell
+npm run tauri build
+```
+
+Le build copie automatiquement FFmpeg et FFprobe depuis
+`GTA_STUDIO_FFMPEG_DIR` ou depuis le `PATH`, puis les embarque dans
+l'installateur. Les exécutables provisionnés sous `src-tauri/binaries/` sont
+générés localement et ne sont pas versionnés.
 
 ## Raccourcis
 
@@ -24,6 +36,6 @@ Espace : lecture/pause · S : couper au playhead · Suppr : supprimer le clip ·
 - `src/` — interface React : état d'édition (EDL + undo), moteur de lecture, timeline virtualisée
 - `src-tauri/src/` — commandes Rust : probe/proxy/vignettes/waveform, export FFmpeg, projets JSON
 - `docs/PLAN.md` — feuille de route par couches
-- `legacy/` — ancienne application archivée (consultation uniquement)
+- `docs/LEGACY_SALVAGE.md` — décisions récupérées de l'ancienne application
 
 Les données de l'app (proxies, projets, exports) vivent dans `%APPDATA%/studio.gta.editor`.

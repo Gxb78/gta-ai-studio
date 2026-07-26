@@ -12,6 +12,9 @@ use std::process::{Command, Stdio};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 
+use crate::hardware::{self, VideoEncoder};
+use crate::media_tools::{self, MediaTool};
+
 const ALLOWED_EXTENSIONS: [&str; 4] = ["mp4", "mov", "mkv", "m4v"];
 const PROXY_HEIGHT: u32 = 720;
 const PROXY_GOP: u32 = 15; // GOP courtes = scrubbing quasi instantané
@@ -74,6 +77,10 @@ fn default_rate() -> f64 {
     1.0
 }
 
+fn default_volume() -> f64 {
+    1.0
+}
+
 /// Contrôle d'un plan avant construction du graphe. Les deux plans y passent :
 /// tout ce qui finit dans une commande FFmpeg doit être validé.
 fn validate_segments(segments: &[ExportSegment], source_count: usize) -> Result<(), String> {
@@ -92,6 +99,9 @@ fn validate_segments(segments: &[ExportSegment], source_count: usize) -> Result<
         }
         if !segment.playback_rate.is_finite() || !(0.25..=4.0).contains(&segment.playback_rate) {
             return Err("Vitesse de segment hors bornes (0,25x à 4x).".into());
+        }
+        if !segment.volume.is_finite() || !(0.0..=1.0).contains(&segment.volume) {
+            return Err("Volume de segment hors bornes (0 % à 100 %).".into());
         }
         if segment.source_index >= source_count {
             return Err("Un segment référence un rush inconnu.".into());
@@ -208,6 +218,9 @@ pub struct ExportSegment {
     /// Vitesse constante du segment (1 = temps réel).
     #[serde(default = "default_rate")]
     pub playback_rate: f64,
+    /// Gain sonore (1 = niveau original, 0 = silence).
+    #[serde(default = "default_volume")]
+    pub volume: f64,
     /// Durée de noir silencieux à insérer AVANT ce segment (trou de la timeline).
     #[serde(default)]
     pub gap_before_ms: f64,
@@ -260,8 +273,8 @@ fn ensure_dir(path: &Path) -> Result<(), String> {
 
 // --- Utilitaires process -------------------------------------------------------
 
-fn base_command(binary: &str) -> Command {
-    let command = Command::new(binary);
+fn base_command(tool: MediaTool) -> Command {
+    let command = Command::new(media_tools::path(tool));
     #[cfg(windows)]
     let command = {
         use std::os::windows::process::CommandExt;
@@ -278,6 +291,33 @@ fn missing_tool_error(tool: &str) -> String {
 
 fn str_args(values: &[&str]) -> Vec<String> {
     values.iter().map(|s| s.to_string()).collect()
+}
+
+fn video_encoder_args(encoder: VideoEncoder, cpu_preset: &str, quality: u8) -> Vec<String> {
+    match encoder {
+        VideoEncoder::H264Nvenc => vec![
+            "-c:v".into(),
+            "h264_nvenc".into(),
+            "-preset".into(),
+            "p4".into(),
+            "-tune".into(),
+            "hq".into(),
+            "-rc".into(),
+            "vbr".into(),
+            "-cq".into(),
+            quality.to_string(),
+            "-b:v".into(),
+            "0".into(),
+        ],
+        VideoEncoder::Libx264 => vec![
+            "-c:v".into(),
+            "libx264".into(),
+            "-preset".into(),
+            cpu_preset.into(),
+            "-crf".into(),
+            quality.to_string(),
+        ],
+    }
 }
 
 /// Parse "HH:MM:SS.micro" en millisecondes.
@@ -298,7 +338,7 @@ fn run_ffmpeg_with_progress(
     total_ms: f64,
     mut on_progress: impl FnMut(f64),
 ) -> Result<(), String> {
-    let mut child = base_command("ffmpeg")
+    let mut child = base_command(MediaTool::Ffmpeg)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -377,7 +417,7 @@ fn quick_fingerprint(path: &Path) -> Result<String, String> {
 // --- Probe -----------------------------------------------------------------------
 
 fn probe_file(path: &Path) -> Result<ProbeInfo, String> {
-    let output = base_command("ffprobe")
+    let output = base_command(MediaTool::Ffprobe)
         .args([
             "-v", "error",
             "-print_format", "json",
@@ -488,7 +528,11 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
         args.push(source.to_str().ok_or("Chemin source invalide.")?.into());
         args.extend(str_args(&["-map", "0:v:0", "-map", "0:a:0?", "-vf"]));
         args.push(format!("scale=-2:{PROXY_HEIGHT}"));
-        args.extend(str_args(&["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-g"]));
+        let encoder = hardware::selected_encoder();
+        let encoder_start = args.len();
+        args.extend(video_encoder_args(encoder, "veryfast", 23));
+        let encoder_end = args.len();
+        args.push("-g".into());
         args.push(PROXY_GOP.to_string());
         args.push("-keyint_min".into());
         args.push(PROXY_GOP.to_string());
@@ -501,9 +545,31 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
         ]));
         args.push(partial.to_str().ok_or("Chemin proxy invalide.")?.into());
 
-        run_ffmpeg_with_progress(&args, probe.duration_ms, |p| {
+        let first_result = run_ffmpeg_with_progress(&args, probe.duration_ms, |p| {
             emit_import(app, "proxy", 10.0 + p * 0.6);
-        })?;
+        });
+        if let Err(nvenc_error) = first_result {
+            if encoder != VideoEncoder::H264Nvenc {
+                return Err(nvenc_error);
+            }
+            let _ = fs::remove_file(&partial);
+            hardware::disable_nvenc(
+                "NVENC a échoué pendant la création d'un proxy ; repli CPU pour cette session.",
+            );
+            let mut cpu_args = args.clone();
+            cpu_args.splice(
+                encoder_start..encoder_end,
+                video_encoder_args(VideoEncoder::Libx264, "veryfast", 23),
+            );
+            run_ffmpeg_with_progress(&cpu_args, probe.duration_ms, |p| {
+                emit_import(app, "proxy", 10.0 + p * 0.6);
+            })
+            .map_err(|cpu_error| {
+                format!(
+                    "NVENC puis l'encodage CPU ont échoué.\nNVENC : {nvenc_error}\nCPU : {cpu_error}"
+                )
+            })?;
+        }
         fs::rename(&partial, &proxy_path).map_err(|e| format!("Finalisation du proxy impossible : {e}"))?;
     }
     emit_import(app, "thumbs", 72.0);
@@ -757,8 +823,9 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
             if request.sources[input].has_audio {
                 let i = next_audio;
                 let tempo = atempo_chain(segment.playback_rate);
+                let volume = segment.volume;
                 graph += &format!(
-                    "[{input}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo},{AFMT}[a{i}];"
+                    "[{input}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo},volume={volume:.6},{AFMT}[a{i}];"
                 );
                 audio_parts.push(i);
                 next_audio += 1;
@@ -833,10 +900,11 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     if request.has_audio {
         args.extend(["-map".into(), "[ac]".into()]);
     }
-    args.extend([
-        "-c:v".into(), "libx264".into(), "-preset".into(), "fast".into(), "-crf".into(), "19".into(),
-        "-pix_fmt".into(), "yuv420p".into(),
-    ]);
+    let encoder = hardware::selected_encoder();
+    let encoder_start = args.len();
+    args.extend(video_encoder_args(encoder, "fast", 19));
+    let encoder_end = args.len();
+    args.extend(["-pix_fmt".into(), "yuv420p".into()]);
     if request.has_audio {
         args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
     }
@@ -852,10 +920,28 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     };
 
     emit(0.0, false, None);
-    run_ffmpeg_with_progress(&args, total_ms, |p| emit(p, false, None)).map_err(|e| {
+    let first_result = run_ffmpeg_with_progress(&args, total_ms, |p| emit(p, false, None));
+    if let Err(nvenc_error) = first_result {
         let _ = fs::remove_file(&partial);
-        e
-    })?;
+        if encoder != VideoEncoder::H264Nvenc {
+            return Err(nvenc_error);
+        }
+        hardware::disable_nvenc("NVENC a échoué pendant un export ; repli CPU pour cette session.");
+        let mut cpu_args = args.clone();
+        cpu_args.splice(
+            encoder_start..encoder_end,
+            video_encoder_args(VideoEncoder::Libx264, "fast", 19),
+        );
+        emit(0.0, false, None);
+        run_ffmpeg_with_progress(&cpu_args, total_ms, |p| emit(p, false, None)).map_err(
+            |cpu_error| {
+                let _ = fs::remove_file(&partial);
+                format!(
+                    "NVENC puis l'encodage CPU ont échoué.\nNVENC : {nvenc_error}\nCPU : {cpu_error}"
+                )
+            },
+        )?;
+    }
 
     fs::rename(&partial, &output).map_err(|e| format!("Finalisation de l'export impossible : {e}"))?;
     let output_str = output.to_string_lossy().to_string();
@@ -888,6 +974,7 @@ mod tests {
             src_in_ms: 0.0,
             src_out_ms: 1000.0,
             playback_rate: 1.0,
+            volume: 1.0,
             crop_x: 0.0,
             gap_before_ms,
         }
@@ -934,6 +1021,12 @@ mod tests {
 
         let hors_bornes = ExportSegment { playback_rate: 12.0, ..segment(0.0) };
         assert!(validate_segments(&[hors_bornes], 1).is_err(), "vitesse aberrante refusée");
+
+        let volume_hors_bornes = ExportSegment { volume: 1.01, ..segment(0.0) };
+        assert!(
+            validate_segments(&[volume_hors_bornes], 1).is_err(),
+            "volume supérieur au niveau original refusé"
+        );
 
         let rush_inconnu = ExportSegment { source_index: 7, ..segment(0.0) };
         assert!(validate_segments(&[rush_inconnu], 1).is_err(), "rush inexistant refusé");

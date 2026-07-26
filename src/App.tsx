@@ -11,6 +11,7 @@ import { ToolRail, type Tool } from "./components/ToolRail";
 import { TopBar, type SaveState } from "./components/TopBar";
 import {
   importSource,
+  getHardwareCapabilities,
   loadLastProject,
   onFilesDropped,
   onImportProgress,
@@ -20,17 +21,21 @@ import {
   saveProject,
 } from "./ipc";
 import { usePlayback } from "./playback/usePlayback";
+import { compileTimeline } from "./timeline/compileTimeline";
 import { editorReducer, effectiveClips, initialEditorState, newClipId } from "./state/editor";
-import type { FramingMode, ImportProgress, Project, SourceInfo, StoredProject } from "./types";
+import type {
+  FramingMode,
+  HardwareCapabilities,
+  ImportProgress,
+  Project,
+  SourceInfo,
+  StoredProject,
+} from "./types";
 import {
   ASSET_VERSION,
-  clipAt,
   frameMs,
-  resolveAudioPlan,
-  resolveVideoPlan,
-  sortClips,
   sourceAspect,
-  topClipAt,
+  timelineTimeToSourceTime,
 } from "./types";
 
 /** Référence stable : évite de recréer un objet vide à chaque rendu. */
@@ -42,6 +47,7 @@ const MAX_TIMELINE_PX = 720;
 const DEFAULT_TIMELINE_PX = 320;
 
 export default function App() {
+  if (import.meta.env.DEV) console.count("[render] App");
   const [state, dispatch] = useReducer(editorReducer, initialEditorState);
   const [pxPerSec, setPxPerSec] = useState(30);
   const [tool, setTool] = useState<Tool>("select");
@@ -63,6 +69,7 @@ export default function App() {
   const [missingIds, setMissingIds] = useState<ReadonlySet<string>>(new Set());
   /** Média tiré depuis le panneau Médias, en attente de dépôt sur la timeline. */
   const [pendingSource, setPendingSource] = useState<SourceInfo | null>(null);
+  const [hardware, setHardware] = useState<HardwareCapabilities | null>(null);
 
   // Deux balises : celle qui est masquée précharge le clip suivant.
   const videoA = useRef<HTMLVideoElement | null>(null);
@@ -79,15 +86,26 @@ export default function App() {
   // montrer la même chose, sinon la promesse du canvas exact ne tient plus.
   const hiddenTracks = useMemo(() => new Set(state.hiddenTracks), [state.hiddenTracks]);
   const lockedTracks = useMemo(() => new Set(state.lockedTracks), [state.lockedTracks]);
-  const videoPlan = useMemo(
-    () => resolveVideoPlan(state.clips, hiddenTracks),
+  const compiledTimeline = useMemo(
+    () => compileTimeline(state.clips, hiddenTracks),
     [hiddenTracks, state.clips],
   );
-  const audioPlan = useMemo(
-    () => resolveAudioPlan(state.clips, hiddenTracks),
-    [hiddenTracks, state.clips],
+  const playback = usePlayback(
+    videoA,
+    videoB,
+    audioA,
+    audioB,
+    compiledTimeline,
+    sources,
+    volume,
   );
-  const playback = usePlayback(videoA, videoB, audioA, audioB, videoPlan, audioPlan, sources);
+
+  useEffect(() => {
+    void getHardwareCapabilities().then(setHardware).catch(() => undefined);
+  }, []);
+  const refreshHardware = useCallback(() => {
+    void getHardwareCapabilities().then(setHardware).catch(() => undefined);
+  }, []);
 
   // Reprendre le dernier projet au lancement. Si les fichiers dérivés d'un rush
   // datent d'une version antérieure, on les régénère : l'import réutilise le
@@ -151,12 +169,6 @@ export default function App() {
 
   // Volume général de l'aperçu : il ne concerne que les balises sonores, les
   // balises vidéo étant muettes par construction.
-  useEffect(() => {
-    for (const ref of [audioA, audioB]) {
-      if (ref.current) ref.current.volume = volume;
-    }
-  }, [volume]);
-
   // Rushs déplacés ou supprimés : le montage reste lisible sur le proxy, mais
   // l'export échouerait. On vérifie à chaque changement de liste de rushs.
   useEffect(() => {
@@ -181,9 +193,6 @@ export default function App() {
     };
   }, [sources]);
 
-  const playheadRef = useRef(0);
-  playheadRef.current = playback.playheadMs;
-
   const handleImported = useCallback((source: SourceInfo) => {
     const now = new Date().toISOString();
     const baseName = source.originalPath.split(/[\\/]/).pop() ?? "rush";
@@ -205,6 +214,7 @@ export default function App() {
           srcInMs: 0,
           srcOutMs: source.probe.durationMs,
           audioEnabled: true,
+          volume: 1,
           playbackRate: 1,
         },
       ],
@@ -234,7 +244,11 @@ export default function App() {
           setImportProgress({ stage: "hash", percent: 0 });
           const source = await importSource(path);
           if (hasProject) {
-            dispatch({ type: "ADD_SOURCE", source, atMs: playheadRef.current });
+            dispatch({
+              type: "ADD_SOURCE",
+              source,
+              atMs: playback.clock.getPlayheadMs(),
+            });
           } else {
             handleImported(source);
             hasProject = true;
@@ -247,7 +261,7 @@ export default function App() {
         setImportProgress(null);
       }
     },
-    [handleImported, state.project],
+    [handleImported, playback.clock, state.project],
   );
 
   // Dépôt de fichiers sur la fenêtre. C'est Tauri qui intercepte le glisser du
@@ -292,8 +306,8 @@ export default function App() {
   }, []);
 
   const splitAtPlayhead = useCallback(() => {
-    dispatch({ type: "SPLIT_AT", timelineMs: playback.playheadMs });
-  }, [playback.playheadMs]);
+    dispatch({ type: "SPLIT_AT", timelineMs: playback.clock.getPlayheadMs() });
+  }, [playback.clock]);
 
   const deleteSelected = useCallback(() => {
     if (state.selectedClipId) dispatch({ type: "DELETE_CLIP", clipId: state.selectedClipId });
@@ -320,25 +334,28 @@ export default function App() {
       let edgeSrcMs: number;
       if ("toPlayhead" in mode) {
         // Le playhead doit être dans le clip sélectionné, sinon le geste n'a pas de sens.
-        const position = clipAt(sortClips(state.clips), playback.playheadMs);
-        if (!position || sortClips(state.clips)[position.clipIndex].id !== clip.id) return;
-        edgeSrcMs = clip.srcInMs + position.offsetMs;
+        const playheadMs = playback.clock.getPlayheadMs();
+        if (playheadMs <= clip.timelineStartMs || playheadMs >= clip.timelineStartMs + (clip.srcOutMs - clip.srcInMs) / clip.playbackRate) return;
+        edgeSrcMs = timelineTimeToSourceTime(clip, playheadMs);
       } else {
         edgeSrcMs = (side === "left" ? clip.srcInMs : clip.srcOutMs) + mode.deltaMs;
       }
       dispatch({ type: "TRIM_EDGE", clipId: clip.id, side, edgeSrcMs });
     },
-    [playback.playheadMs, state.clips, state.selectedClipId],
+    [playback.clock, state.clips, state.selectedClipId],
   );
 
   const stepFrame = useCallback(
     (direction: -1 | 1) => {
       const step = frameMs(referenceFps);
       playback.seek(
-        Math.max(0, Math.min(playback.durationMs, playback.playheadMs + direction * step)),
+        Math.max(
+          0,
+          Math.min(playback.durationMs, playback.clock.getPlayheadMs() + direction * step),
+        ),
       );
     },
-    [playback, referenceFps],
+    [playback.clock, playback.durationMs, playback.seek, referenceFps],
   );
 
   // Raccourcis clavier globaux.
@@ -389,14 +406,18 @@ export default function App() {
         }
         const step = event.shiftKey ? 1000 : frameMs(fps);
         playback.seek(
-          Math.max(0, Math.min(playback.durationMs, playback.playheadMs + direction * step)),
+          Math.max(
+            0,
+            Math.min(playback.durationMs, playback.clock.getPlayheadMs() + direction * step),
+          ),
         );
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [
-    deleteSelected, exporting, playback, referenceFps, splitAtPlayhead, state.project,
+    deleteSelected, exporting, playback.clock, playback.durationMs, playback.seek, playback.toggle,
+    referenceFps, splitAtPlayhead, state.project,
     toggleClipAudio, trimSelected,
   ]);
 
@@ -428,10 +449,8 @@ export default function App() {
 
   // Clip réellement visible au playhead : c'est SON cadrage que l'aperçu doit
   // appliquer, et son rush qui donne le format en mode « rush entier ».
-  const visibleClip = topClipAt(
-    state.clips.filter((clip) => !hiddenTracks.has(clip.track)),
-    playback.playheadMs,
-  );
+  const visibleClip =
+    state.clips.find((clip) => clip.id === playback.activeVideoClipId) ?? null;
   const visibleSource = visibleClip ? sources[visibleClip.sourceId] : undefined;
   const clipCounts = state.clips.reduce<Record<string, number>>((counts, clip) => {
     counts[clip.sourceId] = (counts[clip.sourceId] ?? 0) + 1;
@@ -456,6 +475,8 @@ export default function App() {
           playback.pause();
           setExporting(true);
         }}
+        hardware={hardware}
+        onRefreshHardware={refreshHardware}
       />
 
       <div className="workspace">
@@ -478,7 +499,11 @@ export default function App() {
             error={importError}
             onImport={handlePickAndImport}
             onAddToTimeline={(source) =>
-              dispatch({ type: "ADD_SOURCE", source, atMs: playheadRef.current })
+              dispatch({
+                type: "ADD_SOURCE",
+                source,
+                atMs: playback.clock.getPlayheadMs(),
+              })
             }
             onBeginDrag={(source) => setPendingSource(source)}
             onRelocate={(source) => void handleRelocate(source)}
@@ -501,7 +526,7 @@ export default function App() {
           showSafeZones={showSafeZones}
           onToggleSafeZones={() => setShowSafeZones((visible) => !visible)}
           playing={playback.playing}
-          playheadMs={playback.playheadMs}
+          clock={playback.clock}
           durationMs={playback.durationMs}
           volume={volume}
           onVolumeChange={setVolume}
@@ -530,6 +555,11 @@ export default function App() {
                 dispatch({ type: "SET_CLIP_RATE", clipId: state.selectedClipId, rate });
               }
             }}
+            onSetVolume={(volume) => {
+              if (state.selectedClipId) {
+                dispatch({ type: "SET_CLIP_VOLUME", clipId: state.selectedClipId, volume });
+              }
+            }}
             onToggleAudio={toggleClipAudio}
             onDelete={deleteSelected}
             onCollapse={() => setInspectorOpen(false)}
@@ -543,8 +573,8 @@ export default function App() {
         sources={sources}
         pxPerSec={pxPerSec}
         onPxPerSecChange={setPxPerSec}
-        playheadMs={playback.playheadMs}
-        playing={playback.playing}
+        compiledTimeline={compiledTimeline}
+        clock={playback.clock}
         selectedClipId={state.selectedClipId}
         onSeek={playback.seek}
         onSelect={selectClip}
@@ -589,8 +619,7 @@ export default function App() {
       {exporting && (
         <ExportDialog
           sources={sources}
-          clips={videoPlan}
-          audioClips={audioPlan}
+          compiledTimeline={compiledTimeline}
           framing={framing}
           onSetFraming={(next) => dispatch({ type: "SET_FRAMING", framing: next })}
           missingIds={missingIds}

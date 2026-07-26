@@ -9,6 +9,16 @@ export interface ProbeInfo {
   videoCodec: string;
 }
 
+export interface HardwareCapabilities {
+  ffmpegVersion: string;
+  ffprobeVersion: string;
+  gpuName: string | null;
+  nvencAvailable: boolean;
+  selectedEncoder: "libx264" | "h264_nvenc";
+  mediaToolsBundled: boolean;
+  diagnostics: string[];
+}
+
 export interface SourceInfo {
   /** Empreinte rapide du fichier source (clé de cache locale). */
   id: string;
@@ -73,6 +83,8 @@ export interface Clip {
    * un plan de coupe ne doit pas couper le son de ce qui se joue en dessous.
    */
   audioEnabled: boolean;
+  /** Gain sonore du clip. 1 = niveau original, 0 = silence. */
+  volume: number;
   /**
    * Vitesse de lecture constante. 1 = temps réel, 2 = deux fois plus rapide.
    *
@@ -85,9 +97,14 @@ export interface Clip {
 /** Bornes de vitesse. Au-delà, le décodage et `atempo` deviennent hasardeux. */
 export const MIN_RATE = 0.25;
 export const MAX_RATE = 4;
+export const MIN_VOLUME = 0;
+export const MAX_VOLUME = 1;
 
 export const clampRate = (rate: number): number =>
   Number.isFinite(rate) && rate > 0 ? Math.min(MAX_RATE, Math.max(MIN_RATE, rate)) : 1;
+
+export const clampVolume = (volume: number): number =>
+  Number.isFinite(volume) ? Math.min(MAX_VOLUME, Math.max(MIN_VOLUME, volume)) : 1;
 
 /**
  * Passage du rush au format vertical. C'est un réglage du PROJET, pas de la
@@ -143,6 +160,7 @@ export function flattenTracks(
   clips: Clip[],
   hiddenTracks?: ReadonlySet<number>,
   keep?: (clip: Clip) => boolean,
+  planKind: "video" | "audio" = "video",
 ): Clip[] {
   let visible = hiddenTracks ? clips.filter((clip) => !hiddenTracks.has(clip.track)) : clips;
   if (keep) visible = visible.filter(keep);
@@ -180,6 +198,7 @@ export function flattenTracks(
       srcInMs: timelineTimeToSourceTime(top, from),
       srcOutMs: timelineTimeToSourceTime(top, to),
       audioEnabled: top.audioEnabled,
+      volume: top.volume,
       playbackRate: top.playbackRate,
     };
 
@@ -190,9 +209,11 @@ export function flattenTracks(
       previous &&
       previous.sourceId === segment.sourceId &&
       previous.playbackRate === segment.playbackRate &&
-      // Deux cadrages différents doivent rester deux segments : ils ne
-      // produisent pas la même image à l'export.
-      previous.cropX === segment.cropX &&
+      // Le cadrage ne concerne que l'image ; le gain ne concerne que le son.
+      // Les mélanger ici ajouterait des coupes FFmpeg inutiles dans l'autre plan.
+      (planKind === "audio"
+        ? previous.volume === segment.volume
+        : previous.cropX === segment.cropX) &&
       Math.abs(clipEndMs(previous) - segment.timelineStartMs) < 0.001 &&
       Math.abs(previous.srcOutMs - segment.srcInMs) < 0.001
     ) {
@@ -261,6 +282,8 @@ export interface ExportSegment {
   gapBeforeMs: number;
   /** Décalage du cadrage 9:16 de ce segment (voir `Clip.cropX`). */
   cropX: number;
+  /** Gain sonore de ce segment. Utilisé uniquement dans le plan audio. */
+  volume: number;
 }
 
 export interface ExportRequest {
@@ -355,7 +378,7 @@ export const resolveVideoPlan = (clips: Clip[], hiddenTracks?: ReadonlySet<numbe
   flattenTracks(clips, hiddenTracks);
 
 export const resolveAudioPlan = (clips: Clip[], hiddenTracks?: ReadonlySet<number>): Clip[] =>
-  flattenTracks(clips, hiddenTracks, (clip) => clip.audioEnabled);
+  flattenTracks(clips, hiddenTracks, (clip) => clip.audioEnabled, "audio");
 
 /** Vrai si l'intervalle est libre sur cette piste. */
 export function trackIsFree(clips: Clip[], track: number, startMs: number, endMs: number): boolean {
@@ -553,12 +576,19 @@ export function closeGaps(clips: Clip[]): Clip[] {
 /** Forme d'un clip tel qu'il peut sortir du disque, tous formats confondus. */
 export type StoredClip = Omit<
   Clip,
-  "timelineStartMs" | "sourceId" | "track" | "audioEnabled" | "cropX" | "playbackRate"
+  | "timelineStartMs"
+  | "sourceId"
+  | "track"
+  | "audioEnabled"
+  | "volume"
+  | "cropX"
+  | "playbackRate"
 > & {
   timelineStartMs?: number | null;
   sourceId?: string | null;
   track?: number | null;
   audioEnabled?: boolean | null;
+  volume?: number | null;
   playbackRate?: number | null;
   cropX?: number | null;
 };
@@ -610,6 +640,8 @@ export function migrateProject(stored: StoredProject): Project {
       // Projets antérieurs au son par clip : la piste principale s'entend,
       // les surcouches sont muettes, ce qui reconduit leur comportement.
       audioEnabled: typeof clip.audioEnabled === "boolean" ? clip.audioEnabled : track === 0,
+      // Projets antérieurs au volume par clip : niveau original.
+      volume: clampVolume(clip.volume ?? 1),
       // Projets antérieurs à la vitesse par clip : temps réel.
       playbackRate: clampRate(clip.playbackRate ?? 1),
       // Projets antérieurs au cadrage par clip : recadrage centré.

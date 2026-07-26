@@ -11,6 +11,7 @@ import {
   MIN_CLIP_MS,
   applyRate,
   clampCropX,
+  clampVolume,
   applyTrim,
   clipDurationMs,
   clipEndMs,
@@ -81,6 +82,7 @@ export type EditorAction =
   | { type: "SET_FRAMING"; framing: FramingMode }
   /** Décalage horizontal du cadrage d'un clip. */
   | { type: "SET_CLIP_CROP_X"; clipId: string; cropX: number }
+  | { type: "SET_CLIP_VOLUME"; clipId: string; volume: number }
   | { type: "TOGGLE_TRACK_HIDDEN"; track: number }
   | { type: "TOGGLE_TRACK_LOCKED"; track: number }
   /** Son de tous les clips d'une piste, d'un coup (bouton M de l'en-tête). */
@@ -204,6 +206,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         srcOutMs: action.source.probe.durationMs,
         // Une surcouche arrive muette : elle ne doit pas couper le son du dessous.
         audioEnabled: track === 0,
+        volume: 1,
         playbackRate: 1,
       };
       // Piste imposée (dépôt à la souris) : les clips déjà présents s'écartent,
@@ -262,6 +265,18 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       return pushHistory(state, clips);
     }
 
+    case "SET_CLIP_VOLUME": {
+      const target = state.clips.find((clip) => clip.id === action.clipId);
+      const volume = clampVolume(action.volume);
+      if (!target || target.volume === volume) return state;
+      return pushHistory(
+        state,
+        state.clips.map((clip) =>
+          clip.id === action.clipId ? { ...clip, volume } : clip,
+        ),
+      );
+    }
+
     case "TOGGLE_TRACK_HIDDEN":
       return { ...state, hiddenTracks: toggleTrack(state.hiddenTracks, action.track) };
 
@@ -312,6 +327,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         srcInMs: cutSrc,
         srcOutMs: clip.srcOutMs,
         audioEnabled: clip.audioEnabled,
+        volume: clip.volume,
         playbackRate: clip.playbackRate,
       };
       const next = state.clips.map((c) => (c.id === clip.id ? left : c));

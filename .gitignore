@@ -16,6 +16,7 @@ __pycache__/
 # Archives legacy : caches et binaires lourds
 legacy/apps/desktop/.sidecar-build/
 legacy/**/binaries/*.exe
+src-tauri/binaries/*.exe
 
 # Configuration locale et secrets
 .env

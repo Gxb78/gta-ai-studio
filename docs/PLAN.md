@@ -35,7 +35,8 @@ Reste à faire sur cette couche (petites finitions attendues après le premier `
 
 - Détection de moments forts (audio + mouvement) sur le proxy, en fond.
 - Suggestions de cuts : « garde ces 3 passages », premier jet de montage à partir d'un brief court.
-- S'inspirer des idées de `legacy/` (analyse, scoring) sans réintroduire pipeline HTTP/SQLite/jobs.
+- Consulter la carte `docs/LEGACY_SALVAGE.md` et, seulement si nécessaire, le tag
+  `legacy-v0.7.2-archive`, sans réintroduire le pipeline HTTP/SQLite/jobs.
 
 ## Dette assumée de la v0.1 (à traiter quand ça gêne)
 

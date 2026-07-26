@@ -8,7 +8,15 @@
 import { Icon } from "./Icon";
 import { sourceName } from "./MediaPanel";
 import type { Clip, FramingMode, SourceInfo } from "../types";
-import { MAX_RATE, MIN_RATE, clipDurationMs, clipEndMs, formatTime } from "../types";
+import {
+  MAX_RATE,
+  MAX_VOLUME,
+  MIN_RATE,
+  MIN_VOLUME,
+  clipDurationMs,
+  clipEndMs,
+  formatTime,
+} from "../types";
 
 const RATES = [0.25, 0.5, 1, 1.5, 2, 3, 4];
 
@@ -19,6 +27,7 @@ interface Props {
   onSetFraming: (framing: FramingMode) => void;
   onSetCropX: (cropX: number) => void;
   onSetRate: (rate: number) => void;
+  onSetVolume: (volume: number) => void;
   onToggleAudio: () => void;
   onDelete: () => void;
   onCollapse: () => void;
@@ -153,6 +162,25 @@ export function Inspector(props: Props) {
               <Icon name={clip.audioEnabled ? "sound" : "soundOff"} size={15} />
               {clip.audioEnabled ? "Son actif" : "Son coupé"}
             </button>
+            <div className="slider-row">
+              <Icon name={clip.volume === 0 ? "soundOff" : "volume"} size={15} />
+              <input
+                type="range"
+                min={MIN_VOLUME}
+                max={MAX_VOLUME}
+                step={0.01}
+                value={clip.volume}
+                disabled={!clip.audioEnabled}
+                onChange={(event) => props.onSetVolume(Number(event.target.value))}
+                aria-label="Volume du clip"
+              />
+              <span className="slider-value">{Math.round(clip.volume * 100)} %</span>
+            </div>
+            {clip.volume !== 1 && clip.audioEnabled && (
+              <button type="button" className="ghost small" onClick={() => props.onSetVolume(1)}>
+                Rétablir 100 %
+              </button>
+            )}
             <p className="muted small-text">
               Couper le son d'une surcouche laisse passer celui de la piste du dessous.
             </p>

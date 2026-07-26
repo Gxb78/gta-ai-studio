@@ -393,6 +393,27 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
 }
 .menu-item kbd { margin-left: auto; }
 .menu-item:hover:not(:disabled) { background: var(--surface-3); border-color: transparent; }
+.menu-info {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin-top: 4px;
+  padding: 9px 10px 7px;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  line-height: 1.3;
+}
+.menu-info svg { flex: 0 0 auto; margin-top: 1px; }
+.menu-info span { min-width: 0; }
+.menu-info small {
+  display: block;
+  overflow: hidden;
+  margin-top: 2px;
+  color: var(--text-faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* --- Aperçu : canvas 9:16 réel ---------------------------------------------------- */
 

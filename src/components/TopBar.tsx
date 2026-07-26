@@ -8,6 +8,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
+import type { HardwareCapabilities } from "../types";
 
 /** Où en est la sauvegarde automatique du projet. */
 export type SaveState = "clean" | "saving" | "saved" | "error";
@@ -25,6 +26,8 @@ interface Props {
   onShowShortcuts: () => void;
   onNewProject: () => void;
   onExport: () => void;
+  hardware: HardwareCapabilities | null;
+  onRefreshHardware: () => void;
 }
 
 const SAVE_LABEL: Record<SaveState, string> = {
@@ -132,7 +135,11 @@ export function TopBar(props: Props) {
           <button
             type="button"
             className={"icon-btn ghost" + (menuOpen ? " active" : "")}
-            onClick={() => setMenuOpen((open) => !open)}
+            onClick={() => {
+              const next = !menuOpen;
+              setMenuOpen(next);
+              if (next) props.onRefreshHardware();
+            }}
             title="Paramètres"
             aria-label="Paramètres"
           >
@@ -174,6 +181,38 @@ export function TopBar(props: Props) {
                 <Icon name="plus" size={15} />
                 Nouveau projet
               </button>
+              <div
+                className="menu-info"
+                title={
+                  props.hardware
+                    ? [
+                        props.hardware.ffmpegVersion,
+                        props.hardware.ffprobeVersion,
+                        ...props.hardware.diagnostics,
+                      ].join("\n")
+                    : "Diagnostic matériel en cours"
+                }
+              >
+                <Icon
+                  name={props.hardware?.nvencAvailable ? "saved" : "settings"}
+                  size={15}
+                />
+                <span>
+                  {props.hardware?.nvencAvailable
+                    ? "Accélération NVIDIA active"
+                    : props.hardware
+                      ? "Encodage CPU"
+                      : "Diagnostic matériel…"}
+                  {props.hardware?.gpuName && <small>{props.hardware.gpuName}</small>}
+                  {props.hardware && (
+                    <small>
+                      {props.hardware.mediaToolsBundled
+                        ? "FFmpeg embarqué"
+                        : "FFmpeg système"}
+                    </small>
+                  )}
+                </span>
+              </div>
             </div>
           )}
         </div>

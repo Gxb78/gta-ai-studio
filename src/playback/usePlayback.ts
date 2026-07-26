@@ -12,16 +12,11 @@
 // Entre deux clips disjoints, on traverse le trou à l'horloge, écran noir.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Clip, SourceInfo } from "../types";
-import {
-  clipAt,
-  clipEndMs,
-  nextClipIndex,
-  sortClips,
-  timelineDurationMs,
-  timelineTimeToSourceTime,
-} from "../types";
+import type { SourceInfo } from "../types";
+import { timelineTimeToSourceTime } from "../types";
 import { mediaUrl } from "../ipc";
+import type { CompiledSegment, CompiledTimeline } from "../timeline/compileTimeline";
+import { findNextSegmentIndex, findSegmentIndex } from "../timeline/compileTimeline";
 
 /** Marge de détection de fin de clip (ms) pour anticiper le saut. */
 const BOUNDARY_EPSILON_MS = 26;
@@ -29,14 +24,44 @@ const BOUNDARY_EPSILON_MS = 26;
 /** Écart au-delà duquel l'aperçu est re-calé sur le playhead après un montage. */
 const RESYNC_TOLERANCE_MS = 45;
 
+export interface PlaybackClock {
+  getPlayheadMs: () => number;
+  subscribe: (listener: (playheadMs: number) => void) => () => void;
+}
+
+export interface PlaybackClockController {
+  clock: PlaybackClock;
+  publish: (playheadMs: number) => void;
+}
+
+export function createPlaybackClock(initialPlayheadMs = 0): PlaybackClockController {
+  let playheadMs = initialPlayheadMs;
+  const listeners = new Set<(nextPlayheadMs: number) => void>();
+  return {
+    clock: {
+      getPlayheadMs: () => playheadMs,
+      subscribe: (listener) => {
+        listeners.add(listener);
+        listener(playheadMs);
+        return () => listeners.delete(listener);
+      },
+    },
+    publish: (nextPlayheadMs) => {
+      playheadMs = nextPlayheadMs;
+      for (const listener of listeners) listener(nextPlayheadMs);
+    },
+  };
+}
+
 export interface PlaybackApi {
   playing: boolean;
-  playheadMs: number;
   durationMs: number;
   /** Vrai quand le playhead est dans un trou : l'aperçu affiche du noir. */
   inGap: boolean;
   /** Balise actuellement visible. L'autre précharge le clip suivant. */
   activeIsA: boolean;
+  activeVideoClipId: string | null;
+  clock: PlaybackClock;
   play: () => void;
   pause: () => void;
   toggle: () => void;
@@ -95,33 +120,38 @@ export function usePlayback(
   videoB: React.RefObject<HTMLVideoElement | null>,
   audioA: React.RefObject<HTMLAudioElement | null>,
   audioB: React.RefObject<HTMLAudioElement | null>,
-  clips: Clip[],
-  audioClips: Clip[],
+  compiledTimeline: CompiledTimeline,
   sources: Record<string, SourceInfo>,
+  previewVolume: number,
 ): PlaybackApi {
   const [playing, setPlaying] = useState(false);
-  const [playheadMs, setPlayheadMs] = useState(0);
+  const playingRef = useRef(false);
   const [inGap, setInGap] = useState(false);
   const [activeIsA, setActiveIsA] = useState(true);
+  const [activeVideoClipId, setActiveVideoClipId] = useState<string | null>(null);
 
   const activeIsARef = useRef(true);
   const rafRef = useRef<number | null>(null);
   const lastTickRef = useRef(0);
   const playheadRef = useRef(0);
+  const clockControllerRef = useRef<PlaybackClockController | null>(null);
+  if (!clockControllerRef.current) clockControllerRef.current = createPlaybackClock();
   /** Clip déjà préchargé sur la balise inactive, pour ne pas recharger en boucle. */
   const primedClipIdRef = useRef<string | null>(null);
 
-  const clipsRef = useRef(clips);
-  clipsRef.current = clips;
-  const audioClipsRef = useRef(audioClips);
-  audioClipsRef.current = audioClips;
+  const compiledRef = useRef(compiledTimeline);
+  compiledRef.current = compiledTimeline;
+  const currentVideoIndexRef = useRef(-1);
+  const currentAudioIndexRef = useRef(-1);
   /** Balise sonore active, et clip déjà préchargé sur l'autre. */
   const audioActiveIsARef = useRef(true);
   const primedAudioIdRef = useRef<string | null>(null);
   const sourcesRef = useRef(sources);
   sourcesRef.current = sources;
+  const previewVolumeRef = useRef(previewVolume);
+  previewVolumeRef.current = previewVolume;
 
-  const durationMs = timelineDurationMs(clips);
+  const durationMs = compiledTimeline.video.durationMs;
 
   const getActive = useCallback(
     () => (activeIsARef.current ? videoA.current : videoB.current),
@@ -132,10 +162,21 @@ export function usePlayback(
     [videoA, videoB],
   );
 
-  const setPlayhead = useCallback((ms: number) => {
+  const publishPlayhead = useCallback((ms: number) => {
     playheadRef.current = ms;
-    setPlayheadMs(ms);
+    clockControllerRef.current?.publish(ms);
   }, []);
+
+  useEffect(() => {
+    const audioSegments = compiledTimeline.audio.segments;
+    for (const element of [audioA.current, audioB.current]) {
+      if (!element) continue;
+      const clip = audioSegments.find(
+        (segment) => segment.clip.id === element.dataset.clipId,
+      )?.clip;
+      element.volume = Math.min(1, previewVolume * (clip?.volume ?? 1));
+    }
+  }, [audioA, audioB, compiledTimeline, previewVolume]);
 
   const stopLoop = useCallback(() => {
     if (rafRef.current !== null) {
@@ -150,24 +191,25 @@ export function usePlayback(
     audioA.current?.pause();
     audioB.current?.pause();
     stopLoop();
+    playingRef.current = false;
     setPlaying(false);
   }, [audioA, audioB, stopLoop, videoA, videoB]);
 
   /** Prépare la balise inactive sur le clip qui suit, sans la jouer. */
   const ensurePrimed = useCallback(
-    (upcoming: Clip | undefined) => {
+    (upcoming: CompiledSegment | undefined) => {
       if (!upcoming) {
         primedClipIdRef.current = null;
         return;
       }
-      if (primedClipIdRef.current === upcoming.id) return;
+      if (primedClipIdRef.current === upcoming.clip.id) return;
       const idle = getIdle();
-      const source = sourcesRef.current[upcoming.sourceId];
+      const source = sourcesRef.current[upcoming.clip.sourceId];
       if (!idle || !source) return;
-      primedClipIdRef.current = upcoming.id;
+      primedClipIdRef.current = upcoming.clip.id;
       idle.pause();
-      idle.playbackRate = upcoming.playbackRate;
-      assign(idle, source, upcoming.srcInMs);
+      idle.playbackRate = upcoming.clip.playbackRate;
+      assign(idle, source, upcoming.clip.srcInMs);
     },
     [getIdle],
   );
@@ -175,25 +217,29 @@ export function usePlayback(
   /** Place l'aperçu sur un temps timeline. Renvoie le clip trouvé, ou null (trou). */
   const applyPosition = useCallback(
     (timelineMs: number) => {
-      const sorted = sortClips(clipsRef.current);
-      const position = clipAt(sorted, timelineMs);
+      const segments = compiledRef.current.video.segments;
+      const index = findSegmentIndex(segments, timelineMs);
+      currentVideoIndexRef.current = index;
       const active = getActive();
-      if (position) {
-        const clip = sorted[position.clipIndex];
+      if (index !== -1) {
+        const segment = segments[index];
+        const clip = segment.clip;
         const source = sourcesRef.current[clip.sourceId];
         if (active && source) {
           active.playbackRate = clip.playbackRate;
           assign(active, source, timelineTimeToSourceTime(clip, timelineMs));
         }
         setInGap(false);
-        ensurePrimed(sorted[position.clipIndex + 1]);
+        setActiveVideoClipId(segment.sourceClipId);
+        ensurePrimed(segments[index + 1]);
       } else {
         active?.pause();
         setInGap(true);
-        const upcoming = nextClipIndex(sorted, timelineMs);
-        ensurePrimed(upcoming === -1 ? undefined : sorted[upcoming]);
+        setActiveVideoClipId(null);
+        const upcoming = findNextSegmentIndex(segments, timelineMs);
+        ensurePrimed(upcoming === -1 ? undefined : segments[upcoming]);
       }
-      return position;
+      return index;
     },
     [ensurePrimed, getActive],
   );
@@ -208,16 +254,21 @@ export function usePlayback(
   const syncAudio = useCallback(
     (timelineMs: number, shouldPlay: boolean, force = false) => {
       const elements = [audioA.current, audioB.current];
-      const sorted = sortClips(audioClipsRef.current);
-      const position = clipAt(sorted, timelineMs);
+      const segments = compiledRef.current.audio.segments;
+      let index = currentAudioIndexRef.current;
+      const current = segments[index];
+      if (!current || timelineMs < current.startMs || timelineMs >= current.endMs) {
+        index = findSegmentIndex(segments, timelineMs);
+        currentAudioIndexRef.current = index;
+      }
 
-      if (!position) {
+      if (index === -1) {
         for (const element of elements) element?.pause();
         primedAudioIdRef.current = null;
         return;
       }
 
-      const clip = sorted[position.clipIndex];
+      const clip = segments[index].clip;
       const source = sourcesRef.current[clip.sourceId];
       if (!source) return;
 
@@ -237,6 +288,7 @@ export function usePlayback(
       const targetMs = timelineTimeToSourceTime(clip, timelineMs);
       // La vitesse du son suit celle du clip ; le rattrapage de dérive vient en plus.
       const baseRate = clip.playbackRate;
+      active.volume = Math.min(1, previewVolumeRef.current * clip.volume);
       if (active.dataset.clipId !== clip.id || force) {
         // Changement de segment, ou recalage forcé après un seek ou une pause :
         // on repositionne sans état d'âme, il n'y a rien à préserver.
@@ -262,13 +314,14 @@ export function usePlayback(
       idle?.pause();
 
       // Préchargement du segment sonore suivant.
-      const upcoming = sorted[position.clipIndex + 1];
+      const upcoming = segments[index + 1]?.clip;
       if (idle && upcoming && primedAudioIdRef.current !== upcoming.id) {
         const nextSource = sourcesRef.current[upcoming.sourceId];
         if (nextSource) {
           primedAudioIdRef.current = upcoming.id;
           idle.dataset.clipId = upcoming.id;
           idle.playbackRate = upcoming.playbackRate;
+          idle.volume = Math.min(1, previewVolumeRef.current * upcoming.volume);
           assign(idle, nextSource, upcoming.srcInMs);
         }
       }
@@ -278,13 +331,13 @@ export function usePlayback(
 
   const seek = useCallback(
     (timelineMs: number) => {
-      const clamped = Math.max(0, Math.min(timelineMs, timelineDurationMs(clipsRef.current)));
+      const clamped = Math.max(0, Math.min(timelineMs, compiledRef.current.video.durationMs));
       applyPosition(clamped);
       // Après un seek, le son est recalé d'autorité : aucune dérive à rattraper.
       syncAudio(clamped, false, true);
-      setPlayhead(clamped);
+      publishPlayhead(clamped);
     },
-    [applyPosition, setPlayhead, syncAudio],
+    [applyPosition, publishPlayhead, syncAudio],
   );
 
   /** Bascule sur la balise préchargée : c'est l'opération qui rend la jonction invisible. */
@@ -294,33 +347,43 @@ export function usePlayback(
   }, []);
 
   const loop = useCallback(() => {
-    const sorted = sortClips(clipsRef.current);
-    if (sorted.length === 0) return;
+    const segments = compiledRef.current.video.segments;
+    if (segments.length === 0) return;
 
     const now = performance.now();
     const elapsed = Math.max(0, now - lastTickRef.current);
     lastTickRef.current = now;
 
-    const total = timelineDurationMs(sorted);
-    const position = clipAt(sorted, playheadRef.current);
+    const total = compiledRef.current.video.durationMs;
+    let index = currentVideoIndexRef.current;
+    const indexed = segments[index];
+    if (!indexed || playheadRef.current < indexed.startMs || playheadRef.current >= indexed.endMs) {
+      index = findSegmentIndex(segments, playheadRef.current);
+      currentVideoIndexRef.current = index;
+    }
     const active = getActive();
 
-    if (position && active) {
-      const clip = sorted[position.clipIndex];
+    if (index !== -1 && active) {
+      const clip = segments[index].clip;
       const sourceMs = active.currentTime * 1000;
 
       if (sourceMs >= clip.srcOutMs - BOUNDARY_EPSILON_MS) {
-        const boundaryMs = clipEndMs(clip);
+        const boundaryMs = segments[index].endMs;
         if (boundaryMs >= total - 1) {
-          setPlayhead(total);
+          publishPlayhead(total);
           pause();
           return;
         }
-        setPlayhead(boundaryMs);
-        const nextPosition = clipAt(sorted, boundaryMs);
-        if (nextPosition) {
+        publishPlayhead(boundaryMs);
+        const nextIndex =
+          segments[index + 1]?.startMs === boundaryMs
+            ? index + 1
+            : findSegmentIndex(segments, boundaryMs);
+        currentVideoIndexRef.current = nextIndex;
+        if (nextIndex !== -1) {
           // Le clip suivant est déjà chargé et positionné sur la balise inactive.
-          const nextClip = sorted[nextPosition.clipIndex];
+          const nextSegment = segments[nextIndex];
+          const nextClip = nextSegment.clip;
           const ready = primedClipIdRef.current === nextClip.id;
           if (ready) {
             const incoming = getIdle();
@@ -328,70 +391,76 @@ export function usePlayback(
             active.pause();
             primedClipIdRef.current = null;
             void incoming?.play().catch(() => undefined);
-            ensurePrimed(sorted[nextPosition.clipIndex + 1]);
+            ensurePrimed(segments[nextIndex + 1]);
           } else {
             // Préchargement non terminé : on se rabat sur un saut classique.
             applyPosition(boundaryMs);
             void active.play().catch(() => undefined);
           }
           setInGap(false);
+          setActiveVideoClipId(nextSegment.sourceClipId);
         } else {
           active.pause();
           setInGap(true);
-          const upcoming = nextClipIndex(sorted, boundaryMs);
-          ensurePrimed(upcoming === -1 ? undefined : sorted[upcoming]);
+          setActiveVideoClipId(null);
+          const upcoming = findNextSegmentIndex(segments, boundaryMs);
+          ensurePrimed(upcoming === -1 ? undefined : segments[upcoming]);
         }
       } else {
         // Conversion inverse : le temps source lu donne le temps timeline.
-        setPlayhead(clip.timelineStartMs + Math.max(0, sourceMs - clip.srcInMs) / clip.playbackRate);
+        publishPlayhead(
+          clip.timelineStartMs + Math.max(0, sourceMs - clip.srcInMs) / clip.playbackRate,
+        );
         if (active.paused) void active.play().catch(() => undefined);
-        setInGap(false);
       }
     } else {
       // Dans un trou : on avance à l'horloge, écran noir.
       const target = playheadRef.current + elapsed;
-      const upcoming = nextClipIndex(sorted, playheadRef.current);
-      const boundary = upcoming === -1 ? total : sorted[upcoming].timelineStartMs;
+      const upcoming = findNextSegmentIndex(segments, playheadRef.current);
+      const boundary = upcoming === -1 ? total : segments[upcoming].startMs;
       if (target >= boundary) {
-        setPlayhead(boundary);
+        publishPlayhead(boundary);
         if (upcoming === -1) {
           pause();
           return;
         }
-        const nextClip = sorted[upcoming];
+        const nextSegment = segments[upcoming];
+        const nextClip = nextSegment.clip;
+        currentVideoIndexRef.current = upcoming;
         if (primedClipIdRef.current === nextClip.id) {
           const incoming = getIdle();
           swap();
           primedClipIdRef.current = null;
           void incoming?.play().catch(() => undefined);
-          ensurePrimed(sorted[upcoming + 1]);
+          ensurePrimed(segments[upcoming + 1]);
         } else {
           applyPosition(boundary);
           void getActive()?.play().catch(() => undefined);
         }
         setInGap(false);
+        setActiveVideoClipId(nextSegment.sourceClipId);
       } else {
-        setPlayhead(target);
-        setInGap(true);
+        publishPlayhead(target);
       }
     }
     // Le son se recale sur le playhead à chaque image, sans dépendre de ce qui
     // est affiché : une surcouche muette laisse donc passer le son du dessous.
     syncAudio(playheadRef.current, true);
     rafRef.current = requestAnimationFrame(loop);
-  }, [applyPosition, ensurePrimed, getActive, getIdle, pause, setPlayhead, swap, syncAudio]);
+  }, [applyPosition, ensurePrimed, getActive, getIdle, pause, publishPlayhead, swap, syncAudio]);
 
   const play = useCallback(() => {
-    const sorted = sortClips(clipsRef.current);
-    if (sorted.length === 0) return;
-    const total = timelineDurationMs(sorted);
+    const segments = compiledRef.current.video.segments;
+    if (segments.length === 0) return;
+    const total = compiledRef.current.video.durationMs;
     if (playheadRef.current >= total - 1) seek(0);
 
+    playingRef.current = true;
     setPlaying(true);
     lastTickRef.current = performance.now();
     stopLoop();
     // Dans un trou, la lecture avance à l'horloge : pas d'appel à play().
-    if (clipAt(sorted, playheadRef.current)) {
+    if (findSegmentIndex(segments, playheadRef.current) !== -1) {
       void getActive()?.play().catch(() => undefined);
     }
     syncAudio(playheadRef.current, true);
@@ -399,9 +468,9 @@ export function usePlayback(
   }, [getActive, loop, seek, stopLoop, syncAudio]);
 
   const toggle = useCallback(() => {
-    if (playing) pause();
+    if (playingRef.current) pause();
     else play();
-  }, [pause, play, playing]);
+  }, [pause, play]);
 
   // Aperçu pendant un trim : un seul seek en vol à la fois, sinon le décodeur
   // s'étrangle et l'image saccade.
@@ -439,34 +508,48 @@ export function usePlayback(
   // si l'image affichée ne correspond plus au playhead, pour ne pas provoquer
   // un seek parasite à la fin de chaque geste.
   useEffect(() => {
-    const total = timelineDurationMs(clips);
+    const total = compiledTimeline.video.durationMs;
     if (playheadRef.current > total) {
       seek(total);
       return;
     }
     if (playing) return;
-    const sorted = sortClips(clips);
-    const position = clipAt(sorted, playheadRef.current);
-    if (!position) {
+    const segments = compiledTimeline.video.segments;
+    const index = findSegmentIndex(segments, playheadRef.current);
+    currentVideoIndexRef.current = index;
+    if (index === -1) {
       setInGap(true);
+      setActiveVideoClipId(null);
       return;
     }
     setInGap(false);
-    const clip = sorted[position.clipIndex];
+    const segment = segments[index];
+    const clip = segment.clip;
+    setActiveVideoClipId(segment.sourceClipId);
     const source = sources[clip.sourceId];
     const active = getActive();
     if (!active || !source) return;
-    const targetMs = clip.srcInMs + position.offsetMs;
+    const targetMs = timelineTimeToSourceTime(clip, playheadRef.current);
     const sameSource = active.dataset.sourceId === source.id;
     if (!sameSource || Math.abs(active.currentTime * 1000 - targetMs) > RESYNC_TOLERANCE_MS) {
       assign(active, source, targetMs);
     }
-    ensurePrimed(sorted[position.clipIndex + 1]);
-    // playheadMs volontairement absent : on ne re-cale que sur changement de montage.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [clips]);
+    ensurePrimed(segments[index + 1]);
+  }, [compiledTimeline, ensurePrimed, getActive, playing, seek, sources]);
 
   useEffect(() => stopLoop, [stopLoop]);
 
-  return { playing, playheadMs, durationMs, inGap, activeIsA, play, pause, toggle, seek, showFrame };
+  return {
+    playing,
+    durationMs,
+    inGap,
+    activeIsA,
+    activeVideoClipId,
+    clock: clockControllerRef.current.clock,
+    play,
+    pause,
+    toggle,
+    seek,
+    showFrame,
+  };
 }
