@@ -1782,6 +1782,87 @@ mod tests {
     }
 
     #[test]
+    fn le_filtre_zoom_reprend_la_courbe_validee_au_rendu() {
+        // Ces valeurs sont exactement celles dont le rendu a ete mesure image
+        // par image sur une grille de pas connu : 1,204 mesure a t=1,100 pour
+        // 1,200 attendu ; 1,463 a t=1,233 pour 1,466 ; ecart nul au palier et
+        // au retour. Le test fige l'expression qui a produit ces mesures : si
+        // la formule change, la divergence avec `zoomScaleAt` cote TypeScript
+        // se voit ici, pas dans un fichier exporte.
+        let filter = zoompan_filter(
+            &[ExportZoom {
+                timeline_start_ms: 1000.0,
+                timeline_end_ms: 3000.0,
+                scale: 2.0,
+                x: 0.75,
+                y: 0.25,
+                ramp_in_ms: 500.0,
+                ramp_out_ms: 500.0,
+            }],
+            30.0,
+        );
+        assert!(filter.contains("between(it,1.000000,3.000000)"));
+        assert!(filter.contains("min(1,(it-1.000000)/0.500000)"));
+        assert!(filter.contains("min(1,(3.000000-it)/0.500000)"));
+        // Hors des bornes, la valeur de repli est 1 : la vue d'avant est
+        // retrouvee a l'identique, pas approchee.
+        assert!(filter.ends_with(":d=1:s=1080x1920:fps=30.000"));
+        assert!(filter.contains("1+1.000000*"));
+        // Le coin de la fenetre est borne : viser un bord ne fait jamais
+        // entrer de noir dans le cadre.
+        assert!(filter.contains("max(0,min(iw-iw/zoom,iw*0.750000-(iw/zoom)/2))"));
+        assert!(filter.contains("max(0,min(ih-ih/zoom,ih*0.250000-(ih/zoom)/2))"));
+    }
+
+    #[test]
+    fn un_zoom_sans_rampe_ne_divise_jamais_par_zero() {
+        // Rampes nulles : les gains valent 1 en dur plutot que de produire une
+        // division par zero qui donnerait NaN a chaque image du rendu.
+        let filter = zoompan_filter(
+            &[ExportZoom {
+                timeline_start_ms: 0.0,
+                timeline_end_ms: 1000.0,
+                scale: 3.0,
+                x: 0.5,
+                y: 0.5,
+                ramp_in_ms: 0.0,
+                ramp_out_ms: 0.0,
+            }],
+            30.0,
+        );
+        assert!(!filter.contains("/0.000000"));
+        assert!(filter.contains("max(0,min(1,1))"));
+    }
+
+    #[test]
+    fn les_rampes_sont_bornees_a_la_moitie_de_la_duree() {
+        // Meme borne que `clampZoomRampMs` cote TypeScript : au-dela, l'aller
+        // et le retour se chevaucheraient et le zoom n'atteindrait jamais sa
+        // valeur. Sur un zoom d'une seconde, une rampe demandee a 5 s tombe a
+        // 0,5 s de chaque cote.
+        let filter = zoompan_filter(
+            &[ExportZoom {
+                timeline_start_ms: 0.0,
+                timeline_end_ms: 1000.0,
+                scale: 2.0,
+                x: 0.5,
+                y: 0.5,
+                ramp_in_ms: 5000.0,
+                ramp_out_ms: 5000.0,
+            }],
+            30.0,
+        );
+        assert!(filter.contains("/0.500000"));
+        assert!(!filter.contains("/5.000000"));
+    }
+
+    #[test]
+    fn sans_zoom_le_filtre_est_neutre() {
+        let filter = zoompan_filter(&[], 30.0);
+        assert!(filter.starts_with("zoompan=z='1':x='0':y='0'"));
+    }
+
+    #[test]
     fn le_filtre_titre_echappe_les_chemins_windows() {
         let filter = drawtext_filter(
             &titre(),
