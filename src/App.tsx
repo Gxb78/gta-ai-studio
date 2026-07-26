@@ -209,7 +209,7 @@ export default function App() {
     const now = new Date().toISOString();
     const baseName = source.originalPath.split(/[\\/]/).pop() ?? "rush";
     const project: Project = {
-      version: 5,
+      version: 6,
       // Distinct de l'empreinte du rush : deux projets créés depuis le même
       // fichier partageraient sinon le même identifiant, donc le même fichier
       // JSON, et s'écraseraient l'un l'autre.
@@ -229,6 +229,8 @@ export default function App() {
           volume: 1,
           audioFadeInMs: 0,
           audioFadeOutMs: 0,
+          videoFadeInMs: 0,
+          videoFadeOutMs: 0,
           playbackRate: 1,
         },
       ],
@@ -564,6 +566,7 @@ export default function App() {
           activeIsA={playback.activeIsA}
           inGap={playback.inGap}
           framing={framing}
+          visibleClip={visibleClip}
           cropX={visibleClip?.cropX ?? 0}
           sourceAspect={visibleSource ? sourceAspect(visibleSource.probe) : 16 / 9}
           viewMode={viewMode}
@@ -634,6 +637,16 @@ export default function App() {
               if (state.selectedClipId) {
                 dispatch({
                   type: "SET_CLIP_AUDIO_FADE",
+                  clipId: state.selectedClipId,
+                  side,
+                  fadeMs,
+                });
+              }
+            }}
+            onSetVideoFade={(side, fadeMs) => {
+              if (state.selectedClipId) {
+                dispatch({
+                  type: "SET_CLIP_VIDEO_FADE",
                   clipId: state.selectedClipId,
                   side,
                   fadeMs,

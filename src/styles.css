@@ -495,6 +495,15 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
 .preview-video.fit-cover { object-fit: cover; }
 .preview-video.fit-contain { object-fit: contain; }
 
+.preview-video-fade {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: #000;
+  opacity: 0;
+  pointer-events: none;
+}
+
 .preview-text {
   position: absolute;
   z-index: 4;
@@ -1030,6 +1039,23 @@ body.moving, body.moving * { cursor: grabbing !important; }
 .clip-audio-fade.fade-out {
   right: 0;
   clip-path: polygon(0 0, 100% 100%, 0 100%);
+}
+.clip-video-fade {
+  position: absolute;
+  top: 0;
+  height: calc(100% - var(--audio-h, 28px));
+  max-width: 50%;
+  background: rgba(0, 0, 0, 0.62);
+  pointer-events: none;
+  z-index: 1;
+}
+.clip-video-fade.fade-in {
+  left: 0;
+  clip-path: polygon(0 0, 100% 0, 0 100%);
+}
+.clip-video-fade.fade-out {
+  right: 0;
+  clip-path: polygon(0 0, 100% 0, 100% 100%);
 }
 .clip-duration {
   position: absolute;

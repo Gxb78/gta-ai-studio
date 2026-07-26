@@ -126,6 +126,30 @@ fn validate_segments(segments: &[ExportSegment], source_count: usize) -> Result<
                 return Err("Fondus audio hors des bornes du clip.".into());
             }
         }
+        let video_fades = [
+            segment.video_fade_in_ms,
+            segment.video_fade_out_ms,
+            segment.video_fade_offset_ms,
+            segment.video_clip_duration_ms,
+        ];
+        if video_fades.iter().any(|value| !value.is_finite() || *value < 0.0) {
+            return Err("Enveloppe vidéo de segment invalide.".into());
+        }
+        if segment.video_fade_in_ms > 0.0 || segment.video_fade_out_ms > 0.0 {
+            let timeline_duration =
+                (segment.src_out_ms - segment.src_in_ms) / segment.playback_rate;
+            if segment.video_clip_duration_ms <= 0.0
+                || segment.video_fade_in_ms > 3000.0 + 0.001
+                || segment.video_fade_out_ms > 3000.0 + 0.001
+                || segment.video_fade_in_ms > segment.video_clip_duration_ms / 2.0 + 0.001
+                || segment.video_fade_out_ms > segment.video_clip_duration_ms / 2.0 + 0.001
+                || segment.video_fade_offset_ms + timeline_duration
+                    > segment.video_clip_duration_ms + 0.001
+                || segment.src_in_ms < segment.video_fade_offset_ms * segment.playback_rate - 0.001
+            {
+                return Err("Fondus vidéo hors des bornes du clip.".into());
+            }
+        }
         if segment.source_index >= source_count {
             return Err("Un segment référence un rush inconnu.".into());
         }
@@ -323,6 +347,26 @@ fn audio_volume_filter(segment: &ExportSegment) -> String {
     format!("volume='{}':eval=frame", factors.join("*"))
 }
 
+/// Enveloppe appliquée au clip source complet, avant d'en extraire le tronçon
+/// visible. Les temps restent ainsi positifs, y compris lorsqu'une piste
+/// supérieure a masqué le début du clip.
+fn video_fade_filter(segment: &ExportSegment) -> String {
+    let clip_duration = segment.video_clip_duration_ms / 1000.0;
+    let mut filters: Vec<String> = Vec::new();
+    if segment.video_fade_in_ms > 0.0 {
+        let duration = segment.video_fade_in_ms / 1000.0;
+        filters.push(format!("fade=t=in:st=0:d={duration:.6}:color=black"));
+    }
+    if segment.video_fade_out_ms > 0.0 {
+        let duration = segment.video_fade_out_ms / 1000.0;
+        let start = clip_duration - duration;
+        filters.push(format!(
+            "fade=t=out:st={start:.6}:d={duration:.6}:color=black"
+        ));
+    }
+    filters.join(",")
+}
+
 #[derive(Serialize, Clone)]
 struct ImportProgress {
     stage: &'static str,
@@ -359,6 +403,14 @@ pub struct ExportSegment {
     pub audio_fade_offset_ms: f64,
     #[serde(default)]
     pub audio_clip_duration_ms: f64,
+    #[serde(default)]
+    pub video_fade_in_ms: f64,
+    #[serde(default)]
+    pub video_fade_out_ms: f64,
+    #[serde(default)]
+    pub video_fade_offset_ms: f64,
+    #[serde(default)]
+    pub video_clip_duration_ms: f64,
     /// Durée de noir silencieux à insérer AVANT ce segment (trou de la timeline).
     #[serde(default)]
     pub gap_before_ms: f64,
@@ -971,9 +1023,26 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         let rate = segment.playback_rate;
         let i = next_label;
         // setpts=PTS/rate : accélérer revient à rapprocher les horodatages.
-        graph += &format!(
-            "[{input}:v]trim=start={start:.3}:end={end:.3},setpts=(PTS-STARTPTS)/{rate:.6}[raw{i}];"
-        );
+        let fade_filter = video_fade_filter(segment);
+        if fade_filter.is_empty() {
+            graph += &format!(
+                "[{input}:v]trim=start={start:.3}:end={end:.3},\
+                 setpts=(PTS-STARTPTS)/{rate:.6}[raw{i}];"
+            );
+        } else {
+            let offset = segment.video_fade_offset_ms / 1000.0;
+            let duration = (segment.src_out_ms - segment.src_in_ms) / rate / 1000.0;
+            let clip_start =
+                (segment.src_in_ms - segment.video_fade_offset_ms * rate) / 1000.0;
+            let clip_end = clip_start + segment.video_clip_duration_ms * rate / 1000.0;
+            let extract_end = offset + duration;
+            graph += &format!(
+                "[{input}:v]trim=start={clip_start:.6}:end={clip_end:.6},\
+                 setpts=(PTS-STARTPTS)/{rate:.6},{fade_filter},\
+                 trim=start={offset:.6}:end={extract_end:.6},\
+                 setpts=PTS-STARTPTS[raw{i}];"
+            );
+        }
         graph += &framing_chain(&request.mode, segment.crop_x, i, &vtail);
         parts.push(i);
         next_label += 1;
@@ -1172,6 +1241,10 @@ mod tests {
             audio_fade_out_ms: 0.0,
             audio_fade_offset_ms: 0.0,
             audio_clip_duration_ms: 1000.0,
+            video_fade_in_ms: 0.0,
+            video_fade_out_ms: 0.0,
+            video_fade_offset_ms: 0.0,
+            video_clip_duration_ms: 1000.0,
             crop_x: 0.0,
             gap_before_ms,
         }
@@ -1245,12 +1318,49 @@ mod tests {
             validate_segments(&[fondu_hors_bornes], 1).is_err(),
             "un fondu supérieur à la moitié du clip est refusé"
         );
+        let fondu_video_hors_bornes = ExportSegment {
+            video_fade_out_ms: 600.0,
+            ..segment(0.0)
+        };
+        assert!(
+            validate_segments(&[fondu_video_hors_bornes], 1).is_err(),
+            "un fondu vidéo supérieur à la moitié du clip est refusé"
+        );
 
         let rush_inconnu = ExportSegment { source_index: 7, ..segment(0.0) };
         assert!(validate_segments(&[rush_inconnu], 1).is_err(), "rush inexistant refusé");
 
         let bornes_folles = ExportSegment { src_out_ms: 0.0, ..segment(0.0) };
         assert!(validate_segments(&[bornes_folles], 1).is_err(), "durée nulle refusée");
+    }
+
+    #[test]
+    fn un_fondu_video_reprend_apres_une_interruption() {
+        let interrupted = ExportSegment {
+            src_in_ms: 700.0,
+            src_out_ms: 1000.0,
+            video_fade_in_ms: 1000.0,
+            video_fade_offset_ms: 700.0,
+            video_clip_duration_ms: 10_000.0,
+            ..segment(0.0)
+        };
+        assert_eq!(
+            video_fade_filter(&interrupted),
+            "fade=t=in:st=0:d=1.000000:color=black"
+        );
+
+        let exit = ExportSegment {
+            src_in_ms: 8500.0,
+            src_out_ms: 10_000.0,
+            video_fade_out_ms: 2000.0,
+            video_fade_offset_ms: 8500.0,
+            video_clip_duration_ms: 10_000.0,
+            ..segment(0.0)
+        };
+        assert_eq!(
+            video_fade_filter(&exit),
+            "fade=t=out:st=8.000000:d=2.000000:color=black"
+        );
     }
 
     #[test]

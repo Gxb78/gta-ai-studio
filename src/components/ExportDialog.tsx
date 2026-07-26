@@ -47,6 +47,10 @@ function toSegments(
       audioFadeOutMs: audio ? sourceClip.audioFadeOutMs : 0,
       audioFadeOffsetMs: audio ? compiled.startMs - sourceClip.timelineStartMs : 0,
       audioClipDurationMs: audio ? clipDurationMs(sourceClip) : clipDurationMs(clip),
+      videoFadeInMs: audio ? 0 : sourceClip.videoFadeInMs,
+      videoFadeOutMs: audio ? 0 : sourceClip.videoFadeOutMs,
+      videoFadeOffsetMs: audio ? 0 : compiled.startMs - sourceClip.timelineStartMs,
+      videoClipDurationMs: audio ? clipDurationMs(clip) : clipDurationMs(sourceClip),
       gapBeforeMs: Math.max(0, clip.timelineStartMs - cursor),
       cropX: clip.cropX,
     });

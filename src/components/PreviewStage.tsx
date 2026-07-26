@@ -14,8 +14,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
-import type { FramingMode, TextOverlay } from "../types";
-import { cropXPercent } from "../types";
+import type { Clip, FramingMode, TextOverlay } from "../types";
+import { cropXPercent, videoFadeGainAt } from "../types";
 import type { PlaybackClock } from "../playback/usePlayback";
 import { PlaybackTimecode } from "./PlaybackTimecode";
 
@@ -45,6 +45,8 @@ interface Props {
   /** Playhead dans un trou de la timeline : écran noir, comme à l'export. */
   inGap: boolean;
   framing: FramingMode;
+  /** Clip committé dont l'image est visible, porteur de l'enveloppe complète. */
+  visibleClip: Clip | null;
   /** Décalage du cadrage du clip visible au playhead. */
   cropX: number;
   /** Format du rush visible, pour le mode « rush entier ». */
@@ -76,7 +78,7 @@ interface Props {
 export function PreviewStage(props: Props) {
   if (import.meta.env.DEV) console.count("[render] PreviewStage");
   const {
-    videoA, videoB, audioA, audioB, activeIsA, inGap, framing, cropX, sourceAspect,
+    videoA, videoB, audioA, audioB, activeIsA, inGap, framing, visibleClip, cropX, sourceAspect,
     viewMode, onViewModeChange, showSafeZones, onToggleSafeZones, playing, clock,
     durationMs, volume, onVolumeChange, onTogglePlay, onStepFrame, onCommitCropX,
     textOverlays, selectedTextOverlayId, onSelectTextOverlay, onCommitTextPosition,
@@ -84,6 +86,7 @@ export function PreviewStage(props: Props) {
 
   const frameRef = useRef<HTMLDivElement | null>(null);
   const blurRef = useRef<HTMLCanvasElement | null>(null);
+  const fadeRef = useRef<HTMLDivElement | null>(null);
   const textNodesRef = useRef(new Map<string, HTMLDivElement>());
   const outputView = viewMode === "output";
   const blurred = framing === "blur" && outputView;
@@ -205,6 +208,17 @@ export function PreviewStage(props: Props) {
     return clock.subscribe(updateVisibility);
   }, [clock, outputView, textOverlays]);
 
+  useEffect(() => {
+    const updateFade = (playheadMs: number) => {
+      const node = fadeRef.current;
+      if (!node) return;
+      const gain = visibleClip ? videoFadeGainAt(visibleClip, playheadMs) : 1;
+      node.style.opacity = String(1 - gain);
+    };
+    updateFade(clock.getPlayheadMs());
+    return clock.subscribe(updateFade);
+  }, [clock, visibleClip]);
+
   const beginTextDrag = (event: React.PointerEvent, overlay: TextOverlay) => {
     event.stopPropagation();
     if (event.button !== 0 || !outputView) return;
@@ -308,6 +322,7 @@ export function PreviewStage(props: Props) {
           />
           <audio ref={audioA} preload="auto" />
           <audio ref={audioB} preload="auto" />
+          <div ref={fadeRef} className="preview-video-fade" aria-hidden="true" />
 
           {inGap && (
             <div className="preview-gap">

@@ -11,6 +11,7 @@ import type { Clip, FramingMode, SourceInfo } from "../types";
 import {
   MAX_RATE,
   MAX_AUDIO_FADE_MS,
+  MAX_VIDEO_FADE_MS,
   MAX_VOLUME,
   MIN_RATE,
   MIN_VOLUME,
@@ -30,6 +31,7 @@ interface Props {
   onSetRate: (rate: number) => void;
   onSetVolume: (volume: number) => void;
   onSetAudioFade: (side: "in" | "out" | "both", fadeMs: number) => void;
+  onSetVideoFade: (side: "in" | "out" | "both", fadeMs: number) => void;
   onToggleAudio: () => void;
   onDelete: () => void;
   onCollapse: () => void;
@@ -40,6 +42,9 @@ export function Inspector(props: Props) {
   const maxFadeMs = clip
     ? Math.min(MAX_AUDIO_FADE_MS, clipDurationMs(clip) / 2)
     : MAX_AUDIO_FADE_MS;
+  const maxVideoFadeMs = clip
+    ? Math.min(MAX_VIDEO_FADE_MS, clipDurationMs(clip) / 2)
+    : MAX_VIDEO_FADE_MS;
   const fadeLabel = (fadeMs: number): string =>
     fadeMs === 0 ? "Aucun" : `${(fadeMs / 1000).toFixed(fadeMs % 1000 === 0 ? 0 : 2)} s`;
 
@@ -155,6 +160,47 @@ export function Inspector(props: Props) {
             </div>
             {(clip.playbackRate < MIN_RATE || clip.playbackRate > MAX_RATE) && (
               <p className="warn">Vitesse hors bornes, ramenée à l'application.</p>
+            )}
+          </section>
+
+          <section className="inspector-section">
+            <h3>Fondu vidéo</h3>
+            <div className="fade-control">
+              <label className="slider-row">
+                <span className="fade-label">Entrée</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={maxVideoFadeMs}
+                  step={50}
+                  value={clip.videoFadeInMs}
+                  onChange={(event) => props.onSetVideoFade("in", Number(event.target.value))}
+                  aria-label="Fondu vidéo d'entrée"
+                />
+                <span className="slider-value">{fadeLabel(clip.videoFadeInMs)}</span>
+              </label>
+              <label className="slider-row">
+                <span className="fade-label">Sortie</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={maxVideoFadeMs}
+                  step={50}
+                  value={clip.videoFadeOutMs}
+                  onChange={(event) => props.onSetVideoFade("out", Number(event.target.value))}
+                  aria-label="Fondu vidéo de sortie"
+                />
+                <span className="slider-value">{fadeLabel(clip.videoFadeOutMs)}</span>
+              </label>
+            </div>
+            {(clip.videoFadeInMs > 0 || clip.videoFadeOutMs > 0) && (
+              <button
+                type="button"
+                className="ghost small"
+                onClick={() => props.onSetVideoFade("both", 0)}
+              >
+                Retirer les fondus
+              </button>
             )}
           </section>
 

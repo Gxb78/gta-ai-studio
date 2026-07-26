@@ -18,6 +18,7 @@ import {
   MIN_CLIP_MS,
   applyRate,
   clampAudioFadeMs,
+  clampVideoFadeMs,
   clampCropX,
   clampVolume,
   applyTrim,
@@ -91,6 +92,8 @@ const clampClipFades = (clip: Clip): Clip => {
     ...clip,
     audioFadeInMs: clampAudioFadeMs(clip.audioFadeInMs, durationMs),
     audioFadeOutMs: clampAudioFadeMs(clip.audioFadeOutMs, durationMs),
+    videoFadeInMs: clampVideoFadeMs(clip.videoFadeInMs, durationMs),
+    videoFadeOutMs: clampVideoFadeMs(clip.videoFadeOutMs, durationMs),
   };
 };
 
@@ -116,6 +119,12 @@ export type EditorAction =
   | { type: "SET_CLIP_VOLUME"; clipId: string; volume: number }
   | {
       type: "SET_CLIP_AUDIO_FADE";
+      clipId: string;
+      side: "in" | "out" | "both";
+      fadeMs: number;
+    }
+  | {
+      type: "SET_CLIP_VIDEO_FADE";
       clipId: string;
       side: "in" | "out" | "both";
       fadeMs: number;
@@ -290,6 +299,8 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         volume: 1,
         audioFadeInMs: 0,
         audioFadeOutMs: 0,
+        videoFadeInMs: 0,
+        videoFadeOutMs: 0,
         playbackRate: 1,
       };
       // Piste imposée (dépôt à la souris) : les clips déjà présents s'écartent,
@@ -376,6 +387,31 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         );
       }
       const key = action.side === "in" ? "audioFadeInMs" : "audioFadeOutMs";
+      if (target[key] === fadeMs) return state;
+      return pushHistory(
+        state,
+        state.clips.map((clip) =>
+          clip.id === action.clipId ? { ...clip, [key]: fadeMs } : clip,
+        ),
+      );
+    }
+
+    case "SET_CLIP_VIDEO_FADE": {
+      const target = state.clips.find((clip) => clip.id === action.clipId);
+      if (!target) return state;
+      const fadeMs = clampVideoFadeMs(action.fadeMs, clipDurationMs(target));
+      if (action.side === "both") {
+        if (target.videoFadeInMs === fadeMs && target.videoFadeOutMs === fadeMs) return state;
+        return pushHistory(
+          state,
+          state.clips.map((clip) =>
+            clip.id === action.clipId
+              ? { ...clip, videoFadeInMs: fadeMs, videoFadeOutMs: fadeMs }
+              : clip,
+          ),
+        );
+      }
+      const key = action.side === "in" ? "videoFadeInMs" : "videoFadeOutMs";
       if (target[key] === fadeMs) return state;
       return pushHistory(
         state,
@@ -519,6 +555,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         srcOutMs: cutSrc,
         // Une coupe franche ne crée pas un fondu au nouveau bord.
         audioFadeOutMs: 0,
+        videoFadeOutMs: 0,
       });
       const right: Clip = {
         id: newClipId(),
@@ -533,6 +570,11 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         audioFadeInMs: 0,
         audioFadeOutMs: clampAudioFadeMs(
           clip.audioFadeOutMs,
+          (clip.srcOutMs - cutSrc) / clip.playbackRate,
+        ),
+        videoFadeInMs: 0,
+        videoFadeOutMs: clampVideoFadeMs(
+          clip.videoFadeOutMs,
           (clip.srcOutMs - cutSrc) / clip.playbackRate,
         ),
         playbackRate: clip.playbackRate,

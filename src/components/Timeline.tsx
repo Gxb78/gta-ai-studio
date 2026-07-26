@@ -1357,6 +1357,20 @@ const ClipView = memo(function ClipView(props: {
           aria-hidden="true"
         />
       )}
+      {clip.videoFadeInMs > 0 && (
+        <span
+          className="clip-video-fade fade-in"
+          style={{ width: Math.max(2, clip.videoFadeInMs * pxPerMs) }}
+          aria-hidden="true"
+        />
+      )}
+      {clip.videoFadeOutMs > 0 && (
+        <span
+          className="clip-video-fade fade-out"
+          style={{ width: Math.max(2, clip.videoFadeOutMs * pxPerMs) }}
+          aria-hidden="true"
+        />
+      )}
       <span className="clip-duration">{formatTime(clipDurationMs(clip))}</span>
       {clip.playbackRate !== 1 && (
         <span className="clip-rate" title={`Vitesse ${clip.playbackRate}×`}>

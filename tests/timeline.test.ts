@@ -7,6 +7,7 @@ import {
   clampCropX,
   clampRate,
   clampVolume,
+  clampVideoFadeMs,
   clipDurationMs,
   compactTrackIndices,
   cropXPercent,
@@ -19,6 +20,7 @@ import {
   resolveVideoPlan,
   timelineGaps,
   timelineTimeToSourceTime,
+  videoFadeGainAt,
   type Clip,
   type SourceInfo,
 } from "../src/types";
@@ -52,6 +54,8 @@ const clip = (
   volume: 1,
   audioFadeInMs: 0,
   audioFadeOutMs: 0,
+  videoFadeInMs: 0,
+  videoFadeOutMs: 0,
   playbackRate: 1,
   cropX: 0,
 });
@@ -241,7 +245,7 @@ const source = (id: string): SourceInfo => ({
 const stateWith = (clips: Clip[], selectedClipId: string | null): EditorState => ({
   ...initialEditorState,
   project: {
-    version: 5,
+    version: 6,
     id: "p",
     name: "p",
     sources: { S0: source("S0"), S1: source("S1") },
@@ -661,11 +665,16 @@ const migre = migrateProject({
   createdAt: "",
   updatedAt: "",
 });
-check("le projet est ramené au format 5", migre.version, 5);
+check("le projet est ramené au format 6", migre.version, 6);
 check("le cadrage par défaut est le recadrage", migre.framing, "crop");
 check("les clips sont recentrés", migre.clips[0].cropX, 0);
 check("les clips sans volume restent au niveau original", migre.clips[0].volume, 1);
 check("les anciens clips n'ont aucun fondu", [migre.clips[0].audioFadeInMs, migre.clips[0].audioFadeOutMs], [0, 0]);
+check(
+  "les anciens clips n'ont aucun fondu vidéo inventé",
+  [migre.clips[0].videoFadeInMs, migre.clips[0].videoFadeOutMs],
+  [0, 0],
+);
 check("les anciens projets n'ont aucun titre inventé", migre.textOverlays.length, 0);
 
 console.log("Volume par clip");
@@ -754,6 +763,55 @@ const fadeCoupeTrie = sortClipsById(fadeCoupe.clips);
 check(
   "une coupe ne crée pas de fondu sur ses nouveaux bords",
   fadeCoupeTrie.map((segment) => [segment.audioFadeInMs, segment.audioFadeOutMs]),
+  [[1_000, 0], [0, 2_000]],
+);
+
+console.log("Fondus vidéo par clip");
+const avecFondusVideo = {
+  ...clip("fade-video", 0, 0, 0, 10_000),
+  videoFadeInMs: 1_000,
+  videoFadeOutMs: 2_000,
+};
+check("image noire au début", videoFadeGainAt(avecFondusVideo, 0), 0);
+check("demi-opacité à l'entrée", videoFadeGainAt(avecFondusVideo, 500), 0.5);
+check("image opaque au plateau", videoFadeGainAt(avecFondusVideo, 5_000), 1);
+check("demi-opacité à la sortie", videoFadeGainAt(avecFondusVideo, 9_000), 0.5);
+check("image noire à la fin", videoFadeGainAt(avecFondusVideo, 10_000), 0);
+check("fondu vidéo limité à trois secondes", clampVideoFadeMs(9_000, 10_000), 3_000);
+const fadeVideoModifie = editorReducer(
+  stateWith([clip("video", 0, 0, 0, 4_000)], "video"),
+  {
+    type: "SET_CLIP_VIDEO_FADE",
+    clipId: "video",
+    side: "in",
+    fadeMs: 3_000,
+  },
+);
+check("le réducteur borne le fondu vidéo", fadeVideoModifie.clips[0].videoFadeInMs, 2_000);
+const fondusVideoContigus = [
+  { ...clip("va", 0, 0, 0, 5_000), videoFadeOutMs: 1_000 },
+  { ...clip("vb", 0, 5_000, 5_000, 5_000, "S0"), videoFadeInMs: 1_000 },
+];
+check(
+  "deux enveloppes vidéo contiguës restent distinctes",
+  resolveVideoPlan(fondusVideoContigus).length,
+  2,
+);
+check(
+  "les fondus vidéo ne découpent pas le plan audio",
+  resolveAudioPlan(fondusVideoContigus).length,
+  1,
+);
+const fadeVideoCoupe = editorReducer(stateWith([avecFondusVideo], "fade-video"), {
+  type: "SPLIT_AT",
+  timelineMs: 5_000,
+});
+check(
+  "une coupe ne crée pas de fondu vidéo sur ses nouveaux bords",
+  sortClipsById(fadeVideoCoupe.clips).map((segment) => [
+    segment.videoFadeInMs,
+    segment.videoFadeOutMs,
+  ]),
   [[1_000, 0], [0, 2_000]],
 );
 
@@ -866,6 +924,24 @@ check(
   "la reprise du clip inférieur ne redémarre pas son fondu",
   audioFadeGainAt(compiledFadeInterrupted.audio.segments[2].sourceClip, 6_000),
   1,
+);
+
+const compiledVideoFadeInterrupted = compileTimeline(
+  [
+    avecFondusVideo,
+    { ...clip("cover", 1, 300, 0, 400, "S1"), audioEnabled: false },
+  ],
+  new Set(),
+);
+check(
+  "le clip vidéo source survit à une interruption pendant son fondu",
+  compiledVideoFadeInterrupted.video.segments.map((segment) => segment.sourceClip.id),
+  ["fade-video", "cover", "fade-video"],
+);
+check(
+  "la reprise vidéo conserve l'avancement du fondu",
+  videoFadeGainAt(compiledVideoFadeInterrupted.video.segments[2].sourceClip, 700),
+  0.7,
 );
 
 const compiledHidden = compileTimeline(compileClips, new Set([1]));
