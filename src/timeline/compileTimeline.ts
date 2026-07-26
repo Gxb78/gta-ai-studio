@@ -13,6 +13,8 @@ export interface CompiledSegment {
   endMs: number;
   /** Identifiant du clip committé dont ce segment aplati provient. */
   sourceClipId: string;
+  /** Clip committé portant l'enveloppe et les réglages non découpés. */
+  sourceClip: Clip;
 }
 
 export interface CompiledPlan {
@@ -29,7 +31,7 @@ export interface CompiledTimeline {
   sourceCount: number;
 }
 
-function sourceClipIdFor(segment: Clip, clips: readonly Clip[]): string {
+function sourceClipFor(segment: Clip, clips: readonly Clip[]): Clip {
   const match = clips.find(
     (clip) =>
       clip.track === segment.track &&
@@ -39,17 +41,21 @@ function sourceClipIdFor(segment: Clip, clips: readonly Clip[]): string {
       clip.timelineStartMs <= segment.timelineStartMs &&
       clipEndMs(clip) >= clipEndMs(segment),
   );
-  return match?.id ?? segment.id;
+  return match ?? segment;
 }
 
 function compilePlan(plan: Clip[], clips: readonly Clip[], durationMs: number): CompiledPlan {
   return {
-    segments: plan.map((clip) => ({
-      clip,
-      startMs: clip.timelineStartMs,
-      endMs: clipEndMs(clip),
-      sourceClipId: sourceClipIdFor(clip, clips),
-    })),
+    segments: plan.map((clip) => {
+      const sourceClip = sourceClipFor(clip, clips);
+      return {
+        clip,
+        startMs: clip.timelineStartMs,
+        endMs: clipEndMs(clip),
+        sourceClipId: sourceClip.id,
+        sourceClip,
+      };
+    }),
     durationMs,
   };
 }

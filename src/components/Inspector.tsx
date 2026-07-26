@@ -10,6 +10,7 @@ import { sourceName } from "./MediaPanel";
 import type { Clip, FramingMode, SourceInfo } from "../types";
 import {
   MAX_RATE,
+  MAX_AUDIO_FADE_MS,
   MAX_VOLUME,
   MIN_RATE,
   MIN_VOLUME,
@@ -28,6 +29,7 @@ interface Props {
   onSetCropX: (cropX: number) => void;
   onSetRate: (rate: number) => void;
   onSetVolume: (volume: number) => void;
+  onSetAudioFade: (side: "in" | "out" | "both", fadeMs: number) => void;
   onToggleAudio: () => void;
   onDelete: () => void;
   onCollapse: () => void;
@@ -35,6 +37,11 @@ interface Props {
 
 export function Inspector(props: Props) {
   const { clip, source, framing } = props;
+  const maxFadeMs = clip
+    ? Math.min(MAX_AUDIO_FADE_MS, clipDurationMs(clip) / 2)
+    : MAX_AUDIO_FADE_MS;
+  const fadeLabel = (fadeMs: number): string =>
+    fadeMs === 0 ? "Aucun" : `${(fadeMs / 1000).toFixed(fadeMs % 1000 === 0 ? 0 : 2)} s`;
 
   return (
     <aside className="panel panel-inspector">
@@ -179,6 +186,45 @@ export function Inspector(props: Props) {
             {clip.volume !== 1 && clip.audioEnabled && (
               <button type="button" className="ghost small" onClick={() => props.onSetVolume(1)}>
                 Rétablir 100 %
+              </button>
+            )}
+            <div className="fade-control">
+              <label className="slider-row">
+                <span className="fade-label">Entrée</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={maxFadeMs}
+                  step={50}
+                  value={clip.audioFadeInMs}
+                  disabled={!clip.audioEnabled}
+                  onChange={(event) => props.onSetAudioFade("in", Number(event.target.value))}
+                  aria-label="Fondu audio d'entrée"
+                />
+                <span className="slider-value">{fadeLabel(clip.audioFadeInMs)}</span>
+              </label>
+              <label className="slider-row">
+                <span className="fade-label">Sortie</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={maxFadeMs}
+                  step={50}
+                  value={clip.audioFadeOutMs}
+                  disabled={!clip.audioEnabled}
+                  onChange={(event) => props.onSetAudioFade("out", Number(event.target.value))}
+                  aria-label="Fondu audio de sortie"
+                />
+                <span className="slider-value">{fadeLabel(clip.audioFadeOutMs)}</span>
+              </label>
+            </div>
+            {(clip.audioFadeInMs > 0 || clip.audioFadeOutMs > 0) && clip.audioEnabled && (
+              <button
+                type="button"
+                className="ghost small"
+                onClick={() => props.onSetAudioFade("both", 0)}
+              >
+                Retirer les fondus
               </button>
             )}
             <p className="muted small-text">

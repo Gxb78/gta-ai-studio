@@ -20,7 +20,7 @@ Reste à faire sur cette couche (petites finitions attendues après le premier `
 
 - Drag & drop d'un fichier sur la fenêtre.
 - Plusieurs rushs par projet ; bibliothèque des projets récents.
-- Vitesse par clip (x0.5–x3), volume/mute par clip.
+- Vitesse par clip (x0.25–x4), volume/mute et fondus audio par clip.
 - Recadrage 9:16 ajustable (décalage horizontal du crop par clip, aperçu dans le guide).
 - Miniatures de meilleure qualité, densité adaptative au zoom.
 

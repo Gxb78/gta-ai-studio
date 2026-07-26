@@ -13,7 +13,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { SourceInfo } from "../types";
-import { timelineTimeToSourceTime } from "../types";
+import { audioFadeGainAt, timelineTimeToSourceTime } from "../types";
 import { mediaUrl } from "../ipc";
 import type { CompiledSegment, CompiledTimeline } from "../timeline/compileTimeline";
 import { findNextSegmentIndex, findSegmentIndex } from "../timeline/compileTimeline";
@@ -171,10 +171,13 @@ export function usePlayback(
     const audioSegments = compiledTimeline.audio.segments;
     for (const element of [audioA.current, audioB.current]) {
       if (!element) continue;
-      const clip = audioSegments.find(
+      const segment = audioSegments.find(
         (segment) => segment.clip.id === element.dataset.clipId,
-      )?.clip;
-      element.volume = Math.min(1, previewVolume * (clip?.volume ?? 1));
+      );
+      const envelope = segment
+        ? audioFadeGainAt(segment.sourceClip, clockControllerRef.current!.clock.getPlayheadMs())
+        : 1;
+      element.volume = Math.min(1, previewVolume * (segment?.clip.volume ?? 1) * envelope);
     }
   }, [audioA, audioB, compiledTimeline, previewVolume]);
 
@@ -268,7 +271,8 @@ export function usePlayback(
         return;
       }
 
-      const clip = segments[index].clip;
+      const segment = segments[index];
+      const clip = segment.clip;
       const source = sourcesRef.current[clip.sourceId];
       if (!source) return;
 
@@ -288,7 +292,10 @@ export function usePlayback(
       const targetMs = timelineTimeToSourceTime(clip, timelineMs);
       // La vitesse du son suit celle du clip ; le rattrapage de dérive vient en plus.
       const baseRate = clip.playbackRate;
-      active.volume = Math.min(1, previewVolumeRef.current * clip.volume);
+      active.volume = Math.min(
+        1,
+        previewVolumeRef.current * clip.volume * audioFadeGainAt(segment.sourceClip, timelineMs),
+      );
       if (active.dataset.clipId !== clip.id || force) {
         // Changement de segment, ou recalage forcé après un seek ou une pause :
         // on repositionne sans état d'âme, il n'y a rien à préserver.
@@ -314,15 +321,20 @@ export function usePlayback(
       idle?.pause();
 
       // Préchargement du segment sonore suivant.
-      const upcoming = segments[index + 1]?.clip;
-      if (idle && upcoming && primedAudioIdRef.current !== upcoming.id) {
-        const nextSource = sourcesRef.current[upcoming.sourceId];
+      const upcoming = segments[index + 1];
+      if (idle && upcoming && primedAudioIdRef.current !== upcoming.clip.id) {
+        const nextSource = sourcesRef.current[upcoming.clip.sourceId];
         if (nextSource) {
-          primedAudioIdRef.current = upcoming.id;
-          idle.dataset.clipId = upcoming.id;
-          idle.playbackRate = upcoming.playbackRate;
-          idle.volume = Math.min(1, previewVolumeRef.current * upcoming.volume);
-          assign(idle, nextSource, upcoming.srcInMs);
+          primedAudioIdRef.current = upcoming.clip.id;
+          idle.dataset.clipId = upcoming.clip.id;
+          idle.playbackRate = upcoming.clip.playbackRate;
+          idle.volume = Math.min(
+            1,
+            previewVolumeRef.current *
+              upcoming.clip.volume *
+              audioFadeGainAt(upcoming.sourceClip, upcoming.startMs),
+          );
+          assign(idle, nextSource, upcoming.clip.srcInMs);
         }
       }
     },

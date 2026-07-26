@@ -2,6 +2,8 @@
 // aplatissement déterministe, et parité entre ce que consomment le lecteur et
 // l'export.
 import {
+  audioFadeGainAt,
+  clampAudioFadeMs,
   clampCropX,
   clampRate,
   clampVolume,
@@ -47,6 +49,8 @@ const clip = (
   srcOutMs: srcIn + dur,
   audioEnabled: track === 0,
   volume: 1,
+  audioFadeInMs: 0,
+  audioFadeOutMs: 0,
   playbackRate: 1,
   cropX: 0,
 });
@@ -597,6 +601,7 @@ check("le projet est ramené au format 4", migre.version, 4);
 check("le cadrage par défaut est le recadrage", migre.framing, "crop");
 check("les clips sont recentrés", migre.clips[0].cropX, 0);
 check("les clips sans volume restent au niveau original", migre.clips[0].volume, 1);
+check("les anciens clips n'ont aucun fondu", [migre.clips[0].audioFadeInMs, migre.clips[0].audioFadeOutMs], [0, 0]);
 
 console.log("Volume par clip");
 check("volume négatif écrêté", clampVolume(-0.5), 0);
@@ -626,6 +631,65 @@ check(
   "le volume ne découpe pas le plan vidéo",
   resolveVideoPlan(volumesDifferents).length,
   1,
+);
+
+console.log("Fondus audio par clip");
+const avecFondus = {
+  ...clip("fade", 0, 0, 0, 10_000),
+  audioFadeInMs: 1_000,
+  audioFadeOutMs: 2_000,
+};
+check("début silencieux", audioFadeGainAt(avecFondus, 0), 0);
+check("milieu du fondu d'entrée", audioFadeGainAt(avecFondus, 500), 0.5);
+check("plateau au niveau nominal", audioFadeGainAt(avecFondus, 5_000), 1);
+check("milieu du fondu de sortie", audioFadeGainAt(avecFondus, 9_000), 0.5);
+check("fin silencieuse", audioFadeGainAt(avecFondus, 10_000), 0);
+check("fondu borné à la moitié du clip", clampAudioFadeMs(9_000, 10_000), 5_000);
+const fadeModifie = editorReducer(stateWith([clip("a", 0, 0, 0, 4_000)], "a"), {
+  type: "SET_CLIP_AUDIO_FADE",
+  clipId: "a",
+  side: "in",
+  fadeMs: 3_000,
+});
+check("le réducteur borne le fondu", fadeModifie.clips[0].audioFadeInMs, 2_000);
+check("le fondu est annulable", fadeModifie.past.length, 1);
+const fondusRetires = editorReducer(stateWith([avecFondus], "fade"), {
+  type: "SET_CLIP_AUDIO_FADE",
+  clipId: "fade",
+  side: "both",
+  fadeMs: 0,
+});
+check(
+  "retirer les deux fondus est une seule action",
+  {
+    fades: [fondusRetires.clips[0].audioFadeInMs, fondusRetires.clips[0].audioFadeOutMs],
+    history: fondusRetires.past.length,
+  },
+  { fades: [0, 0], history: 1 },
+);
+const clipsFondusContigus = [
+  { ...clip("a", 0, 0, 0, 5_000), audioFadeOutMs: 1_000 },
+  { ...clip("b", 0, 5_000, 5_000, 5_000, "S0"), audioFadeInMs: 1_000 },
+];
+check(
+  "les enveloppes de deux clips contigus restent distinctes",
+  resolveAudioPlan(clipsFondusContigus).length,
+  2,
+);
+check(
+  "les fondus ne découpent toujours pas le plan vidéo",
+  resolveVideoPlan(clipsFondusContigus).length,
+  1,
+);
+const fadeCoupe = editorReducer(stateWith([avecFondus], "fade"), {
+  type: "SPLIT_AT",
+  timelineMs: 5_000,
+});
+const fadeCoupeTrie = sortClipsById(fadeCoupe.clips);
+check(
+  "une coupe ne crée pas de fondu sur ses nouveaux bords",
+  fadeCoupeTrie.map((segment) => [segment.audioFadeInMs, segment.audioFadeOutMs]),
+  [[1_000, 0], [0, 2_000]],
 );
 
 // --- Pistes : désactivation et son -------------------------------------------
@@ -720,6 +784,24 @@ check("trous compiles", compiled.gaps, timelineGaps(resolveVideoPlan(compileClip
 check("pistes indexees", [...compiled.clipsByTrack.keys()], [0, 1]);
 check("nombre de pistes", compiled.trackCount, 2);
 check("nombre de sources", compiled.sourceCount, 3);
+
+const compiledFadeInterrupted = compileTimeline(
+  [
+    avecFondus,
+    { ...clip("voice", 1, 3_000, 0, 3_000, "S1"), audioEnabled: true },
+  ],
+  new Set(),
+);
+check(
+  "le clip source survit à une interruption par une surcouche sonore",
+  compiledFadeInterrupted.audio.segments.map((segment) => segment.sourceClip.id),
+  ["fade", "voice", "fade"],
+);
+check(
+  "la reprise du clip inférieur ne redémarre pas son fondu",
+  audioFadeGainAt(compiledFadeInterrupted.audio.segments[2].sourceClip, 6_000),
+  1,
+);
 
 const compiledHidden = compileTimeline(compileClips, new Set([1]));
 check(

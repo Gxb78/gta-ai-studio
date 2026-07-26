@@ -85,6 +85,9 @@ export interface Clip {
   audioEnabled: boolean;
   /** Gain sonore du clip. 1 = niveau original, 0 = silence. */
   volume: number;
+  /** Durées des fondus audio, exprimées dans le temps de la timeline. */
+  audioFadeInMs: number;
+  audioFadeOutMs: number;
   /**
    * Vitesse de lecture constante. 1 = temps réel, 2 = deux fois plus rapide.
    *
@@ -99,12 +102,27 @@ export const MIN_RATE = 0.25;
 export const MAX_RATE = 4;
 export const MIN_VOLUME = 0;
 export const MAX_VOLUME = 1;
+export const MAX_AUDIO_FADE_MS = 10_000;
 
 export const clampRate = (rate: number): number =>
   Number.isFinite(rate) && rate > 0 ? Math.min(MAX_RATE, Math.max(MIN_RATE, rate)) : 1;
 
 export const clampVolume = (volume: number): number =>
   Number.isFinite(volume) ? Math.min(MAX_VOLUME, Math.max(MIN_VOLUME, volume)) : 1;
+
+export const clampAudioFadeMs = (fadeMs: number, durationMs: number): number => {
+  if (!Number.isFinite(fadeMs) || fadeMs <= 0) return 0;
+  return Math.min(fadeMs, MAX_AUDIO_FADE_MS, Math.max(0, durationMs / 2));
+};
+
+/** Gain d'enveloppe à un instant absolu de la timeline. */
+export function audioFadeGainAt(clip: Clip, timelineMs: number): number {
+  const elapsedMs = Math.max(0, timelineMs - clip.timelineStartMs);
+  const remainingMs = Math.max(0, clipEndMs(clip) - timelineMs);
+  const fadeInGain = clip.audioFadeInMs > 0 ? elapsedMs / clip.audioFadeInMs : 1;
+  const fadeOutGain = clip.audioFadeOutMs > 0 ? remainingMs / clip.audioFadeOutMs : 1;
+  return Math.max(0, Math.min(1, fadeInGain, fadeOutGain));
+}
 
 /**
  * Passage du rush au format vertical. C'est un réglage du PROJET, pas de la
@@ -199,12 +217,21 @@ export function flattenTracks(
       srcOutMs: timelineTimeToSourceTime(top, to),
       audioEnabled: top.audioEnabled,
       volume: top.volume,
+      audioFadeInMs: top.audioFadeInMs,
+      audioFadeOutMs: top.audioFadeOutMs,
       playbackRate: top.playbackRate,
     };
 
     // Deux tronçons consécutifs du même rush qui se suivent aussi dans le temps
     // source ne forment qu'un seul segment : inutile de couper pour rien.
     const previous = flat[flat.length - 1];
+    const audioEnvelopeCanMerge =
+      previous &&
+      previous.volume === segment.volume &&
+      previous.audioFadeInMs === segment.audioFadeInMs &&
+      previous.audioFadeOutMs === segment.audioFadeOutMs &&
+      ((previous.audioFadeInMs === 0 && previous.audioFadeOutMs === 0) ||
+        previous.id.split("@", 1)[0] === segment.id.split("@", 1)[0]);
     if (
       previous &&
       previous.sourceId === segment.sourceId &&
@@ -212,7 +239,7 @@ export function flattenTracks(
       // Le cadrage ne concerne que l'image ; le gain ne concerne que le son.
       // Les mélanger ici ajouterait des coupes FFmpeg inutiles dans l'autre plan.
       (planKind === "audio"
-        ? previous.volume === segment.volume
+        ? audioEnvelopeCanMerge
         : previous.cropX === segment.cropX) &&
       Math.abs(clipEndMs(previous) - segment.timelineStartMs) < 0.001 &&
       Math.abs(previous.srcOutMs - segment.srcInMs) < 0.001
@@ -284,6 +311,11 @@ export interface ExportSegment {
   cropX: number;
   /** Gain sonore de ce segment. Utilisé uniquement dans le plan audio. */
   volume: number;
+  /** Enveloppe du clip source, en temps de timeline. */
+  audioFadeInMs: number;
+  audioFadeOutMs: number;
+  audioFadeOffsetMs: number;
+  audioClipDurationMs: number;
 }
 
 export interface ExportRequest {
@@ -581,6 +613,8 @@ export type StoredClip = Omit<
   | "track"
   | "audioEnabled"
   | "volume"
+  | "audioFadeInMs"
+  | "audioFadeOutMs"
   | "cropX"
   | "playbackRate"
 > & {
@@ -589,6 +623,8 @@ export type StoredClip = Omit<
   track?: number | null;
   audioEnabled?: boolean | null;
   volume?: number | null;
+  audioFadeInMs?: number | null;
+  audioFadeOutMs?: number | null;
   playbackRate?: number | null;
   cropX?: number | null;
 };
@@ -622,11 +658,13 @@ export function migrateProject(stored: StoredProject): Project {
   let cursor = 0;
   const clips: Clip[] = [];
   for (const clip of stored.clips) {
+    const playbackRate = clampRate(clip.playbackRate ?? 1);
+    const durationMs = (clip.srcOutMs - clip.srcInMs) / playbackRate;
     const timelineStartMs =
       typeof clip.timelineStartMs === "number" && Number.isFinite(clip.timelineStartMs)
         ? clip.timelineStartMs
         : cursor;
-    cursor = timelineStartMs + (clip.srcOutMs - clip.srcInMs);
+    cursor = timelineStartMs + durationMs;
     const sourceId = clip.sourceId ?? fallbackId;
     if (!sources[sourceId]) continue;
     const track = typeof clip.track === "number" && clip.track >= 0 ? Math.floor(clip.track) : 0;
@@ -642,8 +680,11 @@ export function migrateProject(stored: StoredProject): Project {
       audioEnabled: typeof clip.audioEnabled === "boolean" ? clip.audioEnabled : track === 0,
       // Projets antérieurs au volume par clip : niveau original.
       volume: clampVolume(clip.volume ?? 1),
+      // Projets antérieurs aux fondus audio : enveloppe plate.
+      audioFadeInMs: clampAudioFadeMs(clip.audioFadeInMs ?? 0, durationMs),
+      audioFadeOutMs: clampAudioFadeMs(clip.audioFadeOutMs ?? 0, durationMs),
       // Projets antérieurs à la vitesse par clip : temps réel.
-      playbackRate: clampRate(clip.playbackRate ?? 1),
+      playbackRate,
       // Projets antérieurs au cadrage par clip : recadrage centré.
       cropX: clampCropX(clip.cropX ?? 0),
     });

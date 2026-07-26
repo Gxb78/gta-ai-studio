@@ -3,14 +3,14 @@
 import { useEffect, useRef, useState } from "react";
 import { exportTimeline, onExportProgress, revealPath } from "../ipc";
 import { Icon } from "./Icon";
-import type { Clip, ExportRequest, ExportSegment, FramingMode, SourceInfo } from "../types";
-import type { CompiledTimeline } from "../timeline/compileTimeline";
+import type { ExportRequest, ExportSegment, FramingMode, SourceInfo } from "../types";
+import type { CompiledSegment, CompiledTimeline } from "../timeline/compileTimeline";
 import {
   OUTPUT_HEIGHT,
   OUTPUT_WIDTH,
+  clipDurationMs,
   clipEndMs,
   formatTime,
-  sortClips,
   usedSources,
 } from "../types";
 
@@ -19,10 +19,16 @@ import {
  * vers la sienne et précédé de son éventuel trou (noir silencieux).
  */
 /** Segments d'un plan, chacun précédé de son éventuel silence ou noir. */
-function toSegments(clips: Clip[], indexOf: Map<string, number>): ExportSegment[] {
+function toSegments(
+  compiledSegments: readonly CompiledSegment[],
+  indexOf: Map<string, number>,
+  audio: boolean,
+): ExportSegment[] {
   let cursor = 0;
   const segments: ExportSegment[] = [];
-  for (const clip of sortClips(clips)) {
+  const sorted = [...compiledSegments].sort((a, b) => a.startMs - b.startMs);
+  for (const compiled of sorted) {
+    const { clip, sourceClip } = compiled;
     const index = indexOf.get(clip.sourceId);
     if (index === undefined) continue;
     segments.push({
@@ -31,6 +37,10 @@ function toSegments(clips: Clip[], indexOf: Map<string, number>): ExportSegment[
       srcOutMs: clip.srcOutMs,
       playbackRate: clip.playbackRate,
       volume: clip.volume,
+      audioFadeInMs: audio ? sourceClip.audioFadeInMs : 0,
+      audioFadeOutMs: audio ? sourceClip.audioFadeOutMs : 0,
+      audioFadeOffsetMs: audio ? compiled.startMs - sourceClip.timelineStartMs : 0,
+      audioClipDurationMs: audio ? clipDurationMs(sourceClip) : clipDurationMs(clip),
       gapBeforeMs: Math.max(0, clip.timelineStartMs - cursor),
       cropX: clip.cropX,
     });
@@ -41,14 +51,16 @@ function toSegments(clips: Clip[], indexOf: Map<string, number>): ExportSegment[
 
 function buildRequest(
   sources: Record<string, SourceInfo>,
-  clips: Clip[],
-  audioClips: Clip[],
+  videoSegments: readonly CompiledSegment[],
+  audioPlanSegments: readonly CompiledSegment[],
 ): Pick<ExportRequest, "sources" | "segments" | "audioSegments" | "hasAudio" | "frameFps"> {
   // Les deux plans partagent la même liste de rushs : les index concordent.
+  const clips = videoSegments.map((segment) => segment.clip);
+  const audioClips = audioPlanSegments.map((segment) => segment.clip);
   const used = usedSources(sources, clips.concat(audioClips));
   const indexOf = new Map(used.map((source, index) => [source.id, index]));
-  const segments = toSegments(clips, indexOf);
-  const audioSegments = toSegments(audioClips, indexOf);
+  const segments = toSegments(videoSegments, indexOf, false);
+  const audioSegments = toSegments(audioPlanSegments, indexOf, true);
 
   // La définition de sortie est imposée (1080×1920) et appliquée segment par
   // segment ; seule la cadence se cale sur le premier rush.
@@ -123,7 +135,11 @@ export function ExportDialog(props: Props) {
     setPercent(0);
     try {
       const path = await exportTimeline({
-        ...buildRequest(sources, clips, audioClips),
+        ...buildRequest(
+          sources,
+          compiledTimeline.video.segments,
+          compiledTimeline.audio.segments,
+        ),
         mode: framing,
         fileName: sanitized,
       });

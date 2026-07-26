@@ -215,6 +215,8 @@ export default function App() {
           srcOutMs: source.probe.durationMs,
           audioEnabled: true,
           volume: 1,
+          audioFadeInMs: 0,
+          audioFadeOutMs: 0,
           playbackRate: 1,
         },
       ],
@@ -558,6 +560,16 @@ export default function App() {
             onSetVolume={(volume) => {
               if (state.selectedClipId) {
                 dispatch({ type: "SET_CLIP_VOLUME", clipId: state.selectedClipId, volume });
+              }
+            }}
+            onSetAudioFade={(side, fadeMs) => {
+              if (state.selectedClipId) {
+                dispatch({
+                  type: "SET_CLIP_AUDIO_FADE",
+                  clipId: state.selectedClipId,
+                  side,
+                  fadeMs,
+                });
               }
             }}
             onToggleAudio={toggleClipAudio}

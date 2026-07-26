@@ -10,6 +10,7 @@ import type { Clip, FramingMode, Project, SourceInfo, StoredProject } from "../t
 import {
   MIN_CLIP_MS,
   applyRate,
+  clampAudioFadeMs,
   clampCropX,
   clampVolume,
   applyTrim,
@@ -63,6 +64,15 @@ export const initialEditorState: EditorState = {
   future: [],
 };
 
+const clampClipFades = (clip: Clip): Clip => {
+  const durationMs = clipDurationMs(clip);
+  return {
+    ...clip,
+    audioFadeInMs: clampAudioFadeMs(clip.audioFadeInMs, durationMs),
+    audioFadeOutMs: clampAudioFadeMs(clip.audioFadeOutMs, durationMs),
+  };
+};
+
 export type EditorAction =
   | { type: "LOAD"; project: StoredProject }
   /** Fichiers dérivés régénérés : on remplace le rush, jamais le montage. */
@@ -83,6 +93,12 @@ export type EditorAction =
   /** Décalage horizontal du cadrage d'un clip. */
   | { type: "SET_CLIP_CROP_X"; clipId: string; cropX: number }
   | { type: "SET_CLIP_VOLUME"; clipId: string; volume: number }
+  | {
+      type: "SET_CLIP_AUDIO_FADE";
+      clipId: string;
+      side: "in" | "out" | "both";
+      fadeMs: number;
+    }
   | { type: "TOGGLE_TRACK_HIDDEN"; track: number }
   | { type: "TOGGLE_TRACK_LOCKED"; track: number }
   /** Son de tous les clips d'une piste, d'un coup (bouton M de l'en-tête). */
@@ -207,6 +223,8 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         // Une surcouche arrive muette : elle ne doit pas couper le son du dessous.
         audioEnabled: track === 0,
         volume: 1,
+        audioFadeInMs: 0,
+        audioFadeOutMs: 0,
         playbackRate: 1,
       };
       // Piste imposée (dépôt à la souris) : les clips déjà présents s'écartent,
@@ -232,12 +250,12 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       const limit = action.source.probe.durationMs;
       const clips = state.clips.map((clip) =>
         clip.sourceId === action.missingId
-          ? {
+          ? clampClipFades({
               ...clip,
               sourceId: action.source.id,
               srcInMs: Math.min(clip.srcInMs, Math.max(0, limit - MIN_CLIP_MS)),
               srcOutMs: Math.min(clip.srcOutMs, limit),
-            }
+            })
           : clip,
       );
       return { ...pushHistory(state, clips), project: { ...state.project, sources } };
@@ -273,6 +291,31 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         state,
         state.clips.map((clip) =>
           clip.id === action.clipId ? { ...clip, volume } : clip,
+        ),
+      );
+    }
+
+    case "SET_CLIP_AUDIO_FADE": {
+      const target = state.clips.find((clip) => clip.id === action.clipId);
+      if (!target) return state;
+      const fadeMs = clampAudioFadeMs(action.fadeMs, clipDurationMs(target));
+      if (action.side === "both") {
+        if (target.audioFadeInMs === fadeMs && target.audioFadeOutMs === fadeMs) return state;
+        return pushHistory(
+          state,
+          state.clips.map((clip) =>
+            clip.id === action.clipId
+              ? { ...clip, audioFadeInMs: fadeMs, audioFadeOutMs: fadeMs }
+              : clip,
+          ),
+        );
+      }
+      const key = action.side === "in" ? "audioFadeInMs" : "audioFadeOutMs";
+      if (target[key] === fadeMs) return state;
+      return pushHistory(
+        state,
+        state.clips.map((clip) =>
+          clip.id === action.clipId ? { ...clip, [key]: fadeMs } : clip,
         ),
       );
     }
@@ -317,7 +360,12 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       // Le point de coupe dans le RUSH passe par la conversion canonique :
       // avec une vitesse de 2, une seconde de montage vaut deux secondes de rush.
       const cutSrc = timelineTimeToSourceTime(clip, action.timelineMs);
-      const left: Clip = { ...clip, srcOutMs: cutSrc };
+      const left = clampClipFades({
+        ...clip,
+        srcOutMs: cutSrc,
+        // Une coupe franche ne crée pas un fondu au nouveau bord.
+        audioFadeOutMs: 0,
+      });
       const right: Clip = {
         id: newClipId(),
         sourceId: clip.sourceId,
@@ -328,6 +376,11 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         srcOutMs: clip.srcOutMs,
         audioEnabled: clip.audioEnabled,
         volume: clip.volume,
+        audioFadeInMs: 0,
+        audioFadeOutMs: clampAudioFadeMs(
+          clip.audioFadeOutMs,
+          (clip.srcOutMs - cutSrc) / clip.playbackRate,
+        ),
         playbackRate: clip.playbackRate,
       };
       const next = state.clips.map((c) => (c.id === clip.id ? left : c));
@@ -349,7 +402,12 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
     // transitoire ferait dériver le bord par accumulation d'arrondis.
     case "TRIM_TRANSIENT": {
       const next = withGesture(state.clips, action.clipId, (clip, limits) =>
-        applyTrim(clip, action.side, action.edgeSrcMs, { ...limits, sourceDurationMs: durationOf(clip) }),
+        clampClipFades(
+          applyTrim(clip, action.side, action.edgeSrcMs, {
+            ...limits,
+            sourceDurationMs: durationOf(clip),
+          }),
+        ),
       );
       if (!next) return state.transientClips ? { ...state, transientClips: null } : state;
       return { ...state, transientClips: next };
@@ -398,7 +456,12 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
 
     case "TRIM_EDGE": {
       const next = withGesture(state.clips, action.clipId, (clip, limits) =>
-        applyTrim(clip, action.side, action.edgeSrcMs, { ...limits, sourceDurationMs: durationOf(clip) }),
+        clampClipFades(
+          applyTrim(clip, action.side, action.edgeSrcMs, {
+            ...limits,
+            sourceDurationMs: durationOf(clip),
+          }),
+        ),
       );
       if (!next) return state;
       return pushHistory(state, next);
@@ -406,7 +469,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
 
     case "SET_CLIP_RATE": {
       const next = withGesture(state.clips, action.clipId, (clip, limits) =>
-        applyRate(clip, action.rate, limits),
+        clampClipFades(applyRate(clip, action.rate, limits)),
       );
       if (!next) return state;
       return pushHistory(state, next);

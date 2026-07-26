@@ -103,6 +103,27 @@ fn validate_segments(segments: &[ExportSegment], source_count: usize) -> Result<
         if !segment.volume.is_finite() || !(0.0..=1.0).contains(&segment.volume) {
             return Err("Volume de segment hors bornes (0 % à 100 %).".into());
         }
+        let fades = [
+            segment.audio_fade_in_ms,
+            segment.audio_fade_out_ms,
+            segment.audio_fade_offset_ms,
+            segment.audio_clip_duration_ms,
+        ];
+        if fades.iter().any(|value| !value.is_finite() || *value < 0.0) {
+            return Err("Enveloppe audio de segment invalide.".into());
+        }
+        if segment.audio_fade_in_ms > 0.0 || segment.audio_fade_out_ms > 0.0 {
+            let timeline_duration =
+                (segment.src_out_ms - segment.src_in_ms) / segment.playback_rate;
+            if segment.audio_clip_duration_ms <= 0.0
+                || segment.audio_fade_in_ms > segment.audio_clip_duration_ms / 2.0 + 0.001
+                || segment.audio_fade_out_ms > segment.audio_clip_duration_ms / 2.0 + 0.001
+                || segment.audio_fade_offset_ms + timeline_duration
+                    > segment.audio_clip_duration_ms + 0.001
+            {
+                return Err("Fondus audio hors des bornes du clip.".into());
+            }
+        }
         if segment.source_index >= source_count {
             return Err("Un segment référence un rush inconnu.".into());
         }
@@ -193,6 +214,27 @@ fn atempo_chain(rate: f64) -> String {
     }
 }
 
+fn audio_volume_filter(segment: &ExportSegment) -> String {
+    if segment.audio_fade_in_ms <= 0.0 && segment.audio_fade_out_ms <= 0.0 {
+        return format!("volume={:.6}", segment.volume);
+    }
+
+    let offset = segment.audio_fade_offset_ms / 1000.0;
+    let clip_duration = segment.audio_clip_duration_ms / 1000.0;
+    let mut factors = vec![format!("{:.6}", segment.volume)];
+    if segment.audio_fade_in_ms > 0.0 {
+        let duration = segment.audio_fade_in_ms / 1000.0;
+        factors.push(format!("min(1,max(0,(t+{offset:.6})/{duration:.6}))"));
+    }
+    if segment.audio_fade_out_ms > 0.0 {
+        let duration = segment.audio_fade_out_ms / 1000.0;
+        factors.push(format!(
+            "min(1,max(0,({clip_duration:.6}-{offset:.6}-t)/{duration:.6}))"
+        ));
+    }
+    format!("volume='{}':eval=frame", factors.join("*"))
+}
+
 #[derive(Serialize, Clone)]
 struct ImportProgress {
     stage: &'static str,
@@ -221,6 +263,14 @@ pub struct ExportSegment {
     /// Gain sonore (1 = niveau original, 0 = silence).
     #[serde(default = "default_volume")]
     pub volume: f64,
+    #[serde(default)]
+    pub audio_fade_in_ms: f64,
+    #[serde(default)]
+    pub audio_fade_out_ms: f64,
+    #[serde(default)]
+    pub audio_fade_offset_ms: f64,
+    #[serde(default)]
+    pub audio_clip_duration_ms: f64,
     /// Durée de noir silencieux à insérer AVANT ce segment (trou de la timeline).
     #[serde(default)]
     pub gap_before_ms: f64,
@@ -823,9 +873,9 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
             if request.sources[input].has_audio {
                 let i = next_audio;
                 let tempo = atempo_chain(segment.playback_rate);
-                let volume = segment.volume;
+                let volume = audio_volume_filter(segment);
                 graph += &format!(
-                    "[{input}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo},volume={volume:.6},{AFMT}[a{i}];"
+                    "[{input}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo},{volume},{AFMT}[a{i}];"
                 );
                 audio_parts.push(i);
                 next_audio += 1;
@@ -975,6 +1025,10 @@ mod tests {
             src_out_ms: 1000.0,
             playback_rate: 1.0,
             volume: 1.0,
+            audio_fade_in_ms: 0.0,
+            audio_fade_out_ms: 0.0,
+            audio_fade_offset_ms: 0.0,
+            audio_clip_duration_ms: 1000.0,
             crop_x: 0.0,
             gap_before_ms,
         }
@@ -1028,6 +1082,15 @@ mod tests {
             "volume supérieur au niveau original refusé"
         );
 
+        let fondu_hors_bornes = ExportSegment {
+            audio_fade_in_ms: 600.0,
+            ..segment(0.0)
+        };
+        assert!(
+            validate_segments(&[fondu_hors_bornes], 1).is_err(),
+            "un fondu supérieur à la moitié du clip est refusé"
+        );
+
         let rush_inconnu = ExportSegment { source_index: 7, ..segment(0.0) };
         assert!(validate_segments(&[rush_inconnu], 1).is_err(), "rush inexistant refusé");
 
@@ -1041,5 +1104,21 @@ mod tests {
         assert_eq!(atempo_chain(2.0), "atempo=2.000000");
         assert_eq!(atempo_chain(4.0), "atempo=2.000000,atempo=2.000000");
         assert_eq!(atempo_chain(0.25), "atempo=0.500000,atempo=0.500000");
+    }
+
+    #[test]
+    fn le_filtre_volume_conserve_lenveloppe_du_clip_source() {
+        let segment = ExportSegment {
+            volume: 0.8,
+            audio_fade_in_ms: 1000.0,
+            audio_fade_out_ms: 2000.0,
+            audio_fade_offset_ms: 500.0,
+            audio_clip_duration_ms: 5000.0,
+            ..segment(0.0)
+        };
+        assert_eq!(
+            audio_volume_filter(&segment),
+            "volume='0.800000*min(1,max(0,(t+0.500000)/1.000000))*min(1,max(0,(5.000000-0.500000-t)/2.000000))':eval=frame"
+        );
     }
 }
