@@ -279,6 +279,26 @@ check(
   0,
 );
 
+console.log("Piste visée bornée à une piste neuve au-dessus des pistes committées");
+// Bug réel trouvé à l'usage : un pointeur qui reste au-dessus de la rangée
+// fantôme pendant un déplacement fait grimper le nombre de pistes de un à
+// chaque image (la rangée fantôme remonte d'autant, le pointeur se retrouve
+// dessus l'image suivante) — un montage s'est retrouvé avec 76 pistes en
+// moins de deux secondes. Le réducteur doit refuser toute piste au-delà
+// d'UNE nouvelle piste au-dessus du maximum committé, quelle que soit la
+// valeur envoyée par l'interface.
+const versUnePisteAbsurde = editorReducer(stateWith(covered, "haut"), {
+  type: "MOVE_TRANSIENT",
+  clipId: "haut",
+  timelineStartMs: 5000,
+  track: 99,
+});
+check(
+  "la piste est ramenée au plus à une piste neuve (trackCount des clips committés)",
+  (versUnePisteAbsurde.transientClips ?? []).find((c) => c.id === "haut")?.track,
+  2,
+);
+
 // --- Parité lecteur / export -------------------------------------------------
 
 // --- Vitesse par clip --------------------------------------------------------

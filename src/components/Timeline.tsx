@@ -151,9 +151,17 @@ export function Timeline(props: Props) {
   const sourceCount = new Set(clips.map((clip) => clip.sourceId)).size;
   // Une piste vide n'est proposée que pendant un déplacement : le reste du
   // temps elle ne ferait qu'occuper de la hauteur pour rien.
-  const occupied = trackCount(clips);
+  //
+  // Calculé sur anchorClips (COMMITTÉS), jamais sur clips (transitoires) :
+  // sinon, pendant un déplacement, chaque image qui pose le clip sur la piste
+  // fantôme fait grimper le nombre de pistes de un, ce qui fait remonter la
+  // piste fantôme d'autant — si le pointeur ne bouge pas, il se retrouve
+  // de nouveau dessus l'image suivante, et ainsi de suite. Un montage s'est
+  // retrouvé avec 76 pistes de cette façon en moins de deux secondes.
+  const occupied = trackCount(anchorClips);
   // Piste vide proposée pendant un déplacement OU pendant le dépôt d'un média :
-  // c'est le seul moyen de poser une surcouche sur une piste neuve.
+  // c'est le seul moyen de poser une surcouche sur une piste neuve. Toujours
+  // UNE seule, jamais plus, quel que soit l'endroit où le pointeur traîne.
   const dropTrackVisible = hud?.kind === "move" || pendingSource !== null;
   const tracks = occupied + (dropTrackVisible ? 1 : 0);
   const trackOrder = Array.from({ length: tracks }, (_, i) => tracks - 1 - i);
@@ -392,8 +400,13 @@ export function Timeline(props: Props) {
       }
       // Déplacement vertical : on cherche la rangée réellement sous le curseur
       // plutôt que de supposer une hauteur uniforme — le bandeau de dépôt est
-      // plus fin que les pistes, un calcul par division se tromperait.
-      const track = trackUnderPointer(gesture.pointerY, gesture.origin.track);
+      // plus fin que les pistes, un calcul par division se tromperait. Borné à
+      // au plus une piste neuve au-dessus des pistes committées : c'est le
+      // filet visuel, le réducteur applique la même borne sur les données.
+      const track = Math.min(
+        trackUnderPointer(gesture.pointerY, gesture.origin.track),
+        liveRef.current.maxTrack,
+      );
       if (value !== gesture.lastValueMs || track !== gesture.lastTrack) {
         gesture.lastValueMs = value;
         gesture.lastTrack = track;

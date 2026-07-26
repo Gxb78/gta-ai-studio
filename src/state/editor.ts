@@ -23,6 +23,7 @@ import {
   sortClips,
   timelineTimeToSourceTime,
   topClipAt,
+  trackCount,
 } from "../types";
 
 const HISTORY_LIMIT = 100;
@@ -339,7 +340,15 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       const target = state.clips.find((clip) => clip.id === action.clipId);
       if (!target) return state;
       const timelineStartMs = Math.max(0, action.timelineStartMs);
-      const wanted = Math.max(0, Math.floor(action.track));
+      // Borné à au plus UNE piste neuve au-dessus des pistes committées : sans
+      // cette borne, un pointeur qui reste au-dessus de la rangée fantôme
+      // pendant le geste crée une piste par image (la rangée fantôme remonte
+      // d'autant, le pointeur se retrouve de nouveau au-dessus) — un montage
+      // s'est ainsi retrouvé avec 76 pistes après moins de deux secondes.
+      // Cette borne est la garantie ; celle posée côté Timeline n'est qu'un
+      // confort visuel pour ne pas laisser la rangée fantôme s'emballer à l'œil.
+      const ceiling = trackCount(state.clips);
+      const wanted = Math.min(ceiling, Math.max(0, Math.floor(action.track)));
       // Une piste verrouillée n'accepte rien : le clip reste sur la sienne.
       const track = state.lockedTracks.includes(wanted) ? target.track : wanted;
       const moved = { ...target, timelineStartMs, track };
