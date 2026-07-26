@@ -756,6 +756,17 @@ body.resizing-v, body.resizing-v * { cursor: ns-resize !important; }
 }
 .headers-inner { will-change: transform; }
 .headers-spacer { height: var(--ruler-h); border-bottom: 1px solid var(--border); }
+.title-lane-head {
+  height: var(--title-h, 48px);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
 
 .track-head {
   height: var(--track-h, 140px);
@@ -850,6 +861,59 @@ body.moving, body.moving * { cursor: grabbing !important; }
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.3px;
 }
+
+.title-lane {
+  position: relative;
+  height: var(--title-h, 48px);
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.012);
+  touch-action: none;
+}
+.title-clip {
+  position: absolute;
+  top: 6px;
+  height: 35px;
+  min-width: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  overflow: hidden;
+  color: #eaf0ff;
+  background: #294c86;
+  border: 1px solid #5f8fe5;
+  border-radius: 4px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  contain: paint;
+}
+.title-clip.title-caption { background: #42515f; border-color: #8292a1; }
+.title-clip.title-minimal { background: #485043; border-color: #84927a; }
+.title-clip > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+.title-clip.selected {
+  border-color: #b9d0ff;
+  box-shadow: inset 0 0 0 1px var(--accent-hi);
+  z-index: 3;
+}
+.title-clip.active { z-index: 4; }
+.title-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  cursor: ew-resize;
+}
+.title-handle-l { left: 0; }
+.title-handle-r { right: 0; }
+.title-snap-line { top: 0; bottom: 0; }
 
 /* --track-h et --audio-h sont posées par Timeline.tsx : la largeur d'un créneau
    de vignette se déduit de la hauteur de bande, elles ne doivent pas diverger. */

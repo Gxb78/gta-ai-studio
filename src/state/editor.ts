@@ -47,6 +47,8 @@ export interface EditorState {
   textOverlays: TextOverlay[];
   /** Clips pendant un geste en cours (trim, déplacement), sinon null. */
   transientClips: Clip[] | null;
+  /** Titres pendant un geste de timeline, sinon null. */
+  transientTextOverlays: TextOverlay[] | null;
   selectedClipId: string | null;
   selectedTextOverlayId: string | null;
   /**
@@ -74,6 +76,7 @@ export const initialEditorState: EditorState = {
   clips: [],
   textOverlays: [],
   transientClips: null,
+  transientTextOverlays: null,
   selectedClipId: null,
   selectedTextOverlayId: null,
   hiddenTracks: [],
@@ -131,6 +134,14 @@ export type EditorAction =
       patch: Partial<Pick<TextOverlay, "text" | "timelineStartMs" | "timelineEndMs" | "x" | "y" | "fontSizePx" | "style">>;
     }
   | { type: "DELETE_TEXT"; textOverlayId: string }
+  | {
+      type: "TEXT_TRANSIENT";
+      textOverlayId: string;
+      timelineStartMs: number;
+      timelineEndMs: number;
+    }
+  | { type: "TEXT_GESTURE_COMMIT" }
+  | { type: "TEXT_GESTURE_CANCEL" }
   | { type: "SPLIT_AT"; timelineMs: number }
   | { type: "DELETE_CLIP"; clipId: string }
   /** Trim en cours : aucune entrée d'historique. */
@@ -152,6 +163,9 @@ export type EditorAction =
 /** Clips effectivement affichés (transitoires si un geste est en cours). */
 export const effectiveClips = (state: EditorState): Clip[] =>
   state.transientClips ?? state.clips;
+
+export const effectiveTextOverlays = (state: EditorState): TextOverlay[] =>
+  state.transientTextOverlays ?? state.textOverlays;
 
 // Compacté à CHAQUE commit, jamais sur l'état transitoire : c'est le même
 // principe que la borne de piste posée pendant un geste, appliqué une image
@@ -177,6 +191,7 @@ const pushHistory = (
     clips,
     textOverlays,
     transientClips: null,
+    transientTextOverlays: null,
     past: [...state.past.slice(-(HISTORY_LIMIT - 1)), snapshot(state)],
     future: [],
   };
@@ -456,6 +471,30 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       };
     }
 
+    case "TEXT_TRANSIENT": {
+      const target = state.textOverlays.find((overlay) => overlay.id === action.textOverlayId);
+      if (!target) return state;
+      const next = normalizeTextOverlay(
+        {
+          ...target,
+          timelineStartMs: action.timelineStartMs,
+          timelineEndMs: action.timelineEndMs,
+        },
+        timelineDurationMs(state.clips),
+      );
+      const transientTextOverlays = state.textOverlays.map((overlay) =>
+        overlay.id === target.id ? next : overlay,
+      );
+      return { ...state, transientTextOverlays };
+    }
+
+    case "TEXT_GESTURE_COMMIT":
+      if (!state.transientTextOverlays) return state;
+      return pushHistory(state, state.clips, state.transientTextOverlays);
+
+    case "TEXT_GESTURE_CANCEL":
+      return state.transientTextOverlays ? { ...state, transientTextOverlays: null } : state;
+
     case "SPLIT_AT": {
       // Un clip explicitement sélectionné prime, même s'il est recouvert :
       // sinon un clip de la piste du dessous deviendrait inéditable.
@@ -614,6 +653,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         clips: previous.clips,
         textOverlays: previous.textOverlays,
         transientClips: null,
+        transientTextOverlays: null,
         past: state.past.slice(0, -1),
         future: [snapshot(state), ...state.future],
       };
@@ -627,6 +667,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         clips: next.clips,
         textOverlays: next.textOverlays,
         transientClips: null,
+        transientTextOverlays: null,
         past: [...state.past, snapshot(state)],
         future: rest,
       };

@@ -24,7 +24,13 @@ import {
 } from "./ipc";
 import { usePlayback } from "./playback/usePlayback";
 import { compileTimeline } from "./timeline/compileTimeline";
-import { editorReducer, effectiveClips, initialEditorState, newClipId } from "./state/editor";
+import {
+  editorReducer,
+  effectiveClips,
+  effectiveTextOverlays,
+  initialEditorState,
+  newClipId,
+} from "./state/editor";
 import type {
   FramingMode,
   HardwareCapabilities,
@@ -83,6 +89,7 @@ export default function App() {
   const audioB = useRef<HTMLAudioElement | null>(null);
 
   const clips = effectiveClips(state);
+  const textOverlays = effectiveTextOverlays(state);
   const sources = state.project?.sources ?? EMPTY_SOURCES;
   const framing: FramingMode = state.project?.framing ?? "crop";
 
@@ -329,7 +336,7 @@ export default function App() {
   // défaut celle du premier rush. Deux rushs peuvent différer.
   const selectedClip = state.clips.find((clip) => clip.id === state.selectedClipId) ?? null;
   const selectedTextOverlay =
-    state.textOverlays.find((overlay) => overlay.id === state.selectedTextOverlayId) ?? null;
+    textOverlays.find((overlay) => overlay.id === state.selectedTextOverlayId) ?? null;
   const referenceFps =
     (selectedClip ? sources[selectedClip.sourceId]?.probe.fps : undefined) ??
     Object.values(sources)[0]?.probe.fps ??
@@ -535,7 +542,7 @@ export default function App() {
 
         {textOpen && (
           <TextPanel
-            overlays={state.textOverlays}
+            overlays={textOverlays}
             selectedId={state.selectedTextOverlayId}
             onAdd={() => {
               dispatch({ type: "ADD_TEXT", atMs: playback.clock.getPlayheadMs() });
@@ -575,7 +582,7 @@ export default function App() {
               ? (cropX) => dispatch({ type: "SET_CLIP_CROP_X", clipId: visibleClip.id, cropX })
               : null
           }
-          textOverlays={state.textOverlays}
+          textOverlays={textOverlays}
           selectedTextOverlayId={state.selectedTextOverlayId}
           onSelectTextOverlay={(textOverlayId) => {
             dispatch({ type: "SELECT_TEXT", textOverlayId });
@@ -649,6 +656,12 @@ export default function App() {
         compiledTimeline={compiledTimeline}
         clock={playback.clock}
         selectedClipId={state.selectedClipId}
+        textOverlays={textOverlays}
+        anchorTextOverlays={state.textOverlays}
+        selectedTextOverlayId={state.selectedTextOverlayId}
+        onSelectTextOverlay={(textOverlayId) =>
+          dispatch({ type: "SELECT_TEXT", textOverlayId })
+        }
         onSeek={playback.seek}
         onSelect={selectClip}
         onPreviewFrame={playback.showFrame}

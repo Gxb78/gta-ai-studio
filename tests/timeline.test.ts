@@ -24,6 +24,7 @@ import {
 } from "../src/types";
 import {
   editorReducer,
+  effectiveTextOverlays,
   initialEditorState,
   type EditorState,
 } from "../src/state/editor";
@@ -274,6 +275,36 @@ const titleUndoAdd = editorReducer(titleUndo, { type: "UNDO" });
 check("l'ajout du titre est annulable", titleUndoAdd.textOverlays.length, 0);
 const titleRedoAdd = editorReducer(titleUndoAdd, { type: "REDO" });
 check("l'ajout du titre est rétablissable", titleRedoAdd.textOverlays.length, 1);
+const titleTransient = editorReducer(titleAdded, {
+  type: "TEXT_TRANSIENT",
+  textOverlayId: titleAdded.textOverlays[0].id,
+  timelineStartMs: 2000,
+  timelineEndMs: 4500,
+});
+check(
+  "le geste déplace immédiatement le titre visible",
+  effectiveTextOverlays(titleTransient)[0]?.timelineStartMs,
+  2000,
+);
+check(
+  "le geste ne modifie pas encore le titre committé",
+  titleTransient.textOverlays[0]?.timelineStartMs,
+  1000,
+);
+check("le geste ne remplit pas l'historique", titleTransient.past.length, titleAdded.past.length);
+const titleCommitted = editorReducer(titleTransient, { type: "TEXT_GESTURE_COMMIT" });
+check("le relâchement committe le titre", titleCommitted.textOverlays[0]?.timelineStartMs, 2000);
+check("un geste entier crée une seule entrée d'historique", titleCommitted.past.length, 2);
+const titleCancelled = editorReducer(
+  editorReducer(titleAdded, {
+    type: "TEXT_TRANSIENT",
+    textOverlayId: titleAdded.textOverlays[0].id,
+    timelineStartMs: 2500,
+    timelineEndMs: 5000,
+  }),
+  { type: "TEXT_GESTURE_CANCEL" },
+);
+check("Échap restaure le titre committé", effectiveTextOverlays(titleCancelled)[0]?.timelineStartMs, 1000);
 const titleAtEnd = editorReducer(titleBase, { type: "ADD_TEXT", atMs: 4500 });
 const shortenedUnderTitle = editorReducer(titleAtEnd, {
   type: "SET_CLIP_RATE",

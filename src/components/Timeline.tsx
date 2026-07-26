@@ -17,8 +17,9 @@ import type { EditorAction } from "../state/editor";
 import type { PlaybackClock } from "../playback/usePlayback";
 import type { CompiledTimeline } from "../timeline/compileTimeline";
 import type { Tool } from "./ToolRail";
-import type { Clip, SourceInfo } from "../types";
+import type { Clip, SourceInfo, TextOverlay } from "../types";
 import {
+  MIN_TEXT_DURATION_MS,
   clipDurationMs,
   clipEndMs,
   clipsOnTrack,
@@ -45,6 +46,7 @@ const THUMB_WINDOW_QUANTUM = 128;
 const TRACK_GAP_PX = 6;
 /** Bandeau de dépôt affiché au-dessus pendant un déplacement. */
 const DROP_TRACK_PX = 40;
+const TITLE_LANE_PX = 48;
 const SNAP_PX = 9;
 const EDGE_SCROLL_PX = 48;
 const EDGE_SCROLL_SPEED = 20;
@@ -68,6 +70,10 @@ interface Props {
   compiledTimeline: CompiledTimeline;
   clock: PlaybackClock;
   selectedClipId: string | null;
+  textOverlays: TextOverlay[];
+  anchorTextOverlays: TextOverlay[];
+  selectedTextOverlayId: string | null;
+  onSelectTextOverlay: (textOverlayId: string | null) => void;
   onSeek: (timelineMs: number) => void;
   onSelect: (clipId: string | null) => void;
   /** Affiche l'image source à `srcMs` pendant un trim (feedback image par image). */
@@ -122,11 +128,37 @@ interface GestureHud {
   snapped: boolean;
 }
 
+type TextGestureKind = "trim-left" | "trim-right" | "move";
+
+interface TextGesture {
+  kind: TextGestureKind;
+  overlayId: string;
+  origin: TextOverlay;
+  startClientX: number;
+  startScrollLeft: number;
+  pointerX: number;
+  fine: boolean;
+  appliedFine: boolean;
+  engaged: boolean;
+  lastStartMs: number | null;
+  lastEndMs: number | null;
+  raf: number | null;
+  abort: AbortController;
+}
+
+interface TextGestureHud {
+  overlayId: string;
+  kind: TextGestureKind;
+  snapped: boolean;
+  edge: "start" | "end";
+}
+
 export function Timeline(props: Props) {
   if (import.meta.env.DEV) console.count("[render] Timeline");
   const {
     clips, anchorClips, sources, pxPerSec, onPxPerSecChange, compiledTimeline, clock,
-    selectedClipId, onSeek, onSelect, onPreviewFrame, onPause, onCloseGaps,
+    selectedClipId, textOverlays, anchorTextOverlays, selectedTextOverlayId,
+    onSelectTextOverlay, onSeek, onSelect, onPreviewFrame, onPause, onCloseGaps,
     hiddenTracks, lockedTracks, tool, pendingSource, onDropSource, onCancelDrop,
     height, onHeightChange, dispatch,
   } = props;
@@ -136,7 +168,9 @@ export function Timeline(props: Props) {
   const headersRef = useRef<HTMLDivElement | null>(null);
   const [viewport, setViewport] = useState({ scrollLeft: 0, width: 1000 });
   const [hud, setHud] = useState<GestureHud | null>(null);
+  const [textHud, setTextHud] = useState<TextGestureHud | null>(null);
   const gestureRef = useRef<Gesture | null>(null);
+  const textGestureRef = useRef<TextGesture | null>(null);
   const zoomAnchorRef = useRef<{ timeMs: number; viewportX: number } | null>(null);
   const playheadElementRef = useRef<HTMLDivElement | null>(null);
 
@@ -167,8 +201,22 @@ export function Timeline(props: Props) {
   const trackOrder = Array.from({ length: tracks }, (_, i) => tracks - 1 - i);
 
   // Valeurs fraîches lisibles depuis la boucle rAF sans la faire dépendre du rendu.
-  const liveRef = useRef({ pxPerMs, anchorClips, sources, maxTrack: occupied });
-  liveRef.current = { pxPerMs, anchorClips, sources, maxTrack: occupied };
+  const liveRef = useRef({
+    pxPerMs,
+    anchorClips,
+    anchorTextOverlays,
+    sources,
+    maxTrack: occupied,
+    totalMs,
+  });
+  liveRef.current = {
+    pxPerMs,
+    anchorClips,
+    anchorTextOverlays,
+    sources,
+    maxTrack: occupied,
+    totalMs,
+  };
 
   // --- Fenêtre visible -------------------------------------------------------
   const syncViewport = useCallback(() => {
@@ -540,10 +588,196 @@ export function Timeline(props: Props) {
     [dispatch, finishGesture, lockedTracks, onPause, onSelect, runGestureFrame, tool],
   );
 
+  const runTextGestureFrame = useCallback(() => {
+    const gesture = textGestureRef.current;
+    if (!gesture) return;
+    const el = scrollRef.current;
+    const live = liveRef.current;
+
+    if (el && gesture.engaged) {
+      const rect = el.getBoundingClientRect();
+      const x = gesture.pointerX - rect.left;
+      if (x < EDGE_SCROLL_PX) el.scrollLeft = Math.max(0, el.scrollLeft - EDGE_SCROLL_SPEED);
+      else if (x > rect.width - EDGE_SCROLL_PX) el.scrollLeft += EDGE_SCROLL_SPEED;
+    }
+
+    const scrollDelta = el ? el.scrollLeft - gesture.startScrollLeft : 0;
+    if (gesture.fine !== gesture.appliedFine) {
+      const previousRawPx = gesture.pointerX - gesture.startClientX + scrollDelta;
+      gesture.startClientX =
+        gesture.pointerX +
+        scrollDelta -
+        previousRawPx * (gesture.fine ? FINE_FACTOR : 1 / FINE_FACTOR);
+      gesture.appliedFine = gesture.fine;
+    }
+    const rawPx = gesture.pointerX - gesture.startClientX + scrollDelta;
+    if (!gesture.engaged) {
+      if (Math.abs(rawPx) < MOVE_THRESHOLD_PX) {
+        gesture.raf = requestAnimationFrame(runTextGestureFrame);
+        return;
+      }
+      gesture.engaged = true;
+      document.body.classList.add("moving");
+    }
+
+    const deltaMs = (gesture.fine ? rawPx / FINE_FACTOR : rawPx) / live.pxPerMs;
+    const toleranceMs = SNAP_PX / live.pxPerMs;
+    const anchors = [0, live.totalMs, clock.getPlayheadMs()];
+    for (const clip of live.anchorClips) {
+      anchors.push(clip.timelineStartMs, clipEndMs(clip));
+    }
+    for (const overlay of live.anchorTextOverlays) {
+      if (overlay.id !== gesture.overlayId) {
+        anchors.push(overlay.timelineStartMs, overlay.timelineEndMs);
+      }
+    }
+    const snap = (raw: number): { value: number; snapped: boolean } => {
+      let value = Math.round(raw / 10) * 10;
+      let distance = toleranceMs;
+      let snapped = false;
+      for (const anchor of [...anchors, Math.round(raw / 1000) * 1000]) {
+        const nextDistance = Math.abs(anchor - raw);
+        if (nextDistance < distance) {
+          value = anchor;
+          distance = nextDistance;
+          snapped = true;
+        }
+      }
+      return { value, snapped };
+    };
+
+    const durationMs = gesture.origin.timelineEndMs - gesture.origin.timelineStartMs;
+    let timelineStartMs = gesture.origin.timelineStartMs;
+    let timelineEndMs = gesture.origin.timelineEndMs;
+    let snapped = false;
+    let snapEdge: "start" | "end" = gesture.kind === "trim-right" ? "end" : "start";
+    if (gesture.kind === "move") {
+      const rawStart = gesture.origin.timelineStartMs + deltaMs;
+      const head = snap(rawStart);
+      const tail = snap(rawStart + durationMs);
+      if (
+        tail.snapped &&
+        (!head.snapped ||
+          Math.abs(tail.value - durationMs - rawStart) < Math.abs(head.value - rawStart))
+      ) {
+        timelineStartMs = tail.value - durationMs;
+        snapped = true;
+        snapEdge = "end";
+      } else {
+        timelineStartMs = head.value;
+        snapped = head.snapped;
+      }
+      timelineStartMs = Math.max(0, Math.min(live.totalMs - durationMs, timelineStartMs));
+      timelineEndMs = timelineStartMs + durationMs;
+    } else if (gesture.kind === "trim-left") {
+      const result = snap(gesture.origin.timelineStartMs + deltaMs);
+      timelineStartMs = Math.max(
+        0,
+        Math.min(gesture.origin.timelineEndMs - MIN_TEXT_DURATION_MS, result.value),
+      );
+      snapped = result.snapped;
+    } else {
+      const result = snap(gesture.origin.timelineEndMs + deltaMs);
+      timelineEndMs = Math.min(
+        live.totalMs,
+        Math.max(gesture.origin.timelineStartMs + MIN_TEXT_DURATION_MS, result.value),
+      );
+      snapped = result.snapped;
+      snapEdge = "end";
+    }
+
+    if (timelineStartMs !== gesture.lastStartMs || timelineEndMs !== gesture.lastEndMs) {
+      gesture.lastStartMs = timelineStartMs;
+      gesture.lastEndMs = timelineEndMs;
+      dispatch({
+        type: "TEXT_TRANSIENT",
+        textOverlayId: gesture.overlayId,
+        timelineStartMs,
+        timelineEndMs,
+      });
+    }
+    setTextHud((previous) =>
+      previous?.snapped === snapped && previous.edge === snapEdge
+        ? previous
+        : { overlayId: gesture.overlayId, kind: gesture.kind, snapped, edge: snapEdge },
+    );
+    gesture.raf = requestAnimationFrame(runTextGestureFrame);
+  }, [clock, dispatch]);
+
+  const finishTextGesture = useCallback(
+    (commit: boolean) => {
+      const gesture = textGestureRef.current;
+      if (!gesture) return;
+      if (gesture.raf !== null) cancelAnimationFrame(gesture.raf);
+      gesture.abort.abort();
+      textGestureRef.current = null;
+      document.body.classList.remove("trimming", "moving");
+      setTextHud(null);
+      if (gesture.engaged) {
+        dispatch({ type: commit ? "TEXT_GESTURE_COMMIT" : "TEXT_GESTURE_CANCEL" });
+      }
+    },
+    [dispatch],
+  );
+
+  const beginTextGesture = useCallback(
+    (event: React.PointerEvent, overlay: TextOverlay, kind: TextGestureKind) => {
+      if (event.button !== 0) return;
+      event.stopPropagation();
+      event.preventDefault();
+      if (textGestureRef.current) finishTextGesture(true);
+      onPause();
+      onSelectTextOverlay(overlay.id);
+
+      const abort = new AbortController();
+      const gesture: TextGesture = {
+        kind,
+        overlayId: overlay.id,
+        origin: { ...overlay },
+        startClientX: event.clientX,
+        startScrollLeft: scrollRef.current?.scrollLeft ?? 0,
+        pointerX: event.clientX,
+        fine: event.shiftKey,
+        appliedFine: event.shiftKey,
+        engaged: kind !== "move",
+        lastStartMs: null,
+        lastEndMs: null,
+        raf: null,
+        abort,
+      };
+      textGestureRef.current = gesture;
+      if (kind !== "move") document.body.classList.add("trimming");
+      const options = { signal: abort.signal } as const;
+      window.addEventListener(
+        "pointermove",
+        (moveEvent: PointerEvent) => {
+          gesture.pointerX = moveEvent.clientX;
+          gesture.fine = moveEvent.shiftKey;
+        },
+        options,
+      );
+      window.addEventListener("pointerup", () => finishTextGesture(true), options);
+      window.addEventListener("pointercancel", () => finishTextGesture(false), options);
+      window.addEventListener(
+        "keydown",
+        (keyEvent: KeyboardEvent) => {
+          if (keyEvent.key === "Escape") {
+            keyEvent.preventDefault();
+            finishTextGesture(false);
+          }
+        },
+        options,
+      );
+      gesture.raf = requestAnimationFrame(runTextGestureFrame);
+    },
+    [finishTextGesture, onPause, onSelectTextOverlay, runTextGestureFrame],
+  );
+
   // Filet de sécurité : jamais de geste orphelin au démontage.
   useEffect(() => {
     return () => {
       gestureRef.current?.abort.abort();
+      textGestureRef.current?.abort.abort();
       document.body.classList.remove("trimming", "moving");
     };
   }, []);
@@ -670,6 +904,7 @@ export function Timeline(props: Props) {
           "--audio-h": `${AUDIO_LANE_PX}px`,
           "--track-gap": `${TRACK_GAP_PX}px`,
           "--drop-h": `${DROP_TRACK_PX}px`,
+          "--title-h": `${TITLE_LANE_PX}px`,
           // La zone de pistes grandit avec leur nombre, jusqu'à un plafond
           // au-delà duquel elle défile verticalement.
           height: `${height}px`,
@@ -690,6 +925,10 @@ export function Timeline(props: Props) {
         <div className="track-headers">
           <div className="headers-inner" ref={headersRef}>
             <div className="headers-spacer" />
+            <div className="title-lane-head">
+              <Icon name="text" size={14} />
+              <span>Titres</span>
+            </div>
             {trackOrder.map((track) => {
               if (track >= occupied) {
                 return <div key={`head-drop-${track}`} className="track-head track-head-drop" />;
@@ -763,6 +1002,54 @@ export function Timeline(props: Props) {
                 {tick.label && <span>{tick.label}</span>}
               </div>
             ))}
+          </div>
+
+          <div
+            className="title-lane"
+            onPointerDown={(event) => {
+              if (event.target === event.currentTarget) {
+                onSelectTextOverlay(null);
+                onSelect(null);
+                handleScrubDown(event);
+              }
+            }}
+            onPointerMove={(event) => {
+              if (event.target === event.currentTarget) handleScrubMove(event);
+            }}
+          >
+            {textOverlays.map((overlay) => {
+              const leftPx = Math.round(overlay.timelineStartMs * pxPerMs);
+              const widthPx = Math.max(
+                12,
+                Math.round(overlay.timelineEndMs * pxPerMs) - leftPx,
+              );
+              if (leftPx + widthPx < visibleFromPx || leftPx > visibleToPx) return null;
+              return (
+                <TextOverlayView
+                  key={overlay.id}
+                  overlay={overlay}
+                  leftPx={leftPx}
+                  widthPx={widthPx}
+                  selected={overlay.id === selectedTextOverlayId}
+                  active={overlay.id === textHud?.overlayId}
+                  onBeginGesture={beginTextGesture}
+                />
+              );
+            })}
+            {textHud?.snapped && (
+              <div
+                className="snap-line title-snap-line"
+                style={{
+                  left: Math.round(
+                    ((textHud.edge === "end"
+                      ? textOverlays.find((overlay) => overlay.id === textHud.overlayId)
+                          ?.timelineEndMs
+                      : textOverlays.find((overlay) => overlay.id === textHud.overlayId)
+                          ?.timelineStartMs) ?? 0) * pxPerMs,
+                  ),
+                }}
+              />
+            )}
           </div>
 
           {/* Pistes empilées, la plus haute en premier : sa priorité visuelle se
@@ -958,6 +1245,49 @@ function sourceLabel(source: SourceInfo): string {
   const name = source.originalPath.split(/[\\/]/).pop() ?? "rush";
   return name.replace(/\.[^.]+$/, "");
 }
+
+const TextOverlayView = memo(function TextOverlayView(props: {
+  overlay: TextOverlay;
+  leftPx: number;
+  widthPx: number;
+  selected: boolean;
+  active: boolean;
+  onBeginGesture: (
+    event: React.PointerEvent,
+    overlay: TextOverlay,
+    kind: TextGestureKind,
+  ) => void;
+}) {
+  const { overlay, leftPx, widthPx, selected, active, onBeginGesture } = props;
+  const handlePx = Math.max(4, Math.min(9, widthPx / 3));
+  return (
+    <div
+      className={
+        `title-clip title-${overlay.style}` +
+        (selected ? " selected" : "") +
+        (active ? " active" : "")
+      }
+      style={{ left: leftPx, width: widthPx }}
+      onPointerDown={(event) => onBeginGesture(event, overlay, "move")}
+      title={`${overlay.text || "Titre vide"} · ${formatTime(overlay.timelineStartMs)} - ${formatTime(overlay.timelineEndMs)}`}
+    >
+      <Icon name="text" size={12} />
+      <span>{overlay.text || "Titre vide"}</span>
+      <div
+        className="title-handle title-handle-l"
+        style={{ width: handlePx }}
+        onPointerDown={(event) => onBeginGesture(event, overlay, "trim-left")}
+        title="Ajuster le début du titre"
+      />
+      <div
+        className="title-handle title-handle-r"
+        style={{ width: handlePx }}
+        onPointerDown={(event) => onBeginGesture(event, overlay, "trim-right")}
+        title="Ajuster la fin du titre"
+      />
+    </div>
+  );
+});
 
 // Un clip. Mémoïsé : pendant un geste, les clips inchangés ne re-rendent pas.
 const ClipView = memo(function ClipView(props: {
