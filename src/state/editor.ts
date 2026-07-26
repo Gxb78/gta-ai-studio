@@ -125,8 +125,15 @@ export const newClipId = (): string => {
 const toggleTrack = (tracks: number[], track: number): number[] =>
   tracks.includes(track) ? tracks.filter((t) => t !== track) : [...tracks, track];
 
+// Compare aussi playbackRate : sans lui, changer la vitesse d'un clip qui a
+// la place de s'étendre (le cas courant) ne modifie ni les bornes timeline ni
+// les bornes source, donc withGesture le prenait pour un geste sans effet et
+// l'ignorait — SET_CLIP_RATE ne faisait alors littéralement rien.
 const sameBounds = (a: Clip, b: Clip): boolean =>
-  a.timelineStartMs === b.timelineStartMs && a.srcInMs === b.srcInMs && a.srcOutMs === b.srcOutMs;
+  a.timelineStartMs === b.timelineStartMs &&
+  a.srcInMs === b.srcInMs &&
+  a.srcOutMs === b.srcOutMs &&
+  a.playbackRate === b.playbackRate;
 
 /** Applique un geste sur un clip et renvoie la liste complète, ou null si rien ne change. */
 function withGesture(

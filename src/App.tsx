@@ -189,7 +189,10 @@ export default function App() {
     const baseName = source.originalPath.split(/[\\/]/).pop() ?? "rush";
     const project: Project = {
       version: 4,
-      id: source.id,
+      // Distinct de l'empreinte du rush : deux projets créés depuis le même
+      // fichier partageraient sinon le même identifiant, donc le même fichier
+      // JSON, et s'écraseraient l'un l'autre.
+      id: crypto.randomUUID(),
       name: baseName.replace(/\.[^.]+$/, ""),
       sources: { [source.id]: source },
       clips: [

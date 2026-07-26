@@ -339,6 +339,26 @@ check(
   10000,
 );
 
+console.log("Changement de vitesse d'un clip qui a la place de s'étendre");
+// Cas trouvé en manipulant l'interface, pas par les tests : un clip SEUL
+// (ou avec un large trou à droite) qui change de vitesse ne touche ni ses
+// bornes timeline ni ses bornes source — seul playbackRate change. Le
+// comparateur de « geste sans effet » doit donc lui aussi regarder la
+// vitesse, sinon l'action est prise pour un geste nul et purement ignorée.
+const seul = [clip("a", 0, 0, 0, 10000)];
+const accelere = editorReducer(stateWith(seul, "a"), { type: "SET_CLIP_RATE", clipId: "a", rate: 2 });
+check(
+  "la vitesse est bien appliquée quand rien ne la contraint",
+  accelere.clips.find((c) => c.id === "a")?.playbackRate,
+  2,
+);
+check(
+  "un second changement de vitesse est lui aussi pris en compte",
+  editorReducer(accelere, { type: "SET_CLIP_RATE", clipId: "a", rate: 0.5 }).clips.find((c) => c.id === "a")
+    ?.playbackRate,
+  0.5,
+);
+
 console.log("Changement de vitesse borné par le voisin");
 const serre = [clip("a", 0, 0, 0, 5000), clip("b", 0, 5000, 0, 5000)];
 const ralenti = editorReducer(stateWith(serre, "a"), { type: "SET_CLIP_RATE", clipId: "a", rate: 0.5 });

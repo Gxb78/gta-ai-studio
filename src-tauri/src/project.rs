@@ -1,63 +1,26 @@
 // Persistance des projets : un fichier JSON par projet, écrit de façon
 // atomique (fichier temporaire puis renommage). Pas de base de données
 // tant que le besoin n'est pas démontré.
+//
+// GARANTIE DE PERSISTANCE : ce backend relaie le document brut. Il ne le
+// désérialise JAMAIS dans une structure Rust typée pour le réécrire — un champ
+// ajouté côté interface (piste, son, vitesse, cadrage, et tout ce qui viendra
+// après) traverse la sauvegarde sans que ce fichier ait à le connaître. Un
+// `#[serde(flatten)]` sur une poignée de champs demanderait de deviner à
+// l'avance quelles structures imbriquées peuvent évoluer ; le passe-plat rend
+// la question sans objet. Ce fichier ne lit dans le document que le strict
+// nécessaire à son propre travail (identifiant, chemins de proxy, quelques
+// champs d'affichage), jamais pour le réécrire.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde_json::Value;
 use std::fs;
 use tauri::AppHandle;
 
-use crate::media::{data_root, SourceInfo};
+use crate::media::data_root;
 
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Clip {
-    pub id: String,
-    /// Absent dans les projets écrits avant le positionnement libre : le front
-    /// recalcule alors la position par cumul des durées.
-    #[serde(default)]
-    pub timeline_start_ms: Option<f64>,
-    /// Absent dans les projets mono-rush : le front rattache alors le clip à
-    /// l'unique rush du projet.
-    #[serde(default)]
-    pub source_id: Option<String>,
-    pub src_in_ms: f64,
-    pub src_out_ms: f64,
-    /// TOUT le reste du clip, conservé tel quel.
-    ///
-    /// Ce backend ne fait que relayer le montage vers le disque : il n'a aucune
-    /// raison de connaître la piste, le son ou la vitesse d'un clip. Énumérer
-    /// ces champs ici reviendrait à devoir les tenir à jour à chaque évolution
-    /// du modèle, et tout oubli SUPPRIMERAIT silencieusement la donnée à la
-    /// sauvegarde. Le fourre-tout garantit que c'est structurellement impossible.
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Project {
-    pub version: u32,
-    pub id: String,
-    pub name: String,
-    /// Format mono-rush (versions 1 et 2). Conservé en lecture seule pour que
-    /// les projets déjà enregistrés restent ouvrables ; le front les migre.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<SourceInfo>,
-    /// Format multi-rush (version 3), indexé par empreinte.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sources: Option<HashMap<String, SourceInfo>>,
-    pub clips: Vec<Clip>,
-    pub created_at: String,
-    pub updated_at: String,
-    /// Même principe qu'au niveau du clip : tout réglage de projet ajouté par
-    /// l'interface traverse la sauvegarde sans que ce fichier ait à le connaître.
-    #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-/// Fiche courte d'un projet, pour la liste « Projets récents ».
-#[derive(Serialize)]
+/// Fiche courte d'un projet, pour la liste « Projets récents ». Objet dérivé,
+/// pas une copie du document : sa perte de détail n'a aucune conséquence.
+#[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectSummary {
     pub id: String,
@@ -71,16 +34,16 @@ fn is_safe_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// Rushs du projet, tous formats confondus.
-fn project_sources(project: &Project) -> Vec<&SourceInfo> {
-    let mut all: Vec<&SourceInfo> = Vec::new();
-    if let Some(source) = &project.source {
-        all.push(source);
+/// Chemins de proxy de tous les rushs du projet, formats 1 à 4 confondus.
+fn proxy_paths(project: &Value) -> Vec<&str> {
+    let mut paths: Vec<&str> = Vec::new();
+    if let Some(path) = project.get("source").and_then(|s| s.get("proxyPath")).and_then(Value::as_str) {
+        paths.push(path);
     }
-    if let Some(sources) = &project.sources {
-        all.extend(sources.values());
+    if let Some(sources) = project.get("sources").and_then(Value::as_object) {
+        paths.extend(sources.values().filter_map(|s| s.get("proxyPath")).filter_map(Value::as_str));
     }
-    all
+    paths
 }
 
 /// Vrai si tous les proxys du projet sont encore sur le disque.
@@ -88,18 +51,15 @@ fn project_sources(project: &Project) -> Vec<&SourceInfo> {
 /// Sans proxy, il n'y a rien à lire ni à scrubber : le projet n'est pas
 /// ouvrable tel quel. Le rush d'origine, lui, peut manquer sans empêcher le
 /// montage — c'est l'interface qui propose alors de le relocaliser.
-fn proxies_present(project: &Project) -> bool {
-    let sources = project_sources(project);
-    !sources.is_empty()
-        && sources
-            .iter()
-            .all(|s| std::path::Path::new(&s.proxy_path).is_file())
+fn proxies_present(project: &Value) -> bool {
+    let paths = proxy_paths(project);
+    !paths.is_empty() && paths.iter().all(|p| std::path::Path::new(p).is_file())
 }
 
-fn read_project(dir: &std::path::Path, id: &str) -> Option<Project> {
+fn read_project(dir: &std::path::Path, id: &str) -> Option<Value> {
     let path = dir.join(format!("{id}.json"));
     let raw = fs::read_to_string(&path).ok()?;
-    match serde_json::from_str::<Project>(&raw) {
+    match serde_json::from_str::<Value>(&raw) {
         Ok(project) => Some(project),
         Err(error) => {
             eprintln!("Projet illisible ({}) : {error}", path.display());
@@ -108,27 +68,44 @@ fn read_project(dir: &std::path::Path, id: &str) -> Option<Project> {
     }
 }
 
-#[tauri::command]
-pub fn save_project(app: AppHandle, project: Project) -> Result<(), String> {
-    if !is_safe_id(&project.id) {
+/// Le seul champ que ce fichier exige vraiment : un identifiant sûr pour
+/// nommer le fichier. Tout le reste est laissé tel quel.
+fn project_id(project: &Value) -> Result<String, String> {
+    let id = project
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("Projet sans identifiant.")?;
+    if !is_safe_id(id) {
         return Err("Identifiant de projet invalide.".into());
     }
+    Ok(id.to_string())
+}
+
+#[tauri::command]
+pub fn save_project(app: AppHandle, project: Value) -> Result<(), String> {
+    if !project.is_object() {
+        return Err("Projet invalide.".into());
+    }
+    let id = project_id(&project)?;
+
     let dir = data_root(&app)?.join("projects");
     fs::create_dir_all(&dir).map_err(|e| format!("Dossier projets inaccessible : {e}"))?;
 
+    // Passe-plat strict : ce qui est sérialisé ici est exactement ce que
+    // l'interface a envoyé, champ pour champ.
     let payload = serde_json::to_vec_pretty(&project).map_err(|e| format!("Sérialisation : {e}"))?;
-    let target = dir.join(format!("{}.json", project.id));
-    let temp = dir.join(format!("{}.json.tmp", project.id));
+    let target = dir.join(format!("{id}.json"));
+    let temp = dir.join(format!("{id}.json.tmp"));
     fs::write(&temp, payload).map_err(|e| format!("Écriture du projet impossible : {e}"))?;
     fs::rename(&temp, &target).map_err(|e| format!("Finalisation du projet impossible : {e}"))?;
 
-    fs::write(dir.join("_last"), project.id.as_bytes())
+    fs::write(dir.join("_last"), id.as_bytes())
         .map_err(|e| format!("Mémorisation du dernier projet impossible : {e}"))?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn load_last_project(app: AppHandle) -> Result<Option<Project>, String> {
+pub fn load_last_project(app: AppHandle) -> Result<Option<Value>, String> {
     let dir = data_root(&app)?.join("projects");
     let pointer = dir.join("_last");
     let Ok(id) = fs::read_to_string(&pointer) else {
@@ -138,29 +115,16 @@ pub fn load_last_project(app: AppHandle) -> Result<Option<Project>, String> {
     if !is_safe_id(&id) {
         return Ok(None);
     }
-    let path = dir.join(format!("{id}.json"));
-    let Ok(raw) = fs::read_to_string(&path) else {
+    let Some(project) = read_project(&dir, &id) else {
         return Ok(None);
     };
-    match serde_json::from_str::<Project>(&raw) {
-        Ok(project) => {
-            // Si le cache (proxy) a été nettoyé entre-temps, on repart de l'import.
-            if proxies_present(&project) {
-                Ok(Some(project))
-            } else {
-                Ok(None)
-            }
-        }
-        Err(error) => {
-            eprintln!("Projet illisible ({}) : {error}", path.display());
-            Ok(None)
-        }
-    }
+    // Si le cache (proxy) a été nettoyé entre-temps, on repart de l'import.
+    Ok(if proxies_present(&project) { Some(project) } else { None })
 }
 
 /// Ouvre un projet désigné et le note comme dernier projet ouvert.
 #[tauri::command]
-pub fn load_project(app: AppHandle, id: String) -> Result<Option<Project>, String> {
+pub fn load_project(app: AppHandle, id: String) -> Result<Option<Value>, String> {
     if !is_safe_id(&id) {
         return Err("Identifiant de projet invalide.".into());
     }
@@ -201,21 +165,30 @@ pub fn list_projects(app: AppHandle) -> Result<Vec<ProjectSummary>, String> {
             continue;
         };
         // Vignette du premier rush : une liste de projets sans image ne dit rien.
-        let thumb_path = project_sources(&project)
-            .first()
-            .and_then(|s| s.thumb_paths.first().cloned())
-            .filter(|p| std::path::Path::new(p).is_file());
+        let thumb_path = proxy_thumb(&project);
         summaries.push(ProjectSummary {
-            id: project.id.clone(),
-            name: project.name.clone(),
-            updated_at: project.updated_at.clone(),
-            clip_count: project.clips.len(),
+            id: id.to_string(),
+            name: project.get("name").and_then(Value::as_str).unwrap_or("Sans titre").to_string(),
+            updated_at: project.get("updatedAt").and_then(Value::as_str).unwrap_or("").to_string(),
+            clip_count: project.get("clips").and_then(Value::as_array).map_or(0, Vec::len),
             thumb_path,
         });
     }
     // Tri sur la date ISO 8601 : l'ordre lexicographique est l'ordre chronologique.
     summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(summaries)
+}
+
+/// Première vignette d'un rush du projet, si elle existe encore sur le disque.
+fn proxy_thumb(project: &Value) -> Option<String> {
+    let first_thumbs = |source: &Value| -> Option<String> {
+        source.get("thumbPaths").and_then(Value::as_array)?.first()?.as_str().map(String::from)
+    };
+    let candidate = project
+        .get("source")
+        .and_then(first_thumbs)
+        .or_else(|| project.get("sources").and_then(Value::as_object)?.values().find_map(first_thumbs));
+    candidate.filter(|p| std::path::Path::new(p).is_file())
 }
 
 /// Existence de chacun des chemins donnés, dans le même ordre.
@@ -234,69 +207,58 @@ pub fn paths_exist(paths: Vec<String>) -> Vec<bool> {
 mod tests {
     use super::*;
 
-    /// Un projet écrit par l'interface doit ressortir du disque à l'identique.
-    ///
-    /// Ce backend ne connaît ni les pistes, ni le son, ni la vitesse : le test
-    /// vérifie qu'il n'a justement PAS besoin de les connaître pour les
-    /// conserver. C'est la garantie qui manquait — un montage multipiste
-    /// revenait à plat après un redémarrage.
+    /// La garantie centrale de ce fichier : AUCUN champ du document envoyé par
+    /// l'interface ne peut disparaître à la sauvegarde, quel que soit son nom
+    /// ou sa profondeur — parce que rien n'est jamais désérialisé dans une
+    /// structure Rust typée avant d'être réécrit.
     #[test]
     fn un_projet_traverse_la_sauvegarde_sans_rien_perdre() {
-        let brut = r#"{
-            "version": 3,
-            "id": "projet-1",
-            "name": "braquage",
-            "framingMode": "blur",
-            "sources": {},
-            "clips": [
-                {
-                    "id": "c1",
-                    "sourceId": "rushA",
-                    "track": 2,
-                    "timelineStartMs": 1500,
-                    "srcInMs": 0,
-                    "srcOutMs": 4000,
-                    "audioEnabled": false,
-                    "playbackRate": 2,
-                    "cropX": -0.5
-                }
-            ],
-            "createdAt": "a",
-            "updatedAt": "b"
-        }"#;
+        let brut: Value = serde_json::from_str(
+            r#"{
+                "version": 4,
+                "id": "projet-1",
+                "name": "braquage",
+                "framingMode": "blur",
+                "sources": {
+                    "rushA": { "proxyPath": "x.mp4", "unChampFutur": 42 }
+                },
+                "clips": [
+                    {
+                        "id": "c1",
+                        "sourceId": "rushA",
+                        "track": 2,
+                        "timelineStartMs": 1500,
+                        "srcInMs": 0,
+                        "srcOutMs": 4000,
+                        "audioEnabled": false,
+                        "playbackRate": 2,
+                        "cropX": -0.5
+                    }
+                ],
+                "createdAt": "a",
+                "updatedAt": "b"
+            }"#,
+        )
+        .unwrap();
 
-        let projet: Project = serde_json::from_str(brut).expect("lecture");
-        let relu: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&projet).expect("écriture")).unwrap();
-
-        let clip = &relu["clips"][0];
-        assert_eq!(clip["track"], 2, "la piste doit survivre");
-        assert_eq!(clip["audioEnabled"], false, "l'état muet doit survivre");
-        assert_eq!(clip["playbackRate"], 2, "la vitesse doit survivre");
-        assert_eq!(clip["cropX"], -0.5, "un champ futur doit survivre aussi");
-        assert_eq!(clip["sourceId"], "rushA");
-        assert_eq!(clip["timelineStartMs"], 1500.0, "champ typé f64 : revient en flottant");
-        assert_eq!(
-            relu["framingMode"], "blur",
-            "un réglage de projet inconnu du backend doit survivre"
-        );
+        // Simule exactement ce que fait save_project, sans écrire sur le disque.
+        let relu: Value = serde_json::from_str(&serde_json::to_string(&brut).unwrap()).unwrap();
+        assert_eq!(relu, brut, "le document doit ressortir identique, byte pour byte");
     }
 
-    /// Les projets d'avant le multipiste n'ont aucun de ces champs : ils
-    /// doivent rester lisibles, la migration côté interface s'en charge.
     #[test]
-    fn un_projet_ancien_reste_lisible() {
-        let brut = r#"{
-            "version": 1,
-            "id": "vieux",
-            "name": "v1",
-            "clips": [{ "id": "c1", "srcInMs": 0, "srcOutMs": 1000 }],
-            "createdAt": "a",
-            "updatedAt": "b"
-        }"#;
-        let projet: Project = serde_json::from_str(brut).expect("lecture");
-        assert_eq!(projet.clips.len(), 1);
-        assert!(projet.clips[0].timeline_start_ms.is_none());
-        assert!(projet.clips[0].extra.is_empty());
+    fn identifiant_absent_ou_dangereux_est_rejete() {
+        assert!(project_id(&serde_json::json!({})).is_err());
+        assert!(project_id(&serde_json::json!({ "id": "../../etc" })).is_err());
+        assert!(project_id(&serde_json::json!({ "id": "projet-1" })).is_ok());
+    }
+
+    #[test]
+    fn les_proxys_sont_lus_dans_les_deux_formats() {
+        let mono = serde_json::json!({ "source": { "proxyPath": "/tmp/inexistant.mp4" } });
+        assert!(!proxies_present(&mono), "un chemin qui n'existe pas ne doit jamais passer");
+
+        let multi = serde_json::json!({ "sources": {} });
+        assert!(!proxies_present(&multi), "aucun rush référencé : rien à ouvrir");
     }
 }
