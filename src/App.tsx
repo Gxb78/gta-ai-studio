@@ -23,7 +23,7 @@ import {
   saveProject,
 } from "./ipc";
 import { usePlayback } from "./playback/usePlayback";
-import { compileTimeline } from "./timeline/compileTimeline";
+import { compileTimeline, transitionCapacityMs } from "./timeline/compileTimeline";
 import {
   editorReducer,
   effectiveClips,
@@ -98,8 +98,8 @@ export default function App() {
   const hiddenTracks = useMemo(() => new Set(state.hiddenTracks), [state.hiddenTracks]);
   const lockedTracks = useMemo(() => new Set(state.lockedTracks), [state.lockedTracks]);
   const compiledTimeline = useMemo(
-    () => compileTimeline(state.clips, hiddenTracks),
-    [hiddenTracks, state.clips],
+    () => compileTimeline(state.clips, hiddenTracks, state.project?.sources ?? {}),
+    [hiddenTracks, state.clips, state.project?.sources],
   );
   const playback = usePlayback(
     videoA,
@@ -209,7 +209,7 @@ export default function App() {
     const now = new Date().toISOString();
     const baseName = source.originalPath.split(/[\\/]/).pop() ?? "rush";
     const project: Project = {
-      version: 7,
+      version: 8,
       // Distinct de l'empreinte du rush : deux projets créés depuis le même
       // fichier partageraient sinon le même identifiant, donc le même fichier
       // JSON, et s'écraseraient l'un l'autre.
@@ -231,6 +231,7 @@ export default function App() {
           audioFadeOutMs: 0,
           videoFadeInMs: 0,
           videoFadeOutMs: 0,
+          transitionInMs: 0,
           playbackRate: 1,
         },
       ],
@@ -337,6 +338,22 @@ export default function App() {
   // Cadence de référence pour les pas clavier : celle du clip sélectionné, à
   // défaut celle du premier rush. Deux rushs peuvent différer.
   const selectedClip = state.clips.find((clip) => clip.id === state.selectedClipId) ?? null;
+  const selectedTransitionIndex = selectedClip
+    ? compiledTimeline.video.segments.findIndex(
+        (segment) =>
+          segment.sourceClipId === selectedClip.id &&
+          Math.abs(segment.startMs - selectedClip.timelineStartMs) < 1,
+      )
+    : -1;
+  const selectedTransitionMaxMs = transitionCapacityMs(
+    compiledTimeline.video.segments,
+    selectedTransitionIndex,
+    sources,
+  );
+  const selectedTransitionMs =
+    compiledTimeline.video.transitions.find(
+      (transition) => transition.toIndex === selectedTransitionIndex,
+    )?.durationMs ?? 0;
   const selectedTextOverlay =
     textOverlays.find((overlay) => overlay.id === state.selectedTextOverlayId) ?? null;
   const referenceFps =
@@ -474,6 +491,8 @@ export default function App() {
   // appliquer, et son rush qui donne le format en mode « rush entier ».
   const visibleClip =
     state.clips.find((clip) => clip.id === playback.activeVideoClipId) ?? null;
+  const transitionClip =
+    state.clips.find((clip) => clip.id === playback.transitionVideoClipId) ?? null;
   const visibleSource = visibleClip ? sources[visibleClip.sourceId] : undefined;
   const clipCounts = state.clips.reduce<Record<string, number>>((counts, clip) => {
     counts[clip.sourceId] = (counts[clip.sourceId] ?? 0) + 1;
@@ -567,6 +586,7 @@ export default function App() {
           inGap={playback.inGap}
           framing={framing}
           visibleClip={visibleClip}
+          transitionClip={transitionClip}
           cropX={visibleClip?.cropX ?? 0}
           sourceAspect={visibleSource ? sourceAspect(visibleSource.probe) : 16 / 9}
           viewMode={viewMode}
@@ -650,6 +670,17 @@ export default function App() {
                   clipId: state.selectedClipId,
                   side,
                   fadeMs,
+                });
+              }
+            }}
+            transitionMaxMs={selectedTransitionMaxMs}
+            effectiveTransitionMs={selectedTransitionMs}
+            onSetTransitionIn={(durationMs) => {
+              if (state.selectedClipId) {
+                dispatch({
+                  type: "SET_CLIP_TRANSITION_IN",
+                  clipId: state.selectedClipId,
+                  durationMs,
                 });
               }
             }}

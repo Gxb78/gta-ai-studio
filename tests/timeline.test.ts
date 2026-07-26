@@ -62,6 +62,7 @@ const clip = (
   audioFadeOutMs: 0,
   videoFadeInMs: 0,
   videoFadeOutMs: 0,
+  transitionInMs: 0,
   playbackRate: 1,
   cropX: 0,
 });
@@ -251,7 +252,7 @@ const source = (id: string): SourceInfo => ({
 const stateWith = (clips: Clip[], selectedClipId: string | null): EditorState => ({
   ...initialEditorState,
   project: {
-    version: 7,
+    version: 8,
     id: "p",
     name: "p",
     sources: { S0: source("S0"), S1: source("S1") },
@@ -685,7 +686,7 @@ const migre = migrateProject({
   createdAt: "",
   updatedAt: "",
 });
-check("le projet est ramené au format 7", migre.version, 7);
+check("le projet est ramené au format 8", migre.version, 8);
 check("le cadrage par défaut est le recadrage", migre.framing, "crop");
 check("les clips sont recentrés", migre.clips[0].cropX, 0);
 check("les clips sans volume restent au niveau original", migre.clips[0].volume, 1);
@@ -695,6 +696,7 @@ check(
   [migre.clips[0].videoFadeInMs, migre.clips[0].videoFadeOutMs],
   [0, 0],
 );
+check("les anciens clips n'ont aucune transition inventée", migre.clips[0].transitionInMs, 0);
 check("les anciens projets n'ont aucun titre inventé", migre.textOverlays.length, 0);
 const ancienTitre = migrateProject({
   version: 6,
@@ -1009,6 +1011,54 @@ check(
     gaps: emptyCompiled.gaps,
   },
   { video: 0, audio: 0, durationMs: 0, gaps: [] },
+);
+
+console.log("Fondus enchaînés centrés sur les coupes");
+const transitionClips = [
+  clip("transition-out", 0, 0, 1_000, 4_000, "S0"),
+  {
+    ...clip("transition-in", 0, 4_000, 2_000, 4_000, "S1"),
+    transitionInMs: 1_000,
+  },
+];
+const compiledTransition = compileTimeline(
+  transitionClips,
+  new Set(),
+  { S0: source("S0"), S1: source("S1") },
+);
+check(
+  "la transition est centrée sans déplacer la coupe",
+  compiledTransition.video.transitions,
+  [
+    {
+      fromIndex: 0,
+      toIndex: 1,
+      boundaryMs: 4_000,
+      startMs: 3_500,
+      endMs: 4_500,
+      durationMs: 1_000,
+    },
+  ],
+);
+const sansPoigneeEntrante = compileTimeline(
+  [transitionClips[0], { ...transitionClips[1], srcInMs: 0, srcOutMs: 4_000 }],
+  new Set(),
+  { S0: source("S0"), S1: source("S1") },
+);
+check(
+  "aucune transition n'est inventée sans poignée avant le plan entrant",
+  sansPoigneeEntrante.video.transitions,
+  [],
+);
+const transitionApresTrou = compileTimeline(
+  [transitionClips[0], { ...transitionClips[1], timelineStartMs: 4_500 }],
+  new Set(),
+  { S0: source("S0"), S1: source("S1") },
+);
+check(
+  "une transition ne traverse jamais un trou",
+  transitionApresTrou.video.transitions,
+  [],
 );
 
 console.log("Recherche binaire");

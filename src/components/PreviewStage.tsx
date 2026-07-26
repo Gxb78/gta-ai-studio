@@ -47,6 +47,8 @@ interface Props {
   framing: FramingMode;
   /** Clip committé dont l'image est visible, porteur de l'enveloppe complète. */
   visibleClip: Clip | null;
+  /** Second clip visible uniquement pendant un fondu enchaîné. */
+  transitionClip: Clip | null;
   /** Décalage du cadrage du clip visible au playhead. */
   cropX: number;
   /** Format du rush visible, pour le mode « rush entier ». */
@@ -78,7 +80,8 @@ interface Props {
 export function PreviewStage(props: Props) {
   if (import.meta.env.DEV) console.count("[render] PreviewStage");
   const {
-    videoA, videoB, audioA, audioB, activeIsA, inGap, framing, visibleClip, cropX, sourceAspect,
+    videoA, videoB, audioA, audioB, activeIsA, inGap, framing, visibleClip, transitionClip,
+    cropX, sourceAspect,
     viewMode, onViewModeChange, showSafeZones, onToggleSafeZones, playing, clock,
     durationMs, volume, onVolumeChange, onTogglePlay, onStepFrame, onCommitCropX,
     textOverlays, selectedTextOverlayId, onSelectTextOverlay, onCommitTextPosition,
@@ -159,37 +162,36 @@ export function PreviewStage(props: Props) {
   // celle de la lecture suffit, et rien ne tourne quand rien ne bouge.
   useEffect(() => {
     if (!blurred) return;
-    const canvas = blurRef.current;
-    const video = (activeIsA ? videoA.current : videoB.current) ?? null;
-    if (!canvas || !video || video.readyState < 2) return;
-    const context = canvas.getContext("2d");
-    if (!context) return;
-    // Recouvrement : on garde le centre de l'image, comme le fait `crop` après
-    // un `scale ... increase` dans le graphe d'export.
-    const scale = Math.max(BLUR_W / video.videoWidth, BLUR_H / video.videoHeight);
-    const width = video.videoWidth * scale;
-    const height = video.videoHeight * scale;
-    context.drawImage(video, (BLUR_W - width) / 2, (BLUR_H - height) / 2, width, height);
-    return clock.subscribe(() => {
-      const currentCanvas = blurRef.current;
-      const currentVideo = (activeIsA ? videoA.current : videoB.current) ?? null;
-      if (!currentCanvas || !currentVideo || currentVideo.readyState < 2) return;
-      const currentContext = currentCanvas.getContext("2d");
-      if (!currentContext) return;
-      const currentScale = Math.max(
-        BLUR_W / currentVideo.videoWidth,
-        BLUR_H / currentVideo.videoHeight,
-      );
-      const currentWidth = currentVideo.videoWidth * currentScale;
-      const currentHeight = currentVideo.videoHeight * currentScale;
-      currentContext.drawImage(
-        currentVideo,
-        (BLUR_W - currentWidth) / 2,
-        (BLUR_H - currentHeight) / 2,
-        currentWidth,
-        currentHeight,
-      );
-    });
+    const draw = () => {
+      const canvas = blurRef.current;
+      const context = canvas?.getContext("2d");
+      if (!canvas || !context) return;
+      context.clearRect(0, 0, BLUR_W, BLUR_H);
+      const entries = [
+        { video: videoA.current, fallbackOpacity: activeIsA ? 1 : 0 },
+        { video: videoB.current, fallbackOpacity: activeIsA ? 0 : 1 },
+      ];
+      for (const { video, fallbackOpacity } of entries) {
+        if (!video || video.readyState < 2) continue;
+        const inlineOpacity = Number(video.style.opacity);
+        const opacity = video.style.opacity === "" ? fallbackOpacity : inlineOpacity;
+        if (!Number.isFinite(opacity) || opacity <= 0) continue;
+        const scale = Math.max(BLUR_W / video.videoWidth, BLUR_H / video.videoHeight);
+        const width = video.videoWidth * scale;
+        const height = video.videoHeight * scale;
+        context.globalAlpha = opacity;
+        context.drawImage(
+          video,
+          (BLUR_W - width) / 2,
+          (BLUR_H - height) / 2,
+          width,
+          height,
+        );
+      }
+      context.globalAlpha = 1;
+    };
+    draw();
+    return clock.subscribe(draw);
   }, [activeIsA, blurred, clock, inGap, videoA, videoB]);
 
   useEffect(() => {
@@ -261,6 +263,10 @@ export function PreviewStage(props: Props) {
 
   const objectPosition =
     outputView && framing === "crop" ? `${cropXPercent(effectiveCropX)}% 50%` : "50% 50%";
+  const transitionObjectPosition =
+    outputView && framing === "crop" && transitionClip
+      ? `${cropXPercent(transitionClip.cropX)}% 50%`
+      : objectPosition;
 
   // Le viseur 9:16 du mode « rush entier » se place là où le cadrage regarde :
   // il montre la portion réellement conservée, pas un rectangle décoratif.
@@ -309,7 +315,9 @@ export function PreviewStage(props: Props) {
           <video
             ref={videoA}
             className={videoClass(activeIsA)}
-            style={{ objectPosition }}
+            style={{
+              objectPosition: activeIsA ? objectPosition : transitionObjectPosition,
+            }}
             preload="auto"
             playsInline
             muted
@@ -317,7 +325,9 @@ export function PreviewStage(props: Props) {
           <video
             ref={videoB}
             className={videoClass(!activeIsA)}
-            style={{ objectPosition }}
+            style={{
+              objectPosition: activeIsA ? transitionObjectPosition : objectPosition,
+            }}
             preload="auto"
             playsInline
             muted

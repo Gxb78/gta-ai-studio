@@ -6,6 +6,7 @@
 // clip alors qu'on règle le montage entier.
 
 import { Icon } from "./Icon";
+import { InspectorSection } from "./InspectorSection";
 import { sourceName } from "./MediaPanel";
 import type { Clip, FramingMode, SourceInfo } from "../types";
 import {
@@ -32,6 +33,9 @@ interface Props {
   onSetVolume: (volume: number) => void;
   onSetAudioFade: (side: "in" | "out" | "both", fadeMs: number) => void;
   onSetVideoFade: (side: "in" | "out" | "both", fadeMs: number) => void;
+  transitionMaxMs: number;
+  effectiveTransitionMs: number;
+  onSetTransitionIn: (durationMs: number) => void;
   onToggleAudio: () => void;
   onDelete: () => void;
   onCollapse: () => void;
@@ -63,8 +67,10 @@ export function Inspector(props: Props) {
         </button>
       </div>
 
-      <section className="inspector-section">
-        <h3>Cadrage du projet</h3>
+      <InspectorSection
+        title="Cadrage du projet"
+        summary={framing === "crop" ? "Recadrage" : "Fond flou"}
+      >
         <div className="option-grid">
           <label className={"option" + (framing === "crop" ? " selected" : "")}>
             <input
@@ -87,7 +93,7 @@ export function Inspector(props: Props) {
             <span className="option-note muted">Image entière conservée</span>
           </label>
         </div>
-      </section>
+      </InspectorSection>
 
       {!clip || !source ? (
         <p className="muted small-text panel-empty">
@@ -96,8 +102,7 @@ export function Inspector(props: Props) {
         </p>
       ) : (
         <>
-          <section className="inspector-section">
-            <h3>Clip</h3>
+          <InspectorSection title="Clip" summary={sourceName(source)}>
             <dl className="prop-list">
               <dt>Rush</dt>
               <dd title={source.originalPath}>{sourceName(source)}</dd>
@@ -114,13 +119,13 @@ export function Inspector(props: Props) {
               <dt>Piste</dt>
               <dd>V{clip.track + 1}</dd>
             </dl>
-          </section>
+          </InspectorSection>
 
-          <section className="inspector-section">
-            <h3>
-              Cadrage du clip
-              {framing === "blur" && <span className="muted"> — sans effet en fond flou</span>}
-            </h3>
+          <InspectorSection
+            title="Cadrage du clip"
+            note={framing === "blur" ? "sans effet en fond flou" : undefined}
+            summary={clip.cropX === 0 ? "centré" : `${Math.round(clip.cropX * 100)} %`}
+          >
             <div className="slider-row">
               <Icon name="crop" size={15} />
               <input
@@ -142,10 +147,9 @@ export function Inspector(props: Props) {
                 Recentrer
               </button>
             )}
-          </section>
+          </InspectorSection>
 
-          <section className="inspector-section">
-            <h3>Vitesse</h3>
+          <InspectorSection title="Vitesse" summary={`${clip.playbackRate}×`}>
             <div className="chip-row">
               {RATES.map((rate) => (
                 <button
@@ -161,10 +165,16 @@ export function Inspector(props: Props) {
             {(clip.playbackRate < MIN_RATE || clip.playbackRate > MAX_RATE) && (
               <p className="warn">Vitesse hors bornes, ramenée à l'application.</p>
             )}
-          </section>
+          </InspectorSection>
 
-          <section className="inspector-section">
-            <h3>Fondu vidéo</h3>
+          <InspectorSection
+            title="Fondu vidéo"
+            summary={
+              clip.videoFadeInMs === 0 && clip.videoFadeOutMs === 0
+                ? "Aucun"
+                : `${fadeLabel(clip.videoFadeInMs)} / ${fadeLabel(clip.videoFadeOutMs)}`
+            }
+          >
             <div className="fade-control">
               <label className="slider-row">
                 <span className="fade-label">Entrée</span>
@@ -202,10 +212,46 @@ export function Inspector(props: Props) {
                 Retirer les fondus
               </button>
             )}
-          </section>
+          </InspectorSection>
 
-          <section className="inspector-section">
-            <h3>Son</h3>
+          <InspectorSection
+            title="Transition"
+            summary={fadeLabel(props.effectiveTransitionMs)}
+          >
+            <label className="slider-row">
+              <span className="fade-label">Enchaîné</span>
+              <input
+                type="range"
+                min={0}
+                max={Math.max(50, props.transitionMaxMs)}
+                step={50}
+                value={props.effectiveTransitionMs}
+                disabled={props.transitionMaxMs <= 0}
+                onChange={(event) => props.onSetTransitionIn(Number(event.target.value))}
+                aria-label="Durée du fondu enchaîné"
+              />
+              <span className="slider-value">{fadeLabel(props.effectiveTransitionMs)}</span>
+            </label>
+            {props.transitionMaxMs <= 0 && (
+              <p className="muted small-text">Coupe incompatible ou poignées insuffisantes.</p>
+            )}
+            {clip.transitionInMs > 0 && (
+              <button
+                type="button"
+                className="ghost small"
+                onClick={() => props.onSetTransitionIn(0)}
+              >
+                Retirer la transition
+              </button>
+            )}
+          </InspectorSection>
+
+          <InspectorSection
+            title="Son"
+            summary={
+              clip.audioEnabled ? `${Math.round(clip.volume * 100)} %` : "Coupé"
+            }
+          >
             <button
               type="button"
               className={"ghost small" + (clip.audioEnabled ? "" : " active")}
@@ -276,14 +322,14 @@ export function Inspector(props: Props) {
             <p className="muted small-text">
               Couper le son d'une surcouche laisse passer celui de la piste du dessous.
             </p>
-          </section>
+          </InspectorSection>
 
-          <section className="inspector-section">
+          <div className="panel-danger">
             <button type="button" className="ghost small warn" onClick={props.onDelete}>
               <Icon name="trash" size={15} />
               Supprimer le clip
             </button>
-          </section>
+          </div>
         </>
       )}
     </aside>

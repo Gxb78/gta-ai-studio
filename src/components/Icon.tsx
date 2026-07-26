@@ -195,6 +195,28 @@ const PATHS = {
       <path d="M4 8h16M4 16h16" strokeDasharray="3 3" />
     </>
   ),
+  /** Chevron vers le bas : replier/déplier une section. Une rotation CSS suffit
+   *  pour l'état inverse, plutôt qu'une seconde icône à maintenir. */
+  chevron: <path d="M6.5 9.5 12 15l5.5-5.5" />,
+  search: (
+    <>
+      <circle cx="10.5" cy="10.5" r="6" />
+      <path d="M15 15l4.5 4.5" />
+    </>
+  ),
+  grid: (
+    <>
+      <rect x="3.5" y="3.5" width="7" height="7" rx="1.4" />
+      <rect x="13.5" y="3.5" width="7" height="7" rx="1.4" />
+      <rect x="3.5" y="13.5" width="7" height="7" rx="1.4" />
+      <rect x="13.5" y="13.5" width="7" height="7" rx="1.4" />
+    </>
+  ),
+  rows: (
+    <>
+      <path d="M4 6.5h16M4 12h16M4 17.5h16" />
+    </>
+  ),
 } as const;
 
 export type IconName = keyof typeof PATHS;

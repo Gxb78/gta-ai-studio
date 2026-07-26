@@ -85,11 +85,17 @@ fn default_volume() -> f64 {
 
 /// Contrôle d'un plan avant construction du graphe. Les deux plans y passent :
 /// tout ce qui finit dans une commande FFmpeg doit être validé.
-fn validate_segments(segments: &[ExportSegment], source_count: usize) -> Result<(), String> {
+fn validate_segments(segments: &[ExportSegment], sources: &[ExportSource]) -> Result<(), String> {
     if segments.len() > MAX_SEGMENTS {
         return Err(format!("Trop de segments ({MAX_SEGMENTS} maximum)."));
     }
-    for segment in segments {
+    if sources
+        .iter()
+        .any(|source| !source.duration_ms.is_finite() || source.duration_ms <= 0.0)
+    {
+        return Err("Un rush a une durée invalide.".into());
+    }
+    for (segment_index, segment) in segments.iter().enumerate() {
         if !segment.src_in_ms.is_finite() || !segment.src_out_ms.is_finite() {
             return Err("Un segment a des bornes non numériques.".into());
         }
@@ -132,7 +138,10 @@ fn validate_segments(segments: &[ExportSegment], source_count: usize) -> Result<
             segment.video_fade_offset_ms,
             segment.video_clip_duration_ms,
         ];
-        if video_fades.iter().any(|value| !value.is_finite() || *value < 0.0) {
+        if video_fades
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
             return Err("Enveloppe vidéo de segment invalide.".into());
         }
         if segment.video_fade_in_ms > 0.0 || segment.video_fade_out_ms > 0.0 {
@@ -150,8 +159,34 @@ fn validate_segments(segments: &[ExportSegment], source_count: usize) -> Result<
                 return Err("Fondus vidéo hors des bornes du clip.".into());
             }
         }
-        if segment.source_index >= source_count {
+        if segment.source_index >= sources.len() {
             return Err("Un segment référence un rush inconnu.".into());
+        }
+        if !segment.transition_in_ms.is_finite()
+            || !(0.0..=3000.0).contains(&segment.transition_in_ms)
+        {
+            return Err("Durée de transition hors bornes.".into());
+        }
+        if segment.transition_in_ms > 0.0 {
+            if segment_index == 0 || segment.gap_before_ms > 0.001 {
+                return Err("Une transition doit relier deux segments contigus.".into());
+            }
+            let previous = &segments[segment_index - 1];
+            let half = segment.transition_in_ms / 2.0;
+            let previous_duration =
+                (previous.src_out_ms - previous.src_in_ms) / previous.playback_rate;
+            let current_duration = (segment.src_out_ms - segment.src_in_ms) / segment.playback_rate;
+            if segment.transition_in_ms > previous_duration + 0.001
+                || segment.transition_in_ms > current_duration + 0.001
+            {
+                return Err("Transition plus longue que l'un des plans adjacents.".into());
+            }
+            if segment.src_in_ms + 0.001 < half * segment.playback_rate
+                || sources[previous.source_index].duration_ms - previous.src_out_ms + 0.001
+                    < half * previous.playback_rate
+            {
+                return Err("Poignées source insuffisantes pour la transition.".into());
+            }
         }
     }
     Ok(())
@@ -223,11 +258,7 @@ fn escape_filter_path(path: &Path) -> String {
         .replace('\'', "\\'")
 }
 
-fn drawtext_filter(
-    overlay: &ExportTextOverlay,
-    text_path: &Path,
-    font_path: &Path,
-) -> String {
+fn drawtext_filter(overlay: &ExportTextOverlay, text_path: &Path, font_path: &Path) -> String {
     let style = match overlay.style.as_str() {
         "impact" => "borderw=8:bordercolor=black",
         "caption" => "box=1:boxcolor=black@0.72:boxborderw=20",
@@ -238,15 +269,11 @@ fn drawtext_filter(
     let mut alpha_factors: Vec<String> = Vec::new();
     if overlay.fade_in_ms > 0.0 {
         let duration = overlay.fade_in_ms / 1000.0;
-        alpha_factors.push(format!(
-            "min(1,max(0,(t-{start:.6})/{duration:.6}))"
-        ));
+        alpha_factors.push(format!("min(1,max(0,(t-{start:.6})/{duration:.6}))"));
     }
     if overlay.fade_out_ms > 0.0 {
         let duration = overlay.fade_out_ms / 1000.0;
-        alpha_factors.push(format!(
-            "min(1,max(0,({end:.6}-t)/{duration:.6}))"
-        ));
+        alpha_factors.push(format!("min(1,max(0,({end:.6}-t)/{duration:.6}))"));
     }
     let alpha = if alpha_factors.is_empty() {
         "1".into()
@@ -380,21 +407,49 @@ fn audio_volume_filter(segment: &ExportSegment) -> String {
 /// Enveloppe appliquée au clip source complet, avant d'en extraire le tronçon
 /// visible. Les temps restent ainsi positifs, y compris lorsqu'une piste
 /// supérieure a masqué le début du clip.
-fn video_fade_filter(segment: &ExportSegment) -> String {
+fn video_fade_filter(segment: &ExportSegment, prefix_ms: f64) -> String {
     let clip_duration = segment.video_clip_duration_ms / 1000.0;
+    let prefix = prefix_ms / 1000.0;
     let mut filters: Vec<String> = Vec::new();
     if segment.video_fade_in_ms > 0.0 {
         let duration = segment.video_fade_in_ms / 1000.0;
-        filters.push(format!("fade=t=in:st=0:d={duration:.6}:color=black"));
+        filters.push(format!(
+            "fade=t=in:st={prefix:.6}:d={duration:.6}:color=black"
+        ));
     }
     if segment.video_fade_out_ms > 0.0 {
         let duration = segment.video_fade_out_ms / 1000.0;
-        let start = clip_duration - duration;
+        let start = prefix + clip_duration - duration;
         filters.push(format!(
             "fade=t=out:st={start:.6}:d={duration:.6}:color=black"
         ));
     }
     filters.join(",")
+}
+
+fn assemble_video_parts(graph: &mut String, parts: &[(usize, f64, f64)]) -> Result<String, String> {
+    let Some(&(first_label, first_duration, _)) = parts.first() else {
+        return Err("Aucune partie vidéo à assembler.".into());
+    };
+    let mut assembled_label = format!("v{first_label}");
+    let mut assembled_duration = first_duration;
+    for (chain_index, (label, duration, transition)) in parts.iter().enumerate().skip(1) {
+        let next_label = format!("vmix{chain_index}");
+        if *transition > 0.0 {
+            let offset = assembled_duration - transition;
+            graph.push_str(&format!(
+                "[{assembled_label}][v{label}]xfade=transition=fade:duration={transition:.6}:offset={offset:.6}[{next_label}];"
+            ));
+        } else {
+            graph.push_str(&format!(
+                "[{assembled_label}][v{label}]concat=n=2:v=1:a=0[{next_label}];"
+            ));
+        }
+        assembled_duration += duration - transition;
+        assembled_label = next_label;
+    }
+    graph.push_str(&format!("[{assembled_label}]null[vbase];"));
+    Ok("vbase".into())
 }
 
 #[derive(Serialize, Clone)]
@@ -441,6 +496,8 @@ pub struct ExportSegment {
     pub video_fade_offset_ms: f64,
     #[serde(default)]
     pub video_clip_duration_ms: f64,
+    #[serde(default)]
+    pub transition_in_ms: f64,
     /// Durée de noir silencieux à insérer AVANT ce segment (trou de la timeline).
     #[serde(default)]
     pub gap_before_ms: f64,
@@ -454,6 +511,7 @@ pub struct ExportSegment {
 pub struct ExportSource {
     pub path: String,
     pub has_audio: bool,
+    pub duration_ms: f64,
 }
 
 #[derive(Deserialize)]
@@ -501,12 +559,14 @@ pub fn data_root(app: &AppHandle) -> Result<PathBuf, String> {
         .path()
         .app_data_dir()
         .map_err(|e| format!("Dossier de données introuvable : {e}"))?;
-    fs::create_dir_all(&root).map_err(|e| format!("Création du dossier de données impossible : {e}"))?;
+    fs::create_dir_all(&root)
+        .map_err(|e| format!("Création du dossier de données impossible : {e}"))?;
     Ok(root)
 }
 
 fn ensure_dir(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|e| format!("Création de dossier impossible ({}) : {e}", path.display()))
+    fs::create_dir_all(path)
+        .map_err(|e| format!("Création de dossier impossible ({}) : {e}", path.display()))
 }
 
 // --- Utilitaires process -------------------------------------------------------
@@ -627,7 +687,8 @@ fn run_ffmpeg_with_progress(
 /// instantané même sur un rush de plusieurs Go.
 fn quick_fingerprint(path: &Path) -> Result<String, String> {
     const BLOCK: usize = 4 * 1024 * 1024;
-    let mut file = fs::File::open(path).map_err(|e| format!("Lecture du fichier impossible : {e}"))?;
+    let mut file =
+        fs::File::open(path).map_err(|e| format!("Lecture du fichier impossible : {e}"))?;
     let size = file
         .metadata()
         .map_err(|e| format!("Métadonnées illisibles : {e}"))?
@@ -637,13 +698,17 @@ fn quick_fingerprint(path: &Path) -> Result<String, String> {
     hasher.update(size.to_le_bytes());
 
     let mut buffer = vec![0u8; BLOCK];
-    let read = file.read(&mut buffer).map_err(|e| format!("Lecture : {e}"))?;
+    let read = file
+        .read(&mut buffer)
+        .map_err(|e| format!("Lecture : {e}"))?;
     hasher.update(&buffer[..read]);
 
     if size > (BLOCK as u64) * 2 {
         file.seek(SeekFrom::End(-(BLOCK as i64)))
             .map_err(|e| format!("Lecture : {e}"))?;
-        let read = file.read(&mut buffer).map_err(|e| format!("Lecture : {e}"))?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| format!("Lecture : {e}"))?;
         hasher.update(&buffer[..read]);
     }
 
@@ -657,8 +722,10 @@ fn quick_fingerprint(path: &Path) -> Result<String, String> {
 fn probe_file(path: &Path) -> Result<ProbeInfo, String> {
     let output = base_command(MediaTool::Ffprobe)
         .args([
-            "-v", "error",
-            "-print_format", "json",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
             "-show_format",
             "-show_streams",
         ])
@@ -700,7 +767,10 @@ fn probe_file(path: &Path) -> Result<ProbeInfo, String> {
         height: video["height"].as_u64().unwrap_or(0) as u32,
         fps,
         has_audio,
-        video_codec: video["codec_name"].as_str().unwrap_or("inconnu").to_string(),
+        video_codec: video["codec_name"]
+            .as_str()
+            .unwrap_or("inconnu")
+            .to_string(),
     })
 }
 
@@ -759,9 +829,8 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
     if !proxy_path.is_file() {
         let partial = proxies_dir.join(format!("{id}.partial.mp4"));
         let _ = fs::remove_file(&partial);
-        let mut args: Vec<String> = str_args(&[
-            "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-        ]);
+        let mut args: Vec<String> =
+            str_args(&["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
         args.push("-i".into());
         args.push(source.to_str().ok_or("Chemin source invalide.")?.into());
         args.extend(str_args(&["-map", "0:v:0", "-map", "0:a:0?", "-vf"]));
@@ -775,11 +844,19 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
         args.push("-keyint_min".into());
         args.push(PROXY_GOP.to_string());
         args.extend(str_args(&[
-            "-sc_threshold", "0",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            "-progress", "pipe:1", "-nostats",
+            "-sc_threshold",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            "-progress",
+            "pipe:1",
+            "-nostats",
         ]));
         args.push(partial.to_str().ok_or("Chemin proxy invalide.")?.into());
 
@@ -808,7 +885,8 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
                 )
             })?;
         }
-        fs::rename(&partial, &proxy_path).map_err(|e| format!("Finalisation du proxy impossible : {e}"))?;
+        fs::rename(&partial, &proxy_path)
+            .map_err(|e| format!("Finalisation du proxy impossible : {e}"))?;
     }
     emit_import(app, "thumbs", 72.0);
 
@@ -829,7 +907,8 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
     } else {
         ensure_dir(&thumbs_dir)?;
         let pattern = thumbs_dir.join("%05d.jpg");
-        let mut args: Vec<String> = str_args(&["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
+        let mut args: Vec<String> =
+            str_args(&["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
         args.push("-i".into());
         args.push(proxy_path.to_str().ok_or("Chemin proxy invalide.")?.into());
         args.extend(str_args(&["-an", "-sn"]));
@@ -857,7 +936,8 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
         let waveform = waveforms_dir.join(format!("{id}-w{WAVEFORM_VERSION}.png"));
         if !waveform.is_file() {
             let width = ((probe.duration_ms / 1000.0 * 30.0) as u32).clamp(900, 24000);
-            let mut args: Vec<String> = str_args(&["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
+            let mut args: Vec<String> =
+                str_args(&["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
             args.push("-i".into());
             args.push(proxy_path.to_str().ok_or("Chemin proxy invalide.")?.into());
             args.push("-filter_complex".into());
@@ -934,8 +1014,8 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     // Les DEUX plans sont validés : le plan audio finit lui aussi dans le graphe
     // FFmpeg, le laisser passer sans contrôle reviendrait à faire confiance à
     // l'appelant pour construire une commande.
-    validate_segments(&request.segments, request.sources.len())?;
-    validate_segments(&request.audio_segments, request.sources.len())?;
+    validate_segments(&request.segments, &request.sources)?;
+    validate_segments(&request.audio_segments, &request.sources)?;
     if !request.frame_fps.is_finite() || request.frame_fps <= 0.0 || request.frame_fps > 480.0 {
         return Err("Cadence de sortie invalide.".into());
     }
@@ -949,7 +1029,9 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '_' || c == '-');
     if !name_ok {
-        return Err("Nom de fichier invalide (lettres, chiffres, espaces, - et _ uniquement).".into());
+        return Err(
+            "Nom de fichier invalide (lettres, chiffres, espaces, - et _ uniquement).".into(),
+        );
     }
     for source in &request.sources {
         if !PathBuf::from(&source.path).is_file() {
@@ -974,7 +1056,8 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     // Les entrées lavfi (noir, silence) ne sont ajoutées que si un trou existe.
     // Les deux plans sont assemblés séparément puis mappés ensemble : l'image
     // vient du plan vidéo, le son du plan audio.
-    let timeline_ms = |s: &ExportSegment| (s.src_out_ms - s.src_in_ms) / s.playback_rate + s.gap_before_ms;
+    let timeline_ms =
+        |s: &ExportSegment| (s.src_out_ms - s.src_in_ms) / s.playback_rate + s.gap_before_ms;
     let total_video_ms: f64 = request.segments.iter().map(timeline_ms).sum();
     let total_audio_ms: f64 = request.audio_segments.iter().map(timeline_ms).sum();
     validate_text_overlays(&request.text_overlays, total_video_ms)?;
@@ -995,10 +1078,7 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
 
     let mut temporary_text_files = TemporaryTextFiles(Vec::new());
     for (index, overlay) in request.text_overlays.iter().enumerate() {
-        let path = exports_dir.join(format!(
-            ".title-{}-{index}.txt",
-            std::process::id()
-        ));
+        let path = exports_dir.join(format!(".title-{}-{index}.txt", std::process::id()));
         fs::write(&path, overlay.text.as_bytes())
             .map_err(|e| format!("Écriture du titre temporaire impossible : {e}"))?;
         temporary_text_files.0.push(path);
@@ -1032,15 +1112,18 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     // qu'un rush a une autre cadence. Sans lui, chaque branche sort avec sa
     // propre cadence et la durée d'un segment accéléré dérive de quelques
     // images ; avec lui, elle vaut exactement durée_timeline × cadence.
+    // `xfade` exige aussi la même base de temps sur ses deux entrées : `settb`
+    // évite un échec d'export lorsque deux proxys n'ont pas le même timebase.
     let ffps = request.frame_fps;
-    let vtail = format!("setsar=1,format=yuv420p,fps={ffps:.6}");
+    let vtail = format!("setsar=1,format=yuv420p,fps={ffps:.6},settb=AVTB");
     const AFMT: &str = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo";
     let mut graph = String::new();
 
     // --- Branche vidéo : uniquement le plan vidéo -------------------------------
-    let mut parts: Vec<usize> = Vec::new();
+    // label, duration in seconds, overlap with the previous part.
+    let mut parts: Vec<(usize, f64, f64)> = Vec::new();
     let mut next_label = 0usize;
-    for segment in &request.segments {
+    for (segment_index, segment) in request.segments.iter().enumerate() {
         if segment.gap_before_ms > 0.0 {
             let duration = segment.gap_before_ms / 1000.0;
             let i = next_label;
@@ -1048,16 +1131,22 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
             graph += &format!(
                 "[{black_input}:v]trim=duration={duration:.3},setpts=PTS-STARTPTS,{vtail}[v{i}];"
             );
-            parts.push(i);
+            parts.push((i, duration, 0.0));
             next_label += 1;
         }
-        let start = segment.src_in_ms / 1000.0;
-        let end = segment.src_out_ms / 1000.0;
+        let prefix_ms = segment.transition_in_ms / 2.0;
+        let suffix_ms = request
+            .segments
+            .get(segment_index + 1)
+            .map(|next| next.transition_in_ms / 2.0)
+            .unwrap_or(0.0);
+        let start = (segment.src_in_ms - prefix_ms * segment.playback_rate) / 1000.0;
+        let end = (segment.src_out_ms + suffix_ms * segment.playback_rate) / 1000.0;
         let input = segment.source_index;
         let rate = segment.playback_rate;
         let i = next_label;
         // setpts=PTS/rate : accélérer revient à rapprocher les horodatages.
-        let fade_filter = video_fade_filter(segment);
+        let fade_filter = video_fade_filter(segment, prefix_ms);
         if fade_filter.is_empty() {
             graph += &format!(
                 "[{input}:v]trim=start={start:.3}:end={end:.3},\
@@ -1065,10 +1154,13 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
             );
         } else {
             let offset = segment.video_fade_offset_ms / 1000.0;
-            let duration = (segment.src_out_ms - segment.src_in_ms) / rate / 1000.0;
+            let duration = (segment.src_out_ms - segment.src_in_ms) / rate / 1000.0
+                + (prefix_ms + suffix_ms) / 1000.0;
             let clip_start =
-                (segment.src_in_ms - segment.video_fade_offset_ms * rate) / 1000.0;
-            let clip_end = clip_start + segment.video_clip_duration_ms * rate / 1000.0;
+                (segment.src_in_ms - segment.video_fade_offset_ms * rate - prefix_ms * rate)
+                    / 1000.0;
+            let clip_end = clip_start
+                + (segment.video_clip_duration_ms + prefix_ms + suffix_ms) * rate / 1000.0;
             let extract_end = offset + duration;
             graph += &format!(
                 "[{input}:v]trim=start={clip_start:.6}:end={clip_end:.6},\
@@ -1078,7 +1170,9 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
             );
         }
         graph += &framing_chain(&request.mode, segment.crop_x, i, &vtail);
-        parts.push(i);
+        let part_duration = (segment.src_out_ms - segment.src_in_ms) / rate / 1000.0
+            + (prefix_ms + suffix_ms) / 1000.0;
+        parts.push((i, part_duration, segment.transition_in_ms / 1000.0));
         next_label += 1;
     }
 
@@ -1096,7 +1190,11 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         };
         for segment in &request.audio_segments {
             if segment.gap_before_ms > 0.0 {
-                audio_parts.push(push_silence(&mut graph, segment.gap_before_ms / 1000.0, &mut next_audio));
+                audio_parts.push(push_silence(
+                    &mut graph,
+                    segment.gap_before_ms / 1000.0,
+                    &mut next_audio,
+                ));
             }
             let start = segment.src_in_ms / 1000.0;
             let end = segment.src_out_ms / 1000.0;
@@ -1112,26 +1210,28 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
                 next_audio += 1;
             } else {
                 // Rush muet : le silence est déjà à la bonne durée de timeline.
-                let duration = (segment.src_out_ms - segment.src_in_ms) / segment.playback_rate / 1000.0;
+                let duration =
+                    (segment.src_out_ms - segment.src_in_ms) / segment.playback_rate / 1000.0;
                 audio_parts.push(push_silence(&mut graph, duration, &mut next_audio));
             }
         }
         // Le plan audio peut s'arrêter avant l'image : on complète au silence.
         if audio_tail_ms > 1.0 {
-            audio_parts.push(push_silence(&mut graph, audio_tail_ms / 1000.0, &mut next_audio));
+            audio_parts.push(push_silence(
+                &mut graph,
+                audio_tail_ms / 1000.0,
+                &mut next_audio,
+            ));
         }
     }
 
     let n = parts.len();
     if n > MAX_SEGMENTS {
-        return Err(format!("Trop de segments à assembler ({MAX_SEGMENTS} maximum)."));
+        return Err(format!(
+            "Trop de segments à assembler ({MAX_SEGMENTS} maximum)."
+        ));
     }
-    for i in &parts {
-        graph += &format!("[v{i}]");
-    }
-    // Les segments sont déjà cadrés et normalisés : la concaténation produit
-    // directement l'image finale.
-    graph += &format!("concat=n={n}:v=1:a=0[vbase];");
+    assemble_video_parts(&mut graph, &parts)?;
 
     let mut video_output_label = "vbase".to_string();
     for (index, overlay) in request.text_overlays.iter().enumerate() {
@@ -1151,7 +1251,9 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     if request.has_audio {
         let m = audio_parts.len();
         if m > MAX_SEGMENTS {
-            return Err(format!("Trop de segments sonores ({MAX_SEGMENTS} maximum)."));
+            return Err(format!(
+                "Trop de segments sonores ({MAX_SEGMENTS} maximum)."
+            ));
         }
         for i in &audio_parts {
             graph += &format!("[a{i}]");
@@ -1168,9 +1270,7 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     let partial = exports_dir.join(format!(".partial-{}.mp4", std::process::id()));
     let _ = fs::remove_file(&partial);
 
-    let mut args: Vec<String> = str_args(&[
-        "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-    ]);
+    let mut args: Vec<String> = str_args(&["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
     // Les rushs d'abord, dans l'ordre exact référencé par les segments.
     for source in &request.sources {
         args.extend(["-i".into(), source.path.clone()]);
@@ -1178,20 +1278,25 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     if has_gap {
         let fps = request.frame_fps;
         args.extend([
-            "-f".into(), "lavfi".into(),
+            "-f".into(),
+            "lavfi".into(),
             "-i".into(),
             format!("color=c=black:s={OUT_WIDTH}x{OUT_HEIGHT}:r={fps:.3}"),
         ]);
     }
     if needs_silence {
         args.extend([
-            "-f".into(), "lavfi".into(),
-            "-i".into(), "anullsrc=channel_layout=stereo:sample_rate=48000".into(),
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            "anullsrc=channel_layout=stereo:sample_rate=48000".into(),
         ]);
     }
     args.extend([
-        "-filter_complex".into(), graph,
-        "-map".into(), format!("[{video_output_label}]"),
+        "-filter_complex".into(),
+        graph,
+        "-map".into(),
+        format!("[{video_output_label}]"),
     ]);
     if request.has_audio {
         args.extend(["-map".into(), "[ac]".into()]);
@@ -1205,14 +1310,25 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
     }
     args.extend([
-        "-movflags".into(), "+faststart".into(),
-        "-f".into(), "mp4".into(),
-        "-progress".into(), "pipe:1".into(), "-nostats".into(),
+        "-movflags".into(),
+        "+faststart".into(),
+        "-f".into(),
+        "mp4".into(),
+        "-progress".into(),
+        "pipe:1".into(),
+        "-nostats".into(),
         partial.to_string_lossy().to_string(),
     ]);
 
     let emit = |percent: f64, done: bool, output_path: Option<String>| {
-        let _ = app.emit("export://progress", ExportProgress { percent, done, output_path });
+        let _ = app.emit(
+            "export://progress",
+            ExportProgress {
+                percent,
+                done,
+                output_path,
+            },
+        );
     };
 
     emit(0.0, false, None);
@@ -1239,7 +1355,8 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         )?;
     }
 
-    fs::rename(&partial, &output).map_err(|e| format!("Finalisation de l'export impossible : {e}"))?;
+    fs::rename(&partial, &output)
+        .map_err(|e| format!("Finalisation de l'export impossible : {e}"))?;
     let output_str = output.to_string_lossy().to_string();
     emit(100.0, true, Some(output_str.clone()));
     Ok(output_str)
@@ -1253,7 +1370,10 @@ pub async fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
     let dir = if target.is_dir() {
         target
     } else {
-        target.parent().map(Path::to_path_buf).ok_or("Chemin invalide.")?
+        target
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or("Chemin invalide.")?
     };
     app.shell()
         .open(dir.to_string_lossy().to_string(), None)
@@ -1279,13 +1399,18 @@ mod tests {
             video_fade_out_ms: 0.0,
             video_fade_offset_ms: 0.0,
             video_clip_duration_ms: 1000.0,
+            transition_in_ms: 0.0,
             crop_x: 0.0,
             gap_before_ms,
         }
     }
 
     fn sonore() -> Vec<ExportSource> {
-        vec![ExportSource { path: "a.mp4".into(), has_audio: true }]
+        vec![ExportSource {
+            path: "a.mp4".into(),
+            has_audio: true,
+            duration_ms: 10_000.0,
+        }]
     }
 
     fn titre() -> ExportTextOverlay {
@@ -1320,7 +1445,11 @@ mod tests {
 
     #[test]
     fn un_rush_muet_reclame_du_silence() {
-        let muet = vec![ExportSource { path: "b.mp4".into(), has_audio: false }];
+        let muet = vec![ExportSource {
+            path: "b.mp4".into(),
+            has_audio: false,
+            duration_ms: 10_000.0,
+        }];
         assert!(needs_silence_input(true, &[segment(0.0)], 0.0, &muet));
     }
 
@@ -1335,14 +1464,23 @@ mod tests {
 
     #[test]
     fn les_deux_plans_sont_validés() {
-        assert!(validate_segments(&[segment(0.0)], 1).is_ok());
+        assert!(validate_segments(&[segment(0.0)], &sonore()).is_ok());
 
-        let hors_bornes = ExportSegment { playback_rate: 12.0, ..segment(0.0) };
-        assert!(validate_segments(&[hors_bornes], 1).is_err(), "vitesse aberrante refusée");
-
-        let volume_hors_bornes = ExportSegment { volume: 1.01, ..segment(0.0) };
+        let hors_bornes = ExportSegment {
+            playback_rate: 12.0,
+            ..segment(0.0)
+        };
         assert!(
-            validate_segments(&[volume_hors_bornes], 1).is_err(),
+            validate_segments(&[hors_bornes], &sonore()).is_err(),
+            "vitesse aberrante refusée"
+        );
+
+        let volume_hors_bornes = ExportSegment {
+            volume: 1.01,
+            ..segment(0.0)
+        };
+        assert!(
+            validate_segments(&[volume_hors_bornes], &sonore()).is_err(),
             "volume supérieur au niveau original refusé"
         );
 
@@ -1351,7 +1489,7 @@ mod tests {
             ..segment(0.0)
         };
         assert!(
-            validate_segments(&[fondu_hors_bornes], 1).is_err(),
+            validate_segments(&[fondu_hors_bornes], &sonore()).is_err(),
             "un fondu supérieur à la moitié du clip est refusé"
         );
         let fondu_video_hors_bornes = ExportSegment {
@@ -1359,15 +1497,93 @@ mod tests {
             ..segment(0.0)
         };
         assert!(
-            validate_segments(&[fondu_video_hors_bornes], 1).is_err(),
+            validate_segments(&[fondu_video_hors_bornes], &sonore()).is_err(),
             "un fondu vidéo supérieur à la moitié du clip est refusé"
         );
 
-        let rush_inconnu = ExportSegment { source_index: 7, ..segment(0.0) };
-        assert!(validate_segments(&[rush_inconnu], 1).is_err(), "rush inexistant refusé");
+        let rush_inconnu = ExportSegment {
+            source_index: 7,
+            ..segment(0.0)
+        };
+        assert!(
+            validate_segments(&[rush_inconnu], &sonore()).is_err(),
+            "rush inexistant refusé"
+        );
 
-        let bornes_folles = ExportSegment { src_out_ms: 0.0, ..segment(0.0) };
-        assert!(validate_segments(&[bornes_folles], 1).is_err(), "durée nulle refusée");
+        let bornes_folles = ExportSegment {
+            src_out_ms: 0.0,
+            ..segment(0.0)
+        };
+        assert!(
+            validate_segments(&[bornes_folles], &sonore()).is_err(),
+            "durée nulle refusée"
+        );
+
+        let outgoing = ExportSegment {
+            src_in_ms: 1000.0,
+            src_out_ms: 5000.0,
+            ..segment(0.0)
+        };
+        let incoming = ExportSegment {
+            src_in_ms: 2000.0,
+            src_out_ms: 6000.0,
+            transition_in_ms: 1000.0,
+            ..segment(0.0)
+        };
+        assert!(
+            validate_segments(&[outgoing, incoming], &sonore()).is_ok(),
+            "des poignées suffisantes autorisent le fondu enchaîné"
+        );
+        let incoming_sans_poignee = ExportSegment {
+            src_in_ms: 0.0,
+            src_out_ms: 4000.0,
+            transition_in_ms: 1000.0,
+            ..segment(0.0)
+        };
+        assert!(
+            validate_segments(&[segment(0.0), incoming_sans_poignee], &sonore()).is_err(),
+            "une transition sans poignée entrante est refusée"
+        );
+
+        let transition_trop_longue = ExportSegment {
+            src_in_ms: 2000.0,
+            src_out_ms: 2500.0,
+            transition_in_ms: 1000.0,
+            ..segment(0.0)
+        };
+        let plan_precedent = ExportSegment {
+            src_in_ms: 1000.0,
+            src_out_ms: 5000.0,
+            ..segment(0.0)
+        };
+        assert!(
+            validate_segments(&[plan_precedent, transition_trop_longue], &sonore()).is_err(),
+            "une transition plus longue que le plan entrant est refusée"
+        );
+
+        let duree_source_invalide = vec![ExportSource {
+            path: "a.mp4".into(),
+            has_audio: true,
+            duration_ms: f64::NAN,
+        }];
+        assert!(
+            validate_segments(&[segment(0.0)], &duree_source_invalide).is_err(),
+            "une durée source non numérique est refusée"
+        );
+    }
+
+    #[test]
+    fn le_graphe_enchaine_concat_et_xfade_sans_decaler_la_suite() {
+        let mut graph = String::new();
+        let label =
+            assemble_video_parts(&mut graph, &[(0, 4.5, 0.0), (1, 5.0, 1.0), (2, 2.0, 0.0)])
+                .expect("assemblage vidéo");
+        assert_eq!(label, "vbase");
+        assert_eq!(
+            graph,
+            "[v0][v1]xfade=transition=fade:duration=1.000000:offset=3.500000[vmix1];\
+[vmix1][v2]concat=n=2:v=1:a=0[vmix2];[vmix2]null[vbase];"
+        );
     }
 
     #[test]
@@ -1381,8 +1597,8 @@ mod tests {
             ..segment(0.0)
         };
         assert_eq!(
-            video_fade_filter(&interrupted),
-            "fade=t=in:st=0:d=1.000000:color=black"
+            video_fade_filter(&interrupted, 0.0),
+            "fade=t=in:st=0.000000:d=1.000000:color=black"
         );
 
         let exit = ExportSegment {
@@ -1394,7 +1610,7 @@ mod tests {
             ..segment(0.0)
         };
         assert_eq!(
-            video_fade_filter(&exit),
+            video_fade_filter(&exit, 0.0),
             "fade=t=out:st=8.000000:d=2.000000:color=black"
         );
     }

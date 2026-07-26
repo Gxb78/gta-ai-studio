@@ -1388,6 +1388,13 @@ const ClipView = memo(function ClipView(props: {
           aria-hidden="true"
         />
       )}
+      {clip.transitionInMs > 0 && (
+        <span
+          className="clip-transition-in"
+          style={{ width: Math.max(3, (clip.transitionInMs / 2) * pxPerMs) }}
+          title={`Fondu enchaîné ${(clip.transitionInMs / 1000).toFixed(2)} s`}
+        />
+      )}
       <span className="clip-duration">{formatTime(clipDurationMs(clip))}</span>
       {clip.playbackRate !== 1 && (
         <span className="clip-rate" title={`Vitesse ${clip.playbackRate}×`}>

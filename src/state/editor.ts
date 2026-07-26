@@ -19,6 +19,7 @@ import {
   applyRate,
   clampAudioFadeMs,
   clampVideoFadeMs,
+  clampTransitionMs,
   clampCropX,
   clampVolume,
   applyTrim,
@@ -94,6 +95,7 @@ const clampClipFades = (clip: Clip): Clip => {
     audioFadeOutMs: clampAudioFadeMs(clip.audioFadeOutMs, durationMs),
     videoFadeInMs: clampVideoFadeMs(clip.videoFadeInMs, durationMs),
     videoFadeOutMs: clampVideoFadeMs(clip.videoFadeOutMs, durationMs),
+    transitionInMs: clampTransitionMs(clip.transitionInMs, durationMs),
   };
 };
 
@@ -129,6 +131,7 @@ export type EditorAction =
       side: "in" | "out" | "both";
       fadeMs: number;
     }
+  | { type: "SET_CLIP_TRANSITION_IN"; clipId: string; durationMs: number }
   | { type: "TOGGLE_TRACK_HIDDEN"; track: number }
   | { type: "TOGGLE_TRACK_LOCKED"; track: number }
   /** Son de tous les clips d'une piste, d'un coup (bouton M de l'en-tête). */
@@ -301,6 +304,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         audioFadeOutMs: 0,
         videoFadeInMs: 0,
         videoFadeOutMs: 0,
+        transitionInMs: 0,
         playbackRate: 1,
       };
       // Piste imposée (dépôt à la souris) : les clips déjà présents s'écartent,
@@ -417,6 +421,19 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         state,
         state.clips.map((clip) =>
           clip.id === action.clipId ? { ...clip, [key]: fadeMs } : clip,
+        ),
+      );
+    }
+
+    case "SET_CLIP_TRANSITION_IN": {
+      const target = state.clips.find((clip) => clip.id === action.clipId);
+      if (!target) return state;
+      const durationMs = clampTransitionMs(action.durationMs, clipDurationMs(target));
+      if (target.transitionInMs === durationMs) return state;
+      return pushHistory(
+        state,
+        state.clips.map((clip) =>
+          clip.id === action.clipId ? { ...clip, transitionInMs: durationMs } : clip,
         ),
       );
     }
@@ -581,6 +598,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
           clip.videoFadeOutMs,
           (clip.srcOutMs - cutSrc) / clip.playbackRate,
         ),
+        transitionInMs: 0,
         playbackRate: clip.playbackRate,
       };
       const next = state.clips.map((c) => (c.id === clip.id ? left : c));

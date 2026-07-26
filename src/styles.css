@@ -283,16 +283,64 @@ input:focus { border-color: var(--accent); }
 .text-time-grid label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 11px; }
 .text-time-grid input { width: 100%; }
 
-.inspector-section { display: flex; flex-direction: column; gap: 9px; align-items: flex-start; }
-.inspector-section h3 {
+/* Sections repliables : un filet les s?pare, le titre est cliquable sur toute
+   sa largeur. Pas de cadre par section ? une pile de bo?tes dans une bo?te est
+   exactement le bruit visuel que l'inspecteur doit ?viter. */
+.inspector-section {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  margin-top: -4px;
+}
+.inspector-section:first-of-type { border-top: none; margin-top: 0; }
+
+.section-head {
+  width: 100%;
+  height: 34px;
+  padding: 0 2px;
+  gap: 7px;
+  justify-content: flex-start;
+  background: transparent;
+  border-color: transparent;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+}
+.section-head:hover:not(:disabled) { background: transparent; border-color: transparent; color: var(--text); }
+.section-head h3 {
   margin: 0;
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.8px;
-  color: var(--muted);
-  font-weight: 600;
+  font-weight: 650;
+  color: inherit;
 }
-.inspector-section .option-grid { width: 100%; }
+/* Une seule ic?ne pour les deux ?tats : ferm?e elle pointe ? droite. */
+.section-head .icon { transition: transform 130ms var(--ease); transform: rotate(-90deg); }
+.inspector-section.open .section-head .icon { transform: none; }
+.section-note {
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+/* Repli?e, la section montre sa valeur : replier ne doit jamais cacher l'?tat. */
+.section-summary {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 46%;
+}
+.section-body {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 2px 2px 12px;
+}
+.section-body .option-grid { width: 100%; }
 
 .prop-list {
   margin: 0;
@@ -1198,6 +1246,16 @@ body.moving, body.moving * { cursor: grabbing !important; }
   top: 4px;
   transform: translateX(-50%);
   display: flex;
+.clip-transition-in {
+  position: absolute;
+  inset: 0 auto 0 0;
+  max-width: 50%;
+  z-index: 2;
+  pointer-events: none;
+  background:
+    linear-gradient(135deg, rgba(103, 232, 249, 0.48) 0 2px, transparent 2px 7px);
+  border-right: 1px solid rgba(103, 232, 249, 0.9);
+}
   gap: 6px;
   align-items: baseline;
   background: var(--accent);

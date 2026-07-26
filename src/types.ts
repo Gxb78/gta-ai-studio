@@ -92,6 +92,11 @@ export interface Clip {
   videoFadeInMs: number;
   videoFadeOutMs: number;
   /**
+   * Fondu enchaîné demandé à l'entrée du clip. La durée effective est bornée
+   * par les poignées source disponibles de part et d'autre de la coupe.
+   */
+  transitionInMs: number;
+  /**
    * Vitesse de lecture constante. 1 = temps réel, 2 = deux fois plus rapide.
    *
    * `srcInMs`/`srcOutMs` restent exprimés dans le temps du RUSH ; la vitesse ne
@@ -107,6 +112,7 @@ export const MIN_VOLUME = 0;
 export const MAX_VOLUME = 1;
 export const MAX_AUDIO_FADE_MS = 10_000;
 export const MAX_VIDEO_FADE_MS = 3_000;
+export const MAX_TRANSITION_MS = 3_000;
 
 export const clampRate = (rate: number): number =>
   Number.isFinite(rate) && rate > 0 ? Math.min(MAX_RATE, Math.max(MIN_RATE, rate)) : 1;
@@ -122,6 +128,11 @@ export const clampAudioFadeMs = (fadeMs: number, durationMs: number): number => 
 export const clampVideoFadeMs = (fadeMs: number, durationMs: number): number => {
   if (!Number.isFinite(fadeMs) || fadeMs <= 0) return 0;
   return Math.min(fadeMs, MAX_VIDEO_FADE_MS, Math.max(0, durationMs / 2));
+};
+
+export const clampTransitionMs = (transitionMs: number, durationMs: number): number => {
+  if (!Number.isFinite(transitionMs) || transitionMs <= 0) return 0;
+  return Math.min(transitionMs, MAX_TRANSITION_MS, Math.max(0, durationMs));
 };
 
 /** Gain d'enveloppe à un instant absolu de la timeline. */
@@ -239,6 +250,7 @@ export function flattenTracks(
       audioFadeOutMs: top.audioFadeOutMs,
       videoFadeInMs: top.videoFadeInMs,
       videoFadeOutMs: top.videoFadeOutMs,
+      transitionInMs: top.transitionInMs,
       playbackRate: top.playbackRate,
     };
 
@@ -257,6 +269,7 @@ export function flattenTracks(
       previous.cropX === segment.cropX &&
       previous.videoFadeInMs === segment.videoFadeInMs &&
       previous.videoFadeOutMs === segment.videoFadeOutMs &&
+      previous.transitionInMs === segment.transitionInMs &&
       ((previous.videoFadeInMs === 0 && previous.videoFadeOutMs === 0) ||
         previous.id.split("@", 1)[0] === segment.id.split("@", 1)[0]);
     if (
@@ -349,7 +362,7 @@ export function normalizeTextOverlay(
 }
 
 export interface Project {
-  version: 7;
+  version: 8;
   id: string;
   name: string;
   /** Rushs du projet, indexés par leur empreinte. */
@@ -393,6 +406,7 @@ export function usedSources(sources: Record<string, SourceInfo>, clips: Clip[]):
 export interface ExportSource {
   path: string;
   hasAudio: boolean;
+  durationMs: number;
 }
 
 export interface ExportSegment {
@@ -418,6 +432,8 @@ export interface ExportSegment {
   videoFadeOutMs: number;
   videoFadeOffsetMs: number;
   videoClipDurationMs: number;
+  /** Fondu enchaîné effectif avec le segment vidéo précédent. */
+  transitionInMs: number;
 }
 
 export interface ExportRequest {
@@ -720,6 +736,7 @@ export type StoredClip = Omit<
   | "audioFadeOutMs"
   | "videoFadeInMs"
   | "videoFadeOutMs"
+  | "transitionInMs"
   | "cropX"
   | "playbackRate"
 > & {
@@ -732,6 +749,7 @@ export type StoredClip = Omit<
   audioFadeOutMs?: number | null;
   videoFadeInMs?: number | null;
   videoFadeOutMs?: number | null;
+  transitionInMs?: number | null;
   playbackRate?: number | null;
   cropX?: number | null;
 };
@@ -799,6 +817,7 @@ export function migrateProject(stored: StoredProject): Project {
       // Projets antérieurs aux fondus vidéo : image entièrement opaque.
       videoFadeInMs: clampVideoFadeMs(clip.videoFadeInMs ?? 0, durationMs),
       videoFadeOutMs: clampVideoFadeMs(clip.videoFadeOutMs ?? 0, durationMs),
+      transitionInMs: clampTransitionMs(clip.transitionInMs ?? 0, durationMs),
       // Projets antérieurs à la vitesse par clip : temps réel.
       playbackRate,
       // Projets antérieurs au cadrage par clip : recadrage centré.
@@ -834,7 +853,7 @@ export function migrateProject(stored: StoredProject): Project {
     .filter((overlay) => overlay.timelineEndMs > overlay.timelineStartMs);
 
   return {
-    version: 7,
+    version: 8,
     id: stored.id,
     name: stored.name,
     sources,

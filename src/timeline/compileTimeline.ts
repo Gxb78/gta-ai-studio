@@ -1,5 +1,7 @@
-import type { Clip } from "../types";
+import type { Clip, SourceInfo } from "../types";
 import {
+  GAP_EPSILON_MS,
+  MAX_TRANSITION_MS,
   clipEndMs,
   resolveAudioPlan,
   resolveVideoPlan,
@@ -19,7 +21,51 @@ export interface CompiledSegment {
 
 export interface CompiledPlan {
   segments: CompiledSegment[];
+  transitions: CompiledTransition[];
   durationMs: number;
+}
+
+export interface CompiledTransition {
+  fromIndex: number;
+  toIndex: number;
+  boundaryMs: number;
+  startMs: number;
+  endMs: number;
+  durationMs: number;
+}
+
+export function transitionCapacityMs(
+  segments: readonly CompiledSegment[],
+  toIndex: number,
+  sources: Readonly<Record<string, SourceInfo>>,
+): number {
+  if (toIndex <= 0 || toIndex >= segments.length) return 0;
+  const from = segments[toIndex - 1];
+  const to = segments[toIndex];
+  if (
+    Math.abs(from.endMs - to.startMs) > GAP_EPSILON_MS ||
+    Math.abs(to.startMs - to.sourceClip.timelineStartMs) > GAP_EPSILON_MS ||
+    from.sourceClip.videoFadeOutMs > 0 ||
+    to.sourceClip.videoFadeInMs > 0
+  ) {
+    return 0;
+  }
+  const fromSource = sources[from.clip.sourceId];
+  const toSource = sources[to.clip.sourceId];
+  if (!fromSource || !toSource) return 0;
+  const outgoingHandleMs =
+    (fromSource.probe.durationMs - from.clip.srcOutMs) / from.clip.playbackRate;
+  const incomingHandleMs = to.clip.srcInMs / to.clip.playbackRate;
+  return Math.max(
+    0,
+    Math.min(
+      MAX_TRANSITION_MS,
+      from.endMs - from.startMs,
+      to.endMs - to.startMs,
+      outgoingHandleMs * 2,
+      incomingHandleMs * 2,
+    ),
+  );
 }
 
 export interface CompiledTimeline {
@@ -44,9 +90,14 @@ function sourceClipFor(segment: Clip, clips: readonly Clip[]): Clip {
   return match ?? segment;
 }
 
-function compilePlan(plan: Clip[], clips: readonly Clip[], durationMs: number): CompiledPlan {
-  return {
-    segments: plan.map((clip) => {
+function compilePlan(
+  plan: Clip[],
+  clips: readonly Clip[],
+  durationMs: number,
+  sources: Readonly<Record<string, SourceInfo>>,
+  withTransitions: boolean,
+): CompiledPlan {
+  const segments = plan.map((clip) => {
       const sourceClip = sourceClipFor(clip, clips);
       return {
         clip,
@@ -55,7 +106,40 @@ function compilePlan(plan: Clip[], clips: readonly Clip[], durationMs: number): 
         sourceClipId: sourceClip.id,
         sourceClip,
       };
-    }),
+    });
+  const transitions: CompiledTransition[] = [];
+  if (withTransitions) {
+    for (let toIndex = 1; toIndex < segments.length; toIndex++) {
+      const fromIndex = toIndex - 1;
+      const from = segments[fromIndex];
+      const to = segments[toIndex];
+      const requested = to.sourceClip.transitionInMs;
+      if (
+        requested <= 0 ||
+        Math.abs(from.endMs - to.startMs) > GAP_EPSILON_MS ||
+        Math.abs(to.startMs - to.sourceClip.timelineStartMs) > GAP_EPSILON_MS
+      ) {
+        continue;
+      }
+      const durationMs = Math.max(
+        0,
+        Math.min(requested, transitionCapacityMs(segments, toIndex, sources)),
+      );
+      if (durationMs <= GAP_EPSILON_MS) continue;
+      const boundaryMs = to.startMs;
+      transitions.push({
+        fromIndex,
+        toIndex,
+        boundaryMs,
+        startMs: boundaryMs - durationMs / 2,
+        endMs: boundaryMs + durationMs / 2,
+        durationMs,
+      });
+    }
+  }
+  return {
+    segments,
+    transitions,
     durationMs,
   };
 }
@@ -63,6 +147,7 @@ function compilePlan(plan: Clip[], clips: readonly Clip[], durationMs: number): 
 export function compileTimeline(
   clips: readonly Clip[],
   hiddenTracks: ReadonlySet<number>,
+  sources: Readonly<Record<string, SourceInfo>> = {},
 ): CompiledTimeline {
   const mutableClips = [...clips];
   const videoClips = resolveVideoPlan(mutableClips, hiddenTracks);
@@ -82,8 +167,8 @@ export function compileTimeline(
   }
 
   return {
-    video: compilePlan(videoClips, clips, durationMs),
-    audio: compilePlan(audioClips, clips, durationMs),
+    video: compilePlan(videoClips, clips, durationMs, sources, true),
+    audio: compilePlan(audioClips, clips, durationMs, sources, false),
     gaps: timelineGaps(videoClips),
     clipsByTrack,
     trackCount: countTracks(mutableClips),

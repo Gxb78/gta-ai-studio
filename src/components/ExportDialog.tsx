@@ -10,7 +10,11 @@ import type {
   SourceInfo,
   TextOverlay,
 } from "../types";
-import type { CompiledSegment, CompiledTimeline } from "../timeline/compileTimeline";
+import type {
+  CompiledSegment,
+  CompiledTimeline,
+  CompiledTransition,
+} from "../timeline/compileTimeline";
 import {
   OUTPUT_HEIGHT,
   OUTPUT_WIDTH,
@@ -29,11 +33,13 @@ function toSegments(
   compiledSegments: readonly CompiledSegment[],
   indexOf: Map<string, number>,
   audio: boolean,
+  transitions: readonly CompiledTransition[] = [],
 ): ExportSegment[] {
   let cursor = 0;
   const segments: ExportSegment[] = [];
   const sorted = [...compiledSegments].sort((a, b) => a.startMs - b.startMs);
-  for (const compiled of sorted) {
+  for (let segmentIndex = 0; segmentIndex < sorted.length; segmentIndex++) {
+    const compiled = sorted[segmentIndex];
     const { clip, sourceClip } = compiled;
     const index = indexOf.get(clip.sourceId);
     if (index === undefined) continue;
@@ -51,6 +57,9 @@ function toSegments(
       videoFadeOutMs: audio ? 0 : sourceClip.videoFadeOutMs,
       videoFadeOffsetMs: audio ? 0 : compiled.startMs - sourceClip.timelineStartMs,
       videoClipDurationMs: audio ? clipDurationMs(clip) : clipDurationMs(sourceClip),
+      transitionInMs: audio
+        ? 0
+        : transitions.find((transition) => transition.toIndex === segmentIndex)?.durationMs ?? 0,
       gapBeforeMs: Math.max(0, clip.timelineStartMs - cursor),
       cropX: clip.cropX,
     });
@@ -61,22 +70,32 @@ function toSegments(
 
 function buildRequest(
   sources: Record<string, SourceInfo>,
-  videoSegments: readonly CompiledSegment[],
-  audioPlanSegments: readonly CompiledSegment[],
+  compiledTimeline: CompiledTimeline,
 ): Pick<ExportRequest, "sources" | "segments" | "audioSegments" | "hasAudio" | "frameFps"> {
+  const videoSegments = compiledTimeline.video.segments;
+  const audioPlanSegments = compiledTimeline.audio.segments;
   // Les deux plans partagent la même liste de rushs : les index concordent.
   const clips = videoSegments.map((segment) => segment.clip);
   const audioClips = audioPlanSegments.map((segment) => segment.clip);
   const used = usedSources(sources, clips.concat(audioClips));
   const indexOf = new Map(used.map((source, index) => [source.id, index]));
-  const segments = toSegments(videoSegments, indexOf, false);
+  const segments = toSegments(
+    videoSegments,
+    indexOf,
+    false,
+    compiledTimeline.video.transitions,
+  );
   const audioSegments = toSegments(audioPlanSegments, indexOf, true);
 
   // La définition de sortie est imposée (1080×1920) et appliquée segment par
   // segment ; seule la cadence se cale sur le premier rush.
   const reference = used[0];
   return {
-    sources: used.map((source) => ({ path: source.originalPath, hasAudio: source.probe.hasAudio })),
+    sources: used.map((source) => ({
+      path: source.originalPath,
+      hasAudio: source.probe.hasAudio,
+      durationMs: source.probe.durationMs,
+    })),
     segments,
     audioSegments,
     // Un montage sans aucun clip sonore sort muet, plutôt que du silence encodé.
@@ -154,11 +173,7 @@ export function ExportDialog(props: Props) {
     setPercent(0);
     try {
       const path = await exportTimeline({
-        ...buildRequest(
-          sources,
-          compiledTimeline.video.segments,
-          compiledTimeline.audio.segments,
-        ),
+        ...buildRequest(sources, compiledTimeline),
         mode: framing,
         fileName: sanitized,
         textOverlays: textOverlays.filter((overlay) => overlay.text.trim().length > 0),

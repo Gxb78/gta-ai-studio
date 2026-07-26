@@ -15,7 +15,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { SourceInfo } from "../types";
 import { audioFadeGainAt, timelineTimeToSourceTime } from "../types";
 import { mediaUrl } from "../ipc";
-import type { CompiledSegment, CompiledTimeline } from "../timeline/compileTimeline";
+import type {
+  CompiledSegment,
+  CompiledTimeline,
+  CompiledTransition,
+} from "../timeline/compileTimeline";
 import { findNextSegmentIndex, findSegmentIndex } from "../timeline/compileTimeline";
 
 /** Marge de détection de fin de clip (ms) pour anticiper le saut. */
@@ -86,6 +90,8 @@ export interface PlaybackApi {
   /** Balise actuellement visible. L'autre précharge le clip suivant. */
   activeIsA: boolean;
   activeVideoClipId: string | null;
+  /** Clip entrant pendant un fondu enchaîné, sans mise à jour React par image. */
+  transitionVideoClipId: string | null;
   clock: PlaybackClock;
   play: () => void;
   pause: () => void;
@@ -176,6 +182,23 @@ function measurePresentedCut(video: HTMLVideoElement | null, startedAt: number):
   });
 }
 
+function setVideoMix(
+  outgoing: HTMLVideoElement,
+  incoming: HTMLVideoElement,
+  progress: number,
+): void {
+  const mix = Math.max(0, Math.min(1, progress));
+  outgoing.style.opacity = String(1 - mix);
+  incoming.style.opacity = String(mix);
+}
+
+function releaseVideoMix(outgoing: HTMLVideoElement, incoming: HTMLVideoElement): void {
+  requestAnimationFrame(() => {
+    outgoing.style.removeProperty("opacity");
+    incoming.style.removeProperty("opacity");
+  });
+}
+
 /**
  * Dérive du son par rapport à l'image, en trois zones.
  *
@@ -203,6 +226,7 @@ export function usePlayback(
   const [inGap, setInGap] = useState(false);
   const [activeIsA, setActiveIsA] = useState(true);
   const [activeVideoClipId, setActiveVideoClipId] = useState<string | null>(null);
+  const [transitionVideoClipId, setTransitionVideoClipId] = useState<string | null>(null);
 
   const activeIsARef = useRef(true);
   const rafRef = useRef<number | null>(null);
@@ -218,6 +242,16 @@ export function usePlayback(
     boundaryMs: number;
     startedAt: number;
   } | null>(null);
+  const activeTransitionRef = useRef<{
+    transition: CompiledTransition;
+    outgoing: HTMLVideoElement;
+    incoming: HTMLVideoElement;
+  } | null>(null);
+  const transitionWaitRef = useRef<{
+    transition: CompiledTransition;
+    startedAt: number;
+  } | null>(null);
+  const skippedTransitionsRef = useRef(new Set<string>());
 
   const compiledRef = useRef(compiledTimeline);
   compiledRef.current = compiledTimeline;
@@ -294,11 +328,22 @@ export function usePlayback(
       videoPrimeRef.current?.cancel();
       idle.pause();
       idle.playbackRate = upcoming.clip.playbackRate;
+      const upcomingIndex = compiledRef.current.video.segments.indexOf(upcoming);
+      const transition = compiledRef.current.video.transitions.find(
+        (candidate) => candidate.toIndex === upcomingIndex,
+      );
+      const transitionKey = transition
+        ? `${transition.fromIndex}:${transition.toIndex}:${transition.boundaryMs}`
+        : "";
+      const targetTimelineMs =
+        transition && !skippedTransitionsRef.current.has(transitionKey)
+          ? transition.startMs
+          : upcoming.startMs;
       videoPrimeRef.current = startMediaPrime(
         idle,
         upcoming.clip.id,
         source,
-        upcoming.clip.srcInMs,
+        timelineTimeToSourceTime(upcoming.clip, targetTimelineMs),
       );
     },
     [getIdle],
@@ -308,6 +353,40 @@ export function usePlayback(
   const applyPosition = useCallback(
     (timelineMs: number) => {
       const segments = compiledRef.current.video.segments;
+      const transition = compiledRef.current.video.transitions.find(
+        (candidate) => timelineMs >= candidate.startMs && timelineMs < candidate.endMs,
+      );
+      if (transition) {
+        const from = segments[transition.fromIndex];
+        const to = segments[transition.toIndex];
+        const active = getActive();
+        const idle = getIdle();
+        const fromSource = sourcesRef.current[from.clip.sourceId];
+        const toSource = sourcesRef.current[to.clip.sourceId];
+        if (active && idle && fromSource && toSource) {
+          currentVideoIndexRef.current = transition.fromIndex;
+          active.playbackRate = from.clip.playbackRate;
+          assign(active, fromSource, timelineTimeToSourceTime(from.clip, timelineMs));
+          videoPrimeRef.current?.cancel();
+          idle.pause();
+          idle.playbackRate = to.clip.playbackRate;
+          videoPrimeRef.current = startMediaPrime(
+            idle,
+            to.clip.id,
+            toSource,
+            timelineTimeToSourceTime(to.clip, timelineMs),
+          );
+          setVideoMix(
+            active,
+            idle,
+            (timelineMs - transition.startMs) / transition.durationMs,
+          );
+          setTransitionVideoClipId(to.sourceClipId);
+          setInGap(false);
+          setActiveVideoClipId(from.sourceClipId);
+          return transition.fromIndex;
+        }
+      }
       const index = findSegmentIndex(segments, timelineMs);
       currentVideoIndexRef.current = index;
       const active = getActive();
@@ -458,6 +537,21 @@ export function usePlayback(
   const seek = useCallback(
     (timelineMs: number) => {
       pendingCutRef.current = null;
+      transitionWaitRef.current = null;
+      const activeTransition = activeTransitionRef.current;
+      if (activeTransition) {
+        activeTransition.outgoing.pause();
+        activeTransition.incoming.pause();
+        activeTransition.outgoing.style.removeProperty("opacity");
+        activeTransition.incoming.style.removeProperty("opacity");
+      }
+      activeTransitionRef.current = null;
+      setTransitionVideoClipId(null);
+      videoA.current?.style.removeProperty("opacity");
+      videoB.current?.style.removeProperty("opacity");
+      skippedTransitionsRef.current.clear();
+      videoPrimeRef.current?.cancel();
+      videoPrimeRef.current = null;
       const clamped = Math.max(0, Math.min(timelineMs, compiledRef.current.video.durationMs));
       applyPosition(clamped);
       // Après un seek, le son est recalé d'autorité : aucune dérive à rattraper.
@@ -538,6 +632,86 @@ export function usePlayback(
       return;
     }
 
+    const transitionWait = transitionWaitRef.current;
+    if (transitionWait) {
+      const transition = transitionWait.transition;
+      const toSegment = segments[transition.toIndex];
+      const prime = videoPrimeRef.current;
+      const ready = Boolean(toSegment && prime?.clipId === toSegment.clip.id && prime.ready);
+      const decision = decideMediaPrime(ready, now - transitionWait.startedAt);
+      if (decision === "swap" && toSegment && prime) {
+        const outgoing = getActive();
+        const incoming = getIdle();
+        if (outgoing && incoming) {
+          transitionWaitRef.current = null;
+          prime.cancel();
+          videoPrimeRef.current = null;
+          activeTransitionRef.current = { transition, outgoing, incoming };
+          setTransitionVideoClipId(toSegment.sourceClipId);
+          setVideoMix(outgoing, incoming, 0);
+          void outgoing.play().catch(() => undefined);
+          void incoming.play().catch(() => undefined);
+          performance.measure("gta-transition-prime-wait", {
+            start: transitionWait.startedAt,
+            end: now,
+          });
+        }
+      } else if (decision === "fallback") {
+        const key = `${transition.fromIndex}:${transition.toIndex}:${transition.boundaryMs}`;
+        skippedTransitionsRef.current.add(key);
+        transitionWaitRef.current = null;
+        prime?.cancel();
+        videoPrimeRef.current = null;
+        ensurePrimed(toSegment);
+        void getActive()?.play().catch(() => undefined);
+        console.warn(
+          `[transition] Préchargement incomplet après ${MAX_CUT_HOLD_MS} ms, coupe franche conservée.`,
+        );
+      }
+      rafRef.current = requestAnimationFrame(loop);
+      return;
+    }
+
+    const activeTransition = activeTransitionRef.current;
+    if (activeTransition) {
+      const { transition, outgoing, incoming } = activeTransition;
+      const fromSegment = segments[transition.fromIndex];
+      const toSegment = segments[transition.toIndex];
+      if (!fromSegment || !toSegment) {
+        activeTransitionRef.current = null;
+        setTransitionVideoClipId(null);
+        releaseVideoMix(outgoing, incoming);
+      } else {
+        const timelineMs =
+          fromSegment.startMs +
+          (outgoing.currentTime * 1000 - fromSegment.clip.srcInMs) /
+            fromSegment.clip.playbackRate;
+        const progress = (timelineMs - transition.startMs) / transition.durationMs;
+        setVideoMix(outgoing, incoming, progress);
+        publishPlayhead(Math.min(transition.endMs, timelineMs));
+        if (timelineMs >= transition.endMs) {
+          activeTransitionRef.current = null;
+          currentVideoIndexRef.current = transition.toIndex;
+          publishPlayhead(transition.endMs);
+          swap();
+          outgoing.pause();
+          setVideoMix(outgoing, incoming, 1);
+          releaseVideoMix(outgoing, incoming);
+          setTransitionVideoClipId(null);
+          setInGap(false);
+          setActiveVideoClipId(toSegment.sourceClipId);
+          ensurePrimed(segments[transition.toIndex + 1]);
+          measurePresentedCut(incoming, now);
+        } else {
+          if (outgoing.paused) void outgoing.play().catch(() => undefined);
+          if (incoming.paused) void incoming.play().catch(() => undefined);
+        }
+        syncAudio(playheadRef.current, true);
+        rafRef.current = requestAnimationFrame(loop);
+        return;
+      }
+    }
+
     let index = currentVideoIndexRef.current;
     const indexed = segments[index];
     if (!indexed || playheadRef.current < indexed.startMs || playheadRef.current >= indexed.endMs) {
@@ -549,6 +723,26 @@ export function usePlayback(
     if (index !== -1 && active) {
       const clip = segments[index].clip;
       const sourceMs = active.currentTime * 1000;
+      const transition = compiledRef.current.video.transitions.find(
+        (candidate) => candidate.fromIndex === index,
+      );
+      const timelineMs =
+        segments[index].startMs +
+        (sourceMs - clip.srcInMs) / clip.playbackRate;
+      if (
+        transition &&
+        !skippedTransitionsRef.current.has(
+          `${transition.fromIndex}:${transition.toIndex}:${transition.boundaryMs}`,
+        ) &&
+        timelineMs >= transition.startMs - BOUNDARY_EPSILON_MS
+      ) {
+        active.pause();
+        publishPlayhead(Math.max(transition.startMs, timelineMs));
+        transitionWaitRef.current = { transition, startedAt: now };
+        syncAudio(playheadRef.current, false);
+        rafRef.current = requestAnimationFrame(loop);
+        return;
+      }
 
       if (sourceMs >= clip.srcOutMs - BOUNDARY_EPSILON_MS) {
         const boundaryMs = segments[index].endMs;
@@ -755,6 +949,7 @@ export function usePlayback(
     inGap,
     activeIsA,
     activeVideoClipId,
+    transitionVideoClipId,
     clock: clockControllerRef.current.clock,
     play,
     pause,
