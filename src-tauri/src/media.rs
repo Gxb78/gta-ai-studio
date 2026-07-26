@@ -197,6 +197,18 @@ fn validate_text_overlays(overlays: &[ExportTextOverlay], duration_ms: f64) -> R
         {
             return Err("Position ou taille de titre hors bornes.".into());
         }
+        let title_duration = overlay.timeline_end_ms - overlay.timeline_start_ms;
+        if !overlay.fade_in_ms.is_finite()
+            || !overlay.fade_out_ms.is_finite()
+            || overlay.fade_in_ms < 0.0
+            || overlay.fade_out_ms < 0.0
+            || overlay.fade_in_ms > 2000.0 + 0.001
+            || overlay.fade_out_ms > 2000.0 + 0.001
+            || overlay.fade_in_ms > title_duration / 2.0 + 0.001
+            || overlay.fade_out_ms > title_duration / 2.0 + 0.001
+        {
+            return Err("Fondus de titre hors bornes.".into());
+        }
         if !matches!(overlay.style.as_str(), "impact" | "caption" | "minimal") {
             return Err("Style de titre inconnu.".into());
         }
@@ -223,8 +235,26 @@ fn drawtext_filter(
     };
     let start = overlay.timeline_start_ms / 1000.0;
     let end = overlay.timeline_end_ms / 1000.0;
+    let mut alpha_factors: Vec<String> = Vec::new();
+    if overlay.fade_in_ms > 0.0 {
+        let duration = overlay.fade_in_ms / 1000.0;
+        alpha_factors.push(format!(
+            "min(1,max(0,(t-{start:.6})/{duration:.6}))"
+        ));
+    }
+    if overlay.fade_out_ms > 0.0 {
+        let duration = overlay.fade_out_ms / 1000.0;
+        alpha_factors.push(format!(
+            "min(1,max(0,({end:.6}-t)/{duration:.6}))"
+        ));
+    }
+    let alpha = if alpha_factors.is_empty() {
+        "1".into()
+    } else {
+        alpha_factors.join("*")
+    };
     format!(
-        "drawtext=fontfile='{font}':textfile='{text}':expansion=none:fontcolor=white:fontsize={size:.3}:text_align=C:{style}:x='w*{x:.6}-text_w/2':y='h*{y:.6}-text_h/2':enable='between(t,{start:.6},{end:.6})':fix_bounds=1",
+        "drawtext=fontfile='{font}':textfile='{text}':expansion=none:fontcolor=white:fontsize={size:.3}:text_align=C:{style}:x='w*{x:.6}-text_w/2':y='h*{y:.6}-text_h/2':alpha='{alpha}':enable='between(t,{start:.6},{end:.6})':fix_bounds=1",
         font = escape_filter_path(font_path),
         text = escape_filter_path(text_path),
         size = overlay.font_size_px,
@@ -436,6 +466,10 @@ pub struct ExportTextOverlay {
     pub y: f64,
     pub font_size_px: f64,
     pub style: String,
+    #[serde(default)]
+    pub fade_in_ms: f64,
+    #[serde(default)]
+    pub fade_out_ms: f64,
 }
 
 #[derive(Deserialize)]
@@ -1263,6 +1297,8 @@ mod tests {
             y: 0.72,
             font_size_px: 88.0,
             style: "impact".into(),
+            fade_in_ms: 0.0,
+            fade_out_ms: 0.0,
         }
     }
 
@@ -1376,6 +1412,11 @@ mod tests {
             ..titre()
         };
         assert!(validate_text_overlays(&[style_inconnu], 3000.0).is_err());
+        let fondu_trop_long = ExportTextOverlay {
+            fade_in_ms: 1100.0,
+            ..titre()
+        };
+        assert!(validate_text_overlays(&[fondu_trop_long], 3000.0).is_err());
     }
 
     #[test]
@@ -1388,7 +1429,25 @@ mod tests {
         assert!(filter.contains("textfile='C\\:/Temp/mon titre.txt'"));
         assert!(filter.contains("fontfile='C\\:/Windows/Fonts/segoeuib.ttf'"));
         assert!(filter.contains("text_align=C"));
+        assert!(filter.contains("alpha='1'"));
         assert!(filter.contains("enable='between(t,0.500000,2.500000)'"));
+    }
+
+    #[test]
+    fn le_filtre_titre_conserve_ses_fondus_absolus() {
+        let overlay = ExportTextOverlay {
+            fade_in_ms: 500.0,
+            fade_out_ms: 250.0,
+            ..titre()
+        };
+        let filter = drawtext_filter(
+            &overlay,
+            Path::new(r"C:\Temp\titre.txt"),
+            Path::new(r"C:\Windows\Fonts\segoeuib.ttf"),
+        );
+        assert!(filter.contains(
+            "alpha='min(1,max(0,(t-0.500000)/0.500000))*min(1,max(0,(2.500000-t)/0.250000))'"
+        ));
     }
 
     #[test]

@@ -1260,6 +1260,9 @@ const TextOverlayView = memo(function TextOverlayView(props: {
 }) {
   const { overlay, leftPx, widthPx, selected, active, onBeginGesture } = props;
   const handlePx = Math.max(4, Math.min(9, widthPx / 3));
+  const durationMs = overlay.timelineEndMs - overlay.timelineStartMs;
+  const fadeInWidth = durationMs > 0 ? (overlay.fadeInMs / durationMs) * widthPx : 0;
+  const fadeOutWidth = durationMs > 0 ? (overlay.fadeOutMs / durationMs) * widthPx : 0;
   return (
     <div
       className={
@@ -1271,6 +1274,20 @@ const TextOverlayView = memo(function TextOverlayView(props: {
       onPointerDown={(event) => onBeginGesture(event, overlay, "move")}
       title={`${overlay.text || "Titre vide"} · ${formatTime(overlay.timelineStartMs)} - ${formatTime(overlay.timelineEndMs)}`}
     >
+      {overlay.fadeInMs > 0 && (
+        <i
+          className="title-fade title-fade-in"
+          style={{ width: Math.max(2, fadeInWidth) }}
+          aria-hidden="true"
+        />
+      )}
+      {overlay.fadeOutMs > 0 && (
+        <i
+          className="title-fade title-fade-out"
+          style={{ width: Math.max(2, fadeOutWidth) }}
+          aria-hidden="true"
+        />
+      )}
       <Icon name="text" size={12} />
       <span>{overlay.text || "Titre vide"}</span>
       <div

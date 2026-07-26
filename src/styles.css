@@ -899,6 +899,22 @@ body.moving, body.moving * { cursor: grabbing !important; }
 }
 .title-clip.title-caption { background: #42515f; border-color: #8292a1; }
 .title-clip.title-minimal { background: #485043; border-color: #84927a; }
+.title-fade {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  max-width: 50%;
+  background: rgba(0, 0, 0, 0.48);
+  pointer-events: none;
+}
+.title-fade-in {
+  left: 0;
+  clip-path: polygon(0 0, 100% 0, 0 100%);
+}
+.title-fade-out {
+  right: 0;
+  clip-path: polygon(0 0, 100% 0, 100% 100%);
+}
 .title-clip > span {
   min-width: 0;
   overflow: hidden;

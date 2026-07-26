@@ -140,7 +140,7 @@ export type EditorAction =
   | {
       type: "UPDATE_TEXT";
       textOverlayId: string;
-      patch: Partial<Pick<TextOverlay, "text" | "timelineStartMs" | "timelineEndMs" | "x" | "y" | "fontSizePx" | "style">>;
+      patch: Partial<Pick<TextOverlay, "text" | "timelineStartMs" | "timelineEndMs" | "x" | "y" | "fontSizePx" | "style" | "fadeInMs" | "fadeOutMs">>;
     }
   | { type: "DELETE_TEXT"; textOverlayId: string }
   | {
@@ -459,6 +459,8 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
           y: 0.72,
           fontSizePx: 88,
           style: "impact",
+          fadeInMs: 0,
+          fadeOutMs: 0,
         },
         durationMs,
       );
@@ -483,7 +485,9 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         next.x === target.x &&
         next.y === target.y &&
         next.fontSizePx === target.fontSizePx &&
-        next.style === target.style
+        next.style === target.style &&
+        next.fadeInMs === target.fadeInMs &&
+        next.fadeOutMs === target.fadeOutMs
       ) {
         return state;
       }

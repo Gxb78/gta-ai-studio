@@ -8,6 +8,7 @@ import {
   clampRate,
   clampVolume,
   clampVideoFadeMs,
+  clampTextFadeMs,
   clipDurationMs,
   compactTrackIndices,
   cropXPercent,
@@ -20,6 +21,7 @@ import {
   resolveVideoPlan,
   timelineGaps,
   timelineTimeToSourceTime,
+  textFadeGainAt,
   videoFadeGainAt,
   type Clip,
   type SourceInfo,
@@ -245,7 +247,7 @@ const source = (id: string): SourceInfo => ({
 const stateWith = (clips: Clip[], selectedClipId: string | null): EditorState => ({
   ...initialEditorState,
   project: {
-    version: 6,
+    version: 7,
     id: "p",
     name: "p",
     sources: { S0: source("S0"), S1: source("S1") },
@@ -273,6 +275,20 @@ const titleUpdated = editorReducer(titleAdded, {
 check("le texte est modifiable", titleUpdated.textOverlays[0]?.text, "Mission réussie");
 check("la position est bornée par le réducteur", titleUpdated.textOverlays[0]?.x, 1);
 check("la taille est bornée par le réducteur", titleUpdated.textOverlays[0]?.fontSizePx, 180);
+const titleFaded = editorReducer(titleUpdated, {
+  type: "UPDATE_TEXT",
+  textOverlayId: titleUpdated.textOverlays[0].id,
+  patch: { fadeInMs: 9000, fadeOutMs: 500 },
+});
+check(
+  "les fondus du titre sont bornés à sa demi-durée",
+  [titleFaded.textOverlays[0].fadeInMs, titleFaded.textOverlays[0].fadeOutMs],
+  [1500, 500],
+);
+check("titre transparent au début", textFadeGainAt(titleFaded.textOverlays[0], 1000), 0);
+check("titre à demi visible pendant l'entrée", textFadeGainAt(titleFaded.textOverlays[0], 1750), 0.5);
+check("titre transparent à la fin", textFadeGainAt(titleFaded.textOverlays[0], 4000), 0);
+check("fondu de titre limité à deux secondes", clampTextFadeMs(9000, 10_000), 2000);
 const titleUndo = editorReducer(titleUpdated, { type: "UNDO" });
 check("l'édition du titre est annulable", titleUndo.textOverlays[0]?.text, "Nouveau titre");
 const titleUndoAdd = editorReducer(titleUndo, { type: "UNDO" });
@@ -665,7 +681,7 @@ const migre = migrateProject({
   createdAt: "",
   updatedAt: "",
 });
-check("le projet est ramené au format 6", migre.version, 6);
+check("le projet est ramené au format 7", migre.version, 7);
 check("le cadrage par défaut est le recadrage", migre.framing, "crop");
 check("les clips sont recentrés", migre.clips[0].cropX, 0);
 check("les clips sans volume restent au niveau original", migre.clips[0].volume, 1);
@@ -676,6 +692,31 @@ check(
   [0, 0],
 );
 check("les anciens projets n'ont aucun titre inventé", migre.textOverlays.length, 0);
+const ancienTitre = migrateProject({
+  version: 6,
+  id: "p-titre",
+  name: "p-titre",
+  sources: { S0: source("S0") },
+  clips: [{ id: "a", sourceId: "S0", srcInMs: 0, srcOutMs: 5000, playbackRate: 1 }],
+  textOverlays: [{
+    id: "ancien-titre",
+    text: "Avant les animations",
+    timelineStartMs: 500,
+    timelineEndMs: 2500,
+    x: 0.5,
+    y: 0.72,
+    fontSizePx: 88,
+    style: "impact",
+  }],
+  framing: "crop",
+  createdAt: "",
+  updatedAt: "",
+});
+check(
+  "un ancien titre migre sans fondu inventé",
+  [ancienTitre.textOverlays[0].fadeInMs, ancienTitre.textOverlays[0].fadeOutMs],
+  [0, 0],
+);
 
 console.log("Volume par clip");
 check("volume négatif écrêté", clampVolume(-0.5), 0);

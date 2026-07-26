@@ -1,6 +1,11 @@
 import { Icon } from "./Icon";
 import type { TextOverlay, TextStyle } from "../types";
-import { MAX_TEXT_LENGTH, MAX_TEXT_SIZE_PX, MIN_TEXT_SIZE_PX } from "../types";
+import {
+  MAX_TEXT_FADE_MS,
+  MAX_TEXT_LENGTH,
+  MAX_TEXT_SIZE_PX,
+  MIN_TEXT_SIZE_PX,
+} from "../types";
 
 const STYLES: Array<{ value: TextStyle; label: string }> = [
   { value: "impact", label: "Impact" },
@@ -18,6 +23,12 @@ interface Props {
 
 export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onCollapse }: Props) {
   const duration = Math.max(0.1, (overlay.timelineEndMs - overlay.timelineStartMs) / 1000);
+  const maxFadeMs = Math.min(
+    MAX_TEXT_FADE_MS,
+    (overlay.timelineEndMs - overlay.timelineStartMs) / 2,
+  );
+  const fadeLabel = (fadeMs: number): string =>
+    fadeMs === 0 ? "Aucun" : `${(fadeMs / 1000).toFixed(fadeMs % 1000 === 0 ? 0 : 2)} s`;
   const updateStart = (seconds: number) => {
     const start = Math.max(0, Math.min(durationMs - 100, seconds * 1000));
     onUpdate({
@@ -121,6 +132,46 @@ export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onColla
             />
           </label>
         </div>
+      </section>
+      <section className="inspector-section">
+        <h3>Animation</h3>
+        <div className="fade-control">
+          <label className="slider-row">
+            <span className="fade-label">Entrée</span>
+            <input
+              type="range"
+              min={0}
+              max={maxFadeMs}
+              step={50}
+              value={overlay.fadeInMs}
+              onChange={(event) => onUpdate({ fadeInMs: Number(event.target.value) })}
+              aria-label="Fondu d'entrée du titre"
+            />
+            <span className="slider-value">{fadeLabel(overlay.fadeInMs)}</span>
+          </label>
+          <label className="slider-row">
+            <span className="fade-label">Sortie</span>
+            <input
+              type="range"
+              min={0}
+              max={maxFadeMs}
+              step={50}
+              value={overlay.fadeOutMs}
+              onChange={(event) => onUpdate({ fadeOutMs: Number(event.target.value) })}
+              aria-label="Fondu de sortie du titre"
+            />
+            <span className="slider-value">{fadeLabel(overlay.fadeOutMs)}</span>
+          </label>
+        </div>
+        {(overlay.fadeInMs > 0 || overlay.fadeOutMs > 0) && (
+          <button
+            type="button"
+            className="ghost small"
+            onClick={() => onUpdate({ fadeInMs: 0, fadeOutMs: 0 })}
+          >
+            Retirer les fondus
+          </button>
+        )}
       </section>
       <section className="inspector-section">
         <button type="button" className="ghost small warn" onClick={onDelete}>

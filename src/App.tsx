@@ -209,7 +209,7 @@ export default function App() {
     const now = new Date().toISOString();
     const baseName = source.originalPath.split(/[\\/]/).pop() ?? "rush";
     const project: Project = {
-      version: 6,
+      version: 7,
       // Distinct de l'empreinte du rush : deux projets créés depuis le même
       // fichier partageraient sinon le même identifiant, donc le même fichier
       // JSON, et s'écraseraient l'un l'autre.

@@ -292,15 +292,32 @@ export interface TextOverlay {
   /** Taille dans la sortie 1080x1920, mise a l'echelle dans l'apercu. */
   fontSizePx: number;
   style: TextStyle;
+  /** Fondus d'opacité, exprimés dans le temps de la timeline. */
+  fadeInMs: number;
+  fadeOutMs: number;
 }
 
 export const MAX_TEXT_LENGTH = 200;
 export const MIN_TEXT_DURATION_MS = 100;
 export const MIN_TEXT_SIZE_PX = 36;
 export const MAX_TEXT_SIZE_PX = 180;
+export const MAX_TEXT_FADE_MS = 2_000;
 
 const finiteOr = (value: number, fallback: number): number =>
   Number.isFinite(value) ? value : fallback;
+
+export const clampTextFadeMs = (fadeMs: number, durationMs: number): number => {
+  if (!Number.isFinite(fadeMs) || fadeMs <= 0) return 0;
+  return Math.min(fadeMs, MAX_TEXT_FADE_MS, Math.max(0, durationMs / 2));
+};
+
+export function textFadeGainAt(overlay: TextOverlay, timelineMs: number): number {
+  const elapsedMs = Math.max(0, timelineMs - overlay.timelineStartMs);
+  const remainingMs = Math.max(0, overlay.timelineEndMs - timelineMs);
+  const fadeInGain = overlay.fadeInMs > 0 ? elapsedMs / overlay.fadeInMs : 1;
+  const fadeOutGain = overlay.fadeOutMs > 0 ? remainingMs / overlay.fadeOutMs : 1;
+  return Math.max(0, Math.min(1, fadeInGain, fadeOutGain));
+}
 
 export function normalizeTextOverlay(
   overlay: TextOverlay,
@@ -311,6 +328,7 @@ export function normalizeTextOverlay(
     Math.min(durationMs, timelineStartMs + MIN_TEXT_DURATION_MS),
     Math.min(durationMs, finiteOr(overlay.timelineEndMs, timelineStartMs + 3000)),
   );
+  const overlayDurationMs = timelineEndMs - timelineStartMs;
   return {
     ...overlay,
     text: overlay.text.slice(0, MAX_TEXT_LENGTH),
@@ -325,11 +343,13 @@ export function normalizeTextOverlay(
     style: ["impact", "caption", "minimal"].includes(overlay.style)
       ? overlay.style
       : "impact",
+    fadeInMs: clampTextFadeMs(overlay.fadeInMs, overlayDurationMs),
+    fadeOutMs: clampTextFadeMs(overlay.fadeOutMs, overlayDurationMs),
   };
 }
 
 export interface Project {
-  version: 6;
+  version: 7;
   id: string;
   name: string;
   /** Rushs du projet, indexés par leur empreinte. */
@@ -805,6 +825,8 @@ export function migrateProject(stored: StoredProject): Project {
           y: overlay.y ?? 0.72,
           fontSizePx: overlay.fontSizePx ?? 88,
           style: overlay.style ?? "impact",
+          fadeInMs: overlay.fadeInMs ?? 0,
+          fadeOutMs: overlay.fadeOutMs ?? 0,
         },
         durationMs,
       ),
@@ -812,7 +834,7 @@ export function migrateProject(stored: StoredProject): Project {
     .filter((overlay) => overlay.timelineEndMs > overlay.timelineStartMs);
 
   return {
-    version: 6,
+    version: 7,
     id: stored.id,
     name: stored.name,
     sources,

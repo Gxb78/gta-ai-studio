@@ -15,7 +15,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
 import type { Clip, FramingMode, TextOverlay } from "../types";
-import { cropXPercent, videoFadeGainAt } from "../types";
+import { cropXPercent, textFadeGainAt, videoFadeGainAt } from "../types";
 import type { PlaybackClock } from "../playback/usePlayback";
 import { PlaybackTimecode } from "./PlaybackTimecode";
 
@@ -197,10 +197,12 @@ export function PreviewStage(props: Props) {
       for (const overlay of textOverlays) {
         const node = textNodesRef.current.get(overlay.id);
         if (node) {
-          node.hidden =
+          const hidden =
             !outputView ||
             playheadMs < overlay.timelineStartMs ||
             playheadMs >= overlay.timelineEndMs;
+          node.hidden = hidden;
+          node.style.opacity = hidden ? "0" : String(textFadeGainAt(overlay, playheadMs));
         }
       }
     };
