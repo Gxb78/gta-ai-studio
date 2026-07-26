@@ -23,6 +23,31 @@ const BOUNDARY_EPSILON_MS = 26;
 
 /** Écart au-delà duquel l'aperçu est re-calé sur le playhead après un montage. */
 const RESYNC_TOLERANCE_MS = 45;
+/** Tolérance de seek pour considérer la première image du clip comme prête. */
+const PRIME_TOLERANCE_SEC = 0.06;
+/** Au-delà, on préfère un seek classique à un gel durable de la dernière image. */
+const MAX_CUT_HOLD_MS = 500;
+
+export function mediaIsPrimed(
+  readyState: number,
+  seeking: boolean,
+  currentTimeSec: number,
+  targetTimeSec: number,
+): boolean {
+  return (
+    // HAVE_CURRENT_DATA = 2. Garder la valeur évite de dépendre du DOM dans les tests Node.
+    readyState >= 2 &&
+    !seeking &&
+    Math.abs(currentTimeSec - targetTimeSec) <= PRIME_TOLERANCE_SEC
+  );
+}
+
+export type MediaPrimeDecision = "swap" | "hold" | "fallback";
+
+export function decideMediaPrime(ready: boolean, elapsedMs: number): MediaPrimeDecision {
+  if (ready) return "swap";
+  return elapsedMs < MAX_CUT_HOLD_MS ? "hold" : "fallback";
+}
 
 export interface PlaybackClock {
   getPlayheadMs: () => number;
@@ -102,6 +127,55 @@ function assign(media: HTMLMediaElement, source: SourceInfo, srcMs: number): voi
   seekWhenReady(media, Math.max(0, srcMs) / 1000);
 }
 
+interface MediaPrime {
+  clipId: string;
+  targetTimeSec: number;
+  startedAt: number;
+  ready: boolean;
+  cancel: () => void;
+}
+
+function startMediaPrime(
+  media: HTMLMediaElement,
+  clipId: string,
+  source: SourceInfo,
+  srcMs: number,
+): MediaPrime {
+  const targetTimeSec = Math.max(0, srcMs) / 1000;
+  const prime: MediaPrime = {
+    clipId,
+    targetTimeSec,
+    startedAt: performance.now(),
+    ready: false,
+    cancel: () => undefined,
+  };
+  const check = () => {
+    prime.ready = mediaIsPrimed(
+      media.readyState,
+      media.seeking,
+      media.currentTime,
+      targetTimeSec,
+    );
+    if (prime.ready) prime.cancel();
+  };
+  const events: Array<keyof HTMLMediaElementEventMap> = ["loadeddata", "seeked", "canplay"];
+  const cancel = () => {
+    for (const event of events) media.removeEventListener(event, check);
+  };
+  prime.cancel = cancel;
+  for (const event of events) media.addEventListener(event, check);
+  assign(media, source, srcMs);
+  check();
+  return prime;
+}
+
+function measurePresentedCut(video: HTMLVideoElement | null, startedAt: number): void {
+  if (!video || !("requestVideoFrameCallback" in video)) return;
+  video.requestVideoFrameCallback((now) => {
+    performance.measure("gta-cut-first-frame", { start: startedAt, end: now });
+  });
+}
+
 /**
  * Dérive du son par rapport à l'image, en trois zones.
  *
@@ -136,16 +210,22 @@ export function usePlayback(
   const playheadRef = useRef(0);
   const clockControllerRef = useRef<PlaybackClockController | null>(null);
   if (!clockControllerRef.current) clockControllerRef.current = createPlaybackClock();
-  /** Clip déjà préchargé sur la balise inactive, pour ne pas recharger en boucle. */
-  const primedClipIdRef = useRef<string | null>(null);
+  /** Première image réellement décodée sur la balise vidéo inactive. */
+  const videoPrimeRef = useRef<MediaPrime | null>(null);
+  const pendingCutRef = useRef<{
+    fromIndex: number;
+    toIndex: number;
+    boundaryMs: number;
+    startedAt: number;
+  } | null>(null);
 
   const compiledRef = useRef(compiledTimeline);
   compiledRef.current = compiledTimeline;
   const currentVideoIndexRef = useRef(-1);
   const currentAudioIndexRef = useRef(-1);
-  /** Balise sonore active, et clip déjà préchargé sur l'autre. */
+  /** Balise sonore active, et segment réellement prêt sur l'autre. */
   const audioActiveIsARef = useRef(true);
-  const primedAudioIdRef = useRef<string | null>(null);
+  const audioPrimeRef = useRef<MediaPrime | null>(null);
   const sourcesRef = useRef(sources);
   sourcesRef.current = sources;
   const previewVolumeRef = useRef(previewVolume);
@@ -193,6 +273,7 @@ export function usePlayback(
     videoB.current?.pause();
     audioA.current?.pause();
     audioB.current?.pause();
+    pendingCutRef.current = null;
     stopLoop();
     playingRef.current = false;
     setPlaying(false);
@@ -202,17 +283,23 @@ export function usePlayback(
   const ensurePrimed = useCallback(
     (upcoming: CompiledSegment | undefined) => {
       if (!upcoming) {
-        primedClipIdRef.current = null;
+        videoPrimeRef.current?.cancel();
+        videoPrimeRef.current = null;
         return;
       }
-      if (primedClipIdRef.current === upcoming.clip.id) return;
+      if (videoPrimeRef.current?.clipId === upcoming.clip.id) return;
       const idle = getIdle();
       const source = sourcesRef.current[upcoming.clip.sourceId];
       if (!idle || !source) return;
-      primedClipIdRef.current = upcoming.clip.id;
+      videoPrimeRef.current?.cancel();
       idle.pause();
       idle.playbackRate = upcoming.clip.playbackRate;
-      assign(idle, source, upcoming.clip.srcInMs);
+      videoPrimeRef.current = startMediaPrime(
+        idle,
+        upcoming.clip.id,
+        source,
+        upcoming.clip.srcInMs,
+      );
     },
     [getIdle],
   );
@@ -267,7 +354,8 @@ export function usePlayback(
 
       if (index === -1) {
         for (const element of elements) element?.pause();
-        primedAudioIdRef.current = null;
+        audioPrimeRef.current?.cancel();
+        audioPrimeRef.current = null;
         return;
       }
 
@@ -279,9 +367,30 @@ export function usePlayback(
       // Changement de segment : on bascule sur la balise déjà préchargée.
       const currentId = audioActiveIsARef.current ? audioA.current : audioB.current;
       if (currentId && currentId.dataset.clipId !== clip.id) {
-        if (primedAudioIdRef.current === clip.id) {
+        const audioPrime = audioPrimeRef.current?.clipId === clip.id
+          ? audioPrimeRef.current
+          : null;
+        const decision = decideMediaPrime(
+          audioPrime?.ready ?? false,
+          audioPrime ? performance.now() - audioPrime.startedAt : MAX_CUT_HOLD_MS,
+        );
+        if (decision === "swap" && audioPrime) {
           audioActiveIsARef.current = !audioActiveIsARef.current;
-          primedAudioIdRef.current = null;
+          performance.measure("gta-audio-prime-wait", {
+            start: audioPrime.startedAt,
+            end: performance.now(),
+          });
+          audioPrime.cancel();
+          audioPrimeRef.current = null;
+        } else if (decision === "hold" && audioPrime) {
+          currentId.pause();
+          return;
+        } else if (audioPrime) {
+          console.warn(
+            `[cut audio] Préchargement incomplet après ${MAX_CUT_HOLD_MS} ms, seek de secours.`,
+          );
+          audioPrime.cancel();
+          audioPrimeRef.current = null;
         }
       }
 
@@ -322,10 +431,10 @@ export function usePlayback(
 
       // Préchargement du segment sonore suivant.
       const upcoming = segments[index + 1];
-      if (idle && upcoming && primedAudioIdRef.current !== upcoming.clip.id) {
+      if (idle && upcoming && audioPrimeRef.current?.clipId !== upcoming.clip.id) {
         const nextSource = sourcesRef.current[upcoming.clip.sourceId];
         if (nextSource) {
-          primedAudioIdRef.current = upcoming.clip.id;
+          audioPrimeRef.current?.cancel();
           idle.dataset.clipId = upcoming.clip.id;
           idle.playbackRate = upcoming.clip.playbackRate;
           idle.volume = Math.min(
@@ -334,7 +443,12 @@ export function usePlayback(
               upcoming.clip.volume *
               audioFadeGainAt(upcoming.sourceClip, upcoming.startMs),
           );
-          assign(idle, nextSource, upcoming.clip.srcInMs);
+          audioPrimeRef.current = startMediaPrime(
+            idle,
+            upcoming.clip.id,
+            nextSource,
+            upcoming.clip.srcInMs,
+          );
         }
       }
     },
@@ -343,6 +457,7 @@ export function usePlayback(
 
   const seek = useCallback(
     (timelineMs: number) => {
+      pendingCutRef.current = null;
       const clamped = Math.max(0, Math.min(timelineMs, compiledRef.current.video.durationMs));
       applyPosition(clamped);
       // Après un seek, le son est recalé d'autorité : aucune dérive à rattraper.
@@ -367,6 +482,62 @@ export function usePlayback(
     lastTickRef.current = now;
 
     const total = compiledRef.current.video.durationMs;
+    const pendingCut = pendingCutRef.current;
+    if (pendingCut) {
+      const nextSegment = segments[pendingCut.toIndex];
+      const prime = videoPrimeRef.current;
+      const primeReady = Boolean(
+        nextSegment && prime?.clipId === nextSegment.clip.id && prime.ready,
+      );
+      const decision = decideMediaPrime(primeReady, now - pendingCut.startedAt);
+      if (decision === "swap" && nextSegment && prime) {
+        const outgoing = getActive();
+        const incoming = getIdle();
+        pendingCutRef.current = null;
+        currentVideoIndexRef.current = pendingCut.toIndex;
+        publishPlayhead(pendingCut.boundaryMs);
+        swap();
+        outgoing?.pause();
+        prime.cancel();
+        videoPrimeRef.current = null;
+        void incoming?.play().catch(() => undefined);
+        measurePresentedCut(incoming, pendingCut.startedAt);
+        performance.measure("gta-cut-prime-wait", {
+          start: pendingCut.startedAt,
+          end: now,
+        });
+        ensurePrimed(segments[pendingCut.toIndex + 1]);
+        setInGap(false);
+        setActiveVideoClipId(nextSegment.sourceClipId);
+        syncAudio(pendingCut.boundaryMs, true);
+      } else if (decision === "hold") {
+        syncAudio(Math.max(0, pendingCut.boundaryMs - 0.001), false);
+        rafRef.current = requestAnimationFrame(loop);
+        return;
+      } else {
+        pendingCutRef.current = null;
+        console.warn(
+          `[cut] Préchargement incomplet après ${MAX_CUT_HOLD_MS} ms, seek de secours.`,
+        );
+        const outgoing = getActive();
+        const fallback = getIdle();
+        currentVideoIndexRef.current = pendingCut.toIndex;
+        publishPlayhead(pendingCut.boundaryMs);
+        swap();
+        outgoing?.pause();
+        prime?.cancel();
+        videoPrimeRef.current = null;
+        void fallback?.play().catch(() => undefined);
+        measurePresentedCut(fallback, pendingCut.startedAt);
+        ensurePrimed(segments[pendingCut.toIndex + 1]);
+        setInGap(false);
+        setActiveVideoClipId(nextSegment?.sourceClipId ?? null);
+        syncAudio(pendingCut.boundaryMs, true, true);
+      }
+      rafRef.current = requestAnimationFrame(loop);
+      return;
+    }
+
     let index = currentVideoIndexRef.current;
     const indexed = segments[index];
     if (!indexed || playheadRef.current < indexed.startMs || playheadRef.current >= indexed.endMs) {
@@ -386,32 +557,47 @@ export function usePlayback(
           pause();
           return;
         }
-        publishPlayhead(boundaryMs);
         const nextIndex =
           segments[index + 1]?.startMs === boundaryMs
             ? index + 1
             : findSegmentIndex(segments, boundaryMs);
-        currentVideoIndexRef.current = nextIndex;
         if (nextIndex !== -1) {
           // Le clip suivant est déjà chargé et positionné sur la balise inactive.
           const nextSegment = segments[nextIndex];
           const nextClip = nextSegment.clip;
-          const ready = primedClipIdRef.current === nextClip.id;
+          const prime = videoPrimeRef.current;
+          const ready = prime?.clipId === nextClip.id && prime.ready;
           if (ready) {
             const incoming = getIdle();
+            const cutStartedAt = performance.now();
+            publishPlayhead(boundaryMs);
+            currentVideoIndexRef.current = nextIndex;
             swap();
             active.pause();
-            primedClipIdRef.current = null;
+            prime.cancel();
+            videoPrimeRef.current = null;
             void incoming?.play().catch(() => undefined);
+            measurePresentedCut(incoming, cutStartedAt);
             ensurePrimed(segments[nextIndex + 1]);
           } else {
-            // Préchargement non terminé : on se rabat sur un saut classique.
-            applyPosition(boundaryMs);
-            void active.play().catch(() => undefined);
+            active.pause();
+            publishPlayhead(Math.max(segments[index].startMs, boundaryMs - 0.001));
+            currentVideoIndexRef.current = index;
+            pendingCutRef.current = {
+              fromIndex: index,
+              toIndex: nextIndex,
+              boundaryMs,
+              startedAt: now,
+            };
+            syncAudio(Math.max(0, boundaryMs - 0.001), false);
+            rafRef.current = requestAnimationFrame(loop);
+            return;
           }
           setInGap(false);
           setActiveVideoClipId(nextSegment.sourceClipId);
         } else {
+          publishPlayhead(boundaryMs);
+          currentVideoIndexRef.current = -1;
           active.pause();
           setInGap(true);
           setActiveVideoClipId(null);
@@ -438,19 +624,29 @@ export function usePlayback(
         }
         const nextSegment = segments[upcoming];
         const nextClip = nextSegment.clip;
-        currentVideoIndexRef.current = upcoming;
-        if (primedClipIdRef.current === nextClip.id) {
+        const prime = videoPrimeRef.current;
+        if (prime?.clipId === nextClip.id && prime.ready) {
           const incoming = getIdle();
+          currentVideoIndexRef.current = upcoming;
           swap();
-          primedClipIdRef.current = null;
+          prime.cancel();
+          videoPrimeRef.current = null;
           void incoming?.play().catch(() => undefined);
+          measurePresentedCut(incoming, now);
           ensurePrimed(segments[upcoming + 1]);
+          setInGap(false);
+          setActiveVideoClipId(nextSegment.sourceClipId);
         } else {
-          applyPosition(boundary);
-          void getActive()?.play().catch(() => undefined);
+          pendingCutRef.current = {
+            fromIndex: -1,
+            toIndex: upcoming,
+            boundaryMs: boundary,
+            startedAt: now,
+          };
+          syncAudio(Math.max(0, boundary - 0.001), false);
+          rafRef.current = requestAnimationFrame(loop);
+          return;
         }
-        setInGap(false);
-        setActiveVideoClipId(nextSegment.sourceClipId);
       } else {
         publishPlayhead(target);
       }
@@ -513,6 +709,8 @@ export function usePlayback(
   useEffect(() => {
     return () => {
       if (frameRafRef.current !== null) cancelAnimationFrame(frameRafRef.current);
+      videoPrimeRef.current?.cancel();
+      audioPrimeRef.current?.cancel();
     };
   }, []);
 

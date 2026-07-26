@@ -36,7 +36,11 @@ import {
   compileTimeline,
   findSegmentIndex,
 } from "../src/timeline/compileTimeline";
-import { createPlaybackClock } from "../src/playback/usePlayback";
+import {
+  createPlaybackClock,
+  decideMediaPrime,
+  mediaIsPrimed,
+} from "../src/playback/usePlayback";
 
 const clip = (
   id: string,
@@ -1051,6 +1055,15 @@ check("seek publie immediatement", clockNotifications, [125, 456.789]);
 unsubscribeClock();
 clockController.publish(900);
 check("aucune notification apres desabonnement", clockNotifications, [125, 456.789]);
+
+console.log("Préchargement vérifié des cuts");
+check("une simple demande de chargement ne suffit pas", mediaIsPrimed(1, false, 5, 5), false);
+check("un média encore en seek n'est pas prêt", mediaIsPrimed(4, true, 5, 5), false);
+check("une image décodée sur la bonne cible est prête", mediaIsPrimed(2, false, 5.03, 5), true);
+check("une image décodée trop loin de la cible est refusée", mediaIsPrimed(4, false, 5.2, 5), false);
+check("un média prêt bascule immédiatement", decideMediaPrime(true, 0), "swap");
+check("la dernière image est tenue pendant le préchargement", decideMediaPrime(false, 499), "hold");
+check("le secours prend le relais à la borne", decideMediaPrime(false, 500), "fallback");
 
 if (failures > 0) throw new Error(`${failures} echec(s) dans la compilation`);
 console.log("\nTOUT PASSE");
