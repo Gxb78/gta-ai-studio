@@ -11,6 +11,10 @@ import {
   clampTextFadeMs,
   clipDurationMs,
   compactTrackIndices,
+  normalizeZoomRegion,
+  zoomAt,
+  zoomOffset,
+  zoomScaleAt,
   cropXPercent,
   migrateProject,
   clipEndMs,
@@ -253,12 +257,13 @@ const source = (id: string): SourceInfo => ({
 const stateWith = (clips: Clip[], selectedClipId: string | null): EditorState => ({
   ...initialEditorState,
   project: {
-    version: 8,
+    version: 9,
     id: "p",
     name: "p",
     sources: { S0: source("S0"), S1: source("S1") },
     clips,
     textOverlays: [],
+    zooms: [],
     framing: "crop",
     createdAt: "",
     updatedAt: "",
@@ -365,6 +370,221 @@ check(
   2,
 );
 check("avec sélection, la surcouche reste entière", cutSelected.clips.filter((c) => c.track === 1).length, 1);
+
+console.log("Enveloppe d'un zoom");
+const zoomTest = {
+  id: "z1",
+  timelineStartMs: 1000,
+  timelineEndMs: 3000,
+  scale: 2,
+  x: 0.75,
+  y: 0.25,
+  rampInMs: 500,
+  rampOutMs: 500,
+};
+// Hors des bornes, la valeur est EXACTEMENT 1 : c'est ce qui garantit qu'on
+// retrouve la vue d'avant, au pixel près, et pas « à peu près ».
+check("avant le zoom, aucun agrandissement", zoomScaleAt(zoomTest, 999), 1);
+check("après le zoom, la vue d'avant est retrouvée", zoomScaleAt(zoomTest, 3001), 1);
+check("à mi-rampe d'entrée, la moitié du chemin", zoomScaleAt(zoomTest, 1250), 1.5);
+check("au palier, l'agrandissement plein", zoomScaleAt(zoomTest, 2000), 2);
+check("à mi-rampe de sortie, la moitié du chemin", zoomScaleAt(zoomTest, 2750), 1.5);
+// Rampes nulles : le zoom est plein dès la première image, sans division par
+// zéro ni NaN qui se propagerait jusqu'au transform de l'aperçu.
+check(
+  "sans rampe, l'agrandissement est immédiat",
+  zoomScaleAt({ ...zoomTest, rampInMs: 0, rampOutMs: 0 }, 1000.001),
+  2,
+);
+// Deux rampes qui se chevaucheraient : la borne de normalisation les ramène à
+// la moitié de la durée, donc le zoom atteint tout juste son maximum au milieu.
+const zoomSerré = normalizeZoomRegion({ ...zoomTest, rampInMs: 5000, rampOutMs: 5000 }, 10000);
+check("les rampes sont bornées à la moitié de la durée", zoomSerré.rampInMs, 1000);
+check("le maximum est atteint au milieu", zoomScaleAt(zoomSerré, 2000), 2);
+
+console.log("Décalage du zoom : aucun bord noir");
+// À 2×, la fenêtre visible fait la moitié du cadre : son centre ne peut pas
+// s'écarter de plus d'un quart du centre sans laisser entrer du vide.
+check("un point visé au bord est ramené à la limite", zoomOffset(1, 2), 0.25);
+check("l'autre bord aussi, symétriquement", zoomOffset(0, 2), -0.25);
+check("le centre ne bouge pas", zoomOffset(0.5, 2), 0);
+check("sans agrandissement, aucun décalage possible", zoomOffset(1, 1), 0);
+// Plus on zoome, plus on peut s'écarter — la limite tend vers un demi-cadre.
+check("à 4×, la marge est plus grande", zoomOffset(1, 4), 0.375);
+
+console.log("Deux zooms ne se chevauchent jamais");
+// C'est cette garantie qui permet à la lecture et à l'export de n'en retenir
+// qu'un seul, donc de tenir en UNE expression FFmpeg.
+const chevauchants = editorReducer(
+  {
+    ...stateWith([clip("bas", 0, 0, 0, 20000)], null),
+    zooms: [
+      { ...zoomTest, id: "a", timelineStartMs: 1000, timelineEndMs: 5000 },
+      { ...zoomTest, id: "b", timelineStartMs: 3000, timelineEndMs: 7000 },
+    ],
+  },
+  { type: "UPDATE_ZOOM", zoomId: "a", patch: {} },
+);
+check("le second est repoussé derrière le premier", chevauchants.zooms[1]?.timelineStartMs, 5000);
+check("aucun instant n'est couvert deux fois", zoomAt(chevauchants.zooms, 4999)?.id, "a");
+check("et le suivant prend le relais", zoomAt(chevauchants.zooms, 5000)?.id, "b");
+
+console.log("Geste sur un zoom : deplacement et rognage");
+const baseZooms = stateWith([clip("bas", 0, 0, 0, 20000)], null);
+const deuxZooms = {
+  ...baseZooms,
+  zooms: [
+    { ...zoomTest, id: "a", timelineStartMs: 2000, timelineEndMs: 4000 },
+    { ...zoomTest, id: "b", timelineStartMs: 8000, timelineEndMs: 10000 },
+  ],
+};
+
+// Pendant le geste, rien n'entre dans l'historique : c'est la meme regle que
+// pour les clips et les titres.
+const zoomDeplace = editorReducer(deuxZooms, {
+  type: "ZOOM_TRANSIENT",
+  zoomId: "a",
+  timelineStartMs: 5000,
+  timelineEndMs: 7000,
+});
+check("le geste ne touche pas au montage committe", zoomDeplace.zooms[0].timelineStartMs, 2000);
+check("aucune entree d'historique pendant le geste", zoomDeplace.past.length, 0);
+check(
+  "mais l'etat transitoire suit le pointeur",
+  zoomDeplace.transientZooms?.[0].timelineStartMs,
+  5000,
+);
+
+// La difference avec un titre : deux zooms ne peuvent pas se chevaucher, donc
+// le geste BUTE sur le voisin au lieu de le repousser ou de le faire
+// disparaitre sous le pointeur.
+const contreVoisin = editorReducer(deuxZooms, {
+  type: "ZOOM_TRANSIENT",
+  zoomId: "a",
+  timelineStartMs: 7000,
+  timelineEndMs: 9000,
+});
+check(
+  "le zoom bute sur son voisin de droite",
+  contreVoisin.transientZooms?.[0].timelineEndMs,
+  8000,
+);
+check("le voisin, lui, n'a pas bouge", contreVoisin.transientZooms?.[1].timelineStartMs, 8000);
+
+// Le commit passe par pushHistory : une seule entree pour tout le geste.
+const zoomCommit = editorReducer(zoomDeplace, { type: "ZOOM_GESTURE_COMMIT" });
+check("le commit applique le geste", zoomCommit.zooms[0].timelineStartMs, 5000);
+check("une seule entree d'historique pour tout le geste", zoomCommit.past.length, 1);
+check("l'etat transitoire est rendu", zoomCommit.transientZooms, null);
+
+// Echap : on revient exactement a l'etat d'avant, sans entree d'historique.
+const zoomAnnule = editorReducer(zoomDeplace, { type: "ZOOM_GESTURE_CANCEL" });
+check("annuler le geste rend l'etat committe", zoomAnnule.zooms[0].timelineStartMs, 2000);
+check("et ne laisse rien dans l'historique", zoomAnnule.past.length, 0);
+
+// Rognage sous la duree minimale : refuse, plutot que de produire un zoom
+// invisible que `resolveZoomOverlaps` supprimerait au commit.
+const tropCourt = editorReducer(deuxZooms, {
+  type: "ZOOM_TRANSIENT",
+  zoomId: "a",
+  timelineStartMs: 2000,
+  timelineEndMs: 2050,
+});
+check("un rognage sous la duree minimale est refuse", tropCourt.transientZooms, null);
+
+console.log("La sélection ne survit pas à la disparition de sa cible");
+// Bug réel : annuler une duplication laissait `selectedClipId` sur le clip
+// disparu. L'inspecteur affichait « aucun clip sélectionné », la timeline ne
+// surlignait rien, et Suppr comme M ne faisaient plus rien — sans explication.
+const dupPuisAnnule = editorReducer(
+  editorReducer(stateWith([clip("bas", 0, 0, 0, 20000)], "bas"), {
+    type: "DUPLICATE_CLIP",
+    clipId: "bas",
+  }),
+  { type: "UNDO" },
+);
+check(
+  "annuler une duplication libère la sélection devenue fantôme",
+  dupPuisAnnule.selectedClipId,
+  null,
+);
+check("le montage est bien revenu à un seul clip", dupPuisAnnule.clips.length, 1);
+// Une sélection toujours valide, elle, doit être conservée.
+const supprPuisAnnule = editorReducer(
+  editorReducer(stateWith(covered, "haut"), { type: "DELETE_CLIP", clipId: "bas" }),
+  { type: "UNDO" },
+);
+check("une sélection encore présente est conservée", supprPuisAnnule.selectedClipId, "haut");
+
+console.log("Duplication, copie et collage");
+// Une copie doit être un AUTRE clip : deux clips de même identifiant se
+// sélectionneraient et se déplaceraient ensemble.
+const reglé = {
+  ...clip("bas", 0, 0, 0, 20000),
+  playbackRate: 2,
+  volume: 0.4,
+  cropX: 0.5,
+  videoFadeInMs: 500,
+  transitionInMs: 400,
+};
+const duplique = editorReducer(stateWith([reglé], "bas"), {
+  type: "DUPLICATE_CLIP",
+  clipId: "bas",
+});
+const copieFaite = duplique.clips.find((c) => c.id !== "bas");
+check("la duplication ajoute un clip", duplique.clips.length, 2);
+check("la copie a un identifiant neuf", copieFaite?.id !== "bas", true);
+check("la copie se pose juste après l'original", copieFaite?.timelineStartMs, 10000);
+check("la copie garde la vitesse", copieFaite?.playbackRate, 2);
+check("la copie garde le volume", copieFaite?.volume, 0.4);
+check("la copie garde le cadrage", copieFaite?.cropX, 0.5);
+check("la copie garde les fondus", copieFaite?.videoFadeInMs, 500);
+// La transition décrit une jonction précise avec le clip précédent : elle n'a
+// aucun sens sur une copie posée ailleurs.
+check("la copie abandonne la transition d'entrée", copieFaite?.transitionInMs, 0);
+check("la copie reste sur la piste de l'original si la place existe", copieFaite?.track, 0);
+check("la copie devient la sélection", duplique.selectedClipId, copieFaite?.id);
+
+// Copier ne touche pas au montage : rien ne change, aucune entrée d'historique.
+const copie = editorReducer(stateWith(covered, "haut"), { type: "COPY_CLIP", clipId: "haut" });
+check("copier ne modifie pas le montage", copie.clips.length, 2);
+check("copier n'ouvre pas d'entrée d'historique", copie.past.length, 0);
+check("copier remplit le presse-papiers", copie.clipboard?.id, "haut");
+
+const colle = editorReducer(copie, { type: "PASTE_CLIP", atMs: 30000 });
+check("coller ajoute un clip", colle.clips.length, 3);
+check(
+  "coller le pose à l'endroit demandé",
+  colle.clips.find((c) => c.id === colle.selectedClipId)?.timelineStartMs,
+  30000,
+);
+check(
+  "coller sans presse-papiers ne fait rien",
+  editorReducer(stateWith(covered, "haut"), { type: "PASTE_CLIP", atMs: 1000 }).clips.length,
+  2,
+);
+
+console.log("Montée explicite sur une piste neuve");
+// Remplaçant de la rangée fantôme qui s'affichait pendant les déplacements.
+const monte = editorReducer(stateWith(covered, "bas"), {
+  type: "CLIP_TO_NEW_TRACK",
+  clipId: "bas",
+});
+// L'invariant est « au-dessus des autres », pas « piste numéro N » : en vidant
+// sa piste d'origine, le clip déclenche le recompactage des indices, qui fait
+// redescendre tout le monde d'un cran. C'est le rang relatif qui compte.
+const basMonte = monte.clips.find((c) => c.id === "bas");
+const hautReste = monte.clips.find((c) => c.id === "haut");
+check("le clip passe au-dessus de l'autre", (basMonte?.track ?? 0) > (hautReste?.track ?? 0), true);
+check("aucune piste vide n'est laissée derrière", compactTrackIndices(monte.clips), monte.clips);
+check("une surcouche arrive muette", monte.clips.find((c) => c.id === "bas")?.audioEnabled, false);
+// pushHistory recompacte les indices : un clip déjà seul tout en haut ne peut
+// pas monter plus, sinon chaque appel laisserait une piste vide derrière lui.
+const dejaEnHaut = editorReducer(stateWith(covered, "haut"), {
+  type: "CLIP_TO_NEW_TRACK",
+  clipId: "haut",
+});
+check("un clip déjà seul tout en haut ne bouge pas", dejaEnHaut, stateWith(covered, "haut"));
 
 console.log("Déplacement d'un clip entre deux pistes");
 const moved = editorReducer(stateWith(covered, "haut"), {
@@ -687,7 +907,10 @@ const migre = migrateProject({
   createdAt: "",
   updatedAt: "",
 });
-check("le projet est ramené au format 8", migre.version, 8);
+check("le projet est ramené au format courant", migre.version, 9);
+// Un projet d'avant les zooms n'en gagne aucun : on n'ajoute pas de mouvement
+// à un montage que l'utilisateur avait validé sans.
+check("aucun zoom n'est inventé", migre.zooms, []);
 check("le cadrage par défaut est le recadrage", migre.framing, "crop");
 check("les clips sont recentrés", migre.clips[0].cropX, 0);
 check("les clips sans volume restent au niveau original", migre.clips[0].volume, 1);

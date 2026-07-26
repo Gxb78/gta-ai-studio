@@ -5,9 +5,11 @@ import { Inspector } from "./components/Inspector";
 import { MediaPanel } from "./components/MediaPanel";
 import { TextInspector } from "./components/TextInspector";
 import { TextPanel } from "./components/TextPanel";
+import { ZoomInspector } from "./components/ZoomInspector";
 import { PreviewStage, type ViewMode } from "./components/PreviewStage";
 import { ProjectsDialog } from "./components/ProjectsDialog";
 import { ShortcutsPanel } from "./components/ShortcutsPanel";
+import { SideGrip } from "./components/SideGrip";
 import { Timeline } from "./components/Timeline";
 import { ToolRail, type Tool } from "./components/ToolRail";
 import { TopBar, type SaveState } from "./components/TopBar";
@@ -28,6 +30,7 @@ import {
   editorReducer,
   effectiveClips,
   effectiveTextOverlays,
+  effectiveZooms,
   initialEditorState,
   newClipId,
 } from "./state/editor";
@@ -55,6 +58,11 @@ const MIN_TIMELINE_PX = 180;
 const MAX_TIMELINE_PX = 720;
 const DEFAULT_TIMELINE_PX = 320;
 
+/** Bornes du volet Inspecteur, en bas de la colonne de gauche. */
+const MIN_INSPECTOR_PX = 200;
+const MAX_INSPECTOR_PX = 900;
+const DEFAULT_INSPECTOR_PX = 420;
+
 export default function App() {
   if (import.meta.env.DEV) console.count("[render] App");
   const [state, dispatch] = useReducer(editorReducer, initialEditorState);
@@ -67,6 +75,7 @@ export default function App() {
   const [showSafeZones, setShowSafeZones] = useState(false);
   const [volume, setVolume] = useState(1);
   const [timelineHeight, setTimelineHeight] = useState(DEFAULT_TIMELINE_PX);
+  const [inspectorHeight, setInspectorHeight] = useState(DEFAULT_INSPECTOR_PX);
   const [exporting, setExporting] = useState(false);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
@@ -90,6 +99,7 @@ export default function App() {
 
   const clips = effectiveClips(state);
   const textOverlays = effectiveTextOverlays(state);
+  const zooms = effectiveZooms(state);
   const sources = state.project?.sources ?? EMPTY_SOURCES;
   const framing: FramingMode = state.project?.framing ?? "crop";
 
@@ -150,6 +160,7 @@ export default function App() {
       ...state.project,
       clips: state.clips,
       textOverlays: state.textOverlays,
+      zooms: state.zooms,
       updatedAt: new Date().toISOString(),
     };
     const timer = setTimeout(() => {
@@ -163,7 +174,7 @@ export default function App() {
         });
     }, 600);
     return () => clearTimeout(timer);
-  }, [state.clips, state.project, state.textOverlays]);
+  }, [state.clips, state.project, state.textOverlays, state.zooms]);
 
   // Progression d'import, affichée dans le panneau Médias.
   useEffect(() => {
@@ -209,7 +220,7 @@ export default function App() {
     const now = new Date().toISOString();
     const baseName = source.originalPath.split(/[\\/]/).pop() ?? "rush";
     const project: Project = {
-      version: 8,
+      version: 9,
       // Distinct de l'empreinte du rush : deux projets créés depuis le même
       // fichier partageraient sinon le même identifiant, donc le même fichier
       // JSON, et s'écraseraient l'un l'autre.
@@ -236,6 +247,7 @@ export default function App() {
         },
       ],
       textOverlays: [],
+      zooms: [],
       framing: "crop",
       createdAt: now,
       updatedAt: now,
@@ -356,6 +368,7 @@ export default function App() {
     )?.durationMs ?? 0;
   const selectedTextOverlay =
     textOverlays.find((overlay) => overlay.id === state.selectedTextOverlayId) ?? null;
+  const selectedZoom = zooms.find((zoom) => zoom.id === state.selectedZoomId) ?? null;
   const referenceFps =
     (selectedClip ? sources[selectedClip.sourceId]?.probe.fps : undefined) ??
     Object.values(sources)[0]?.probe.fps ??
@@ -404,6 +417,28 @@ export default function App() {
       const target = event.target as HTMLElement | null;
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
       if (!state.project || exporting) return;
+
+      // Les combinaisons Ctrl passent AVANT les touches simples : sans ce
+      // traitement séparé, Ctrl+V déclencherait aussi la branche « v », qui
+      // bascule sur l'outil de sélection.
+      if (event.ctrlKey && !event.shiftKey && !event.altKey) {
+        const key = event.key.toLowerCase();
+        if (key === "d" && state.selectedClipId) {
+          event.preventDefault();
+          dispatch({ type: "DUPLICATE_CLIP", clipId: state.selectedClipId });
+          return;
+        }
+        if (key === "c" && state.selectedClipId) {
+          event.preventDefault();
+          dispatch({ type: "COPY_CLIP", clipId: state.selectedClipId });
+          return;
+        }
+        if (key === "v" && state.clipboard) {
+          event.preventDefault();
+          dispatch({ type: "PASTE_CLIP", atMs: playback.clock.getPlayheadMs() });
+          return;
+        }
+      }
 
       if (event.key === "?" || (event.key === "/" && event.shiftKey)) {
         event.preventDefault();
@@ -457,7 +492,7 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [
     deleteSelected, exporting, playback.clock, playback.durationMs, playback.seek, playback.toggle,
-    referenceFps, splitAtPlayhead, state.project,
+    referenceFps, splitAtPlayhead, state.clipboard, state.project, state.selectedClipId,
     toggleClipAudio, trimSelected,
   ]);
 
@@ -539,6 +574,12 @@ export default function App() {
           onToggleInspector={() => setInspectorOpen((open) => !open)}
         />
 
+        {/* Colonne de gauche, en deux volets : la bibliothèque en haut,
+            l'inspecteur en bas. Les deux sont des panneaux « de côté » ; les
+            réunir libère toute la droite pour l'image et le montage. La colonne
+            entière disparaît quand ses deux volets sont repliés. */}
+        {(mediaOpen || textOpen || inspectorOpen) && (
+          <div className="side-column">
         {mediaOpen && (
           <MediaPanel
             sources={Object.values(sources)}
@@ -555,7 +596,7 @@ export default function App() {
                 atMs: playback.clock.getPlayheadMs(),
               })
             }
-            onBeginDrag={(source) => setPendingSource(source)}
+            onBeginDrag={setPendingSource}
             onRelocate={(source) => void handleRelocate(source)}
             onCollapse={() => setMediaOpen(false)}
           />
@@ -577,46 +618,35 @@ export default function App() {
           />
         )}
 
-        <PreviewStage
-          videoA={videoA}
-          videoB={videoB}
-          audioA={audioA}
-          audioB={audioB}
-          activeIsA={playback.activeIsA}
-          inGap={playback.inGap}
-          framing={framing}
-          visibleClip={visibleClip}
-          transitionClip={transitionClip}
-          cropX={visibleClip?.cropX ?? 0}
-          sourceAspect={visibleSource ? sourceAspect(visibleSource.probe) : 16 / 9}
-          viewMode={viewMode}
-          onViewModeChange={setViewMode}
-          showSafeZones={showSafeZones}
-          onToggleSafeZones={() => setShowSafeZones((visible) => !visible)}
-          playing={playback.playing}
-          clock={playback.clock}
-          durationMs={playback.durationMs}
-          volume={volume}
-          onVolumeChange={setVolume}
-          onTogglePlay={playback.toggle}
-          onStepFrame={stepFrame}
-          onCommitCropX={
-            visibleClip
-              ? (cropX) => dispatch({ type: "SET_CLIP_CROP_X", clipId: visibleClip.id, cropX })
-              : null
-          }
-          textOverlays={textOverlays}
-          selectedTextOverlayId={state.selectedTextOverlayId}
-          onSelectTextOverlay={(textOverlayId) => {
-            dispatch({ type: "SELECT_TEXT", textOverlayId });
-            setInspectorOpen(true);
-          }}
-          onCommitTextPosition={(textOverlayId, x, y) =>
-            dispatch({ type: "UPDATE_TEXT", textOverlayId, patch: { x, y } })
-          }
-        />
+        {inspectorOpen && (mediaOpen || textOpen) && (
+          <SideGrip
+            height={inspectorHeight}
+            onHeightChange={(next) =>
+              setInspectorHeight(
+                Math.min(MAX_INSPECTOR_PX, Math.max(MIN_INSPECTOR_PX, next)),
+              )
+            }
+          />
+        )}
 
-        {inspectorOpen && selectedTextOverlay ? (
+        {/* Volet du bas. Il ne porte une hauteur fixe que s'il partage la
+            colonne : seul, il la prend tout entière. */}
+        {inspectorOpen && (
+        <div
+          className="side-pane-bottom"
+          style={mediaOpen || textOpen ? { height: inspectorHeight } : undefined}
+        >
+        {selectedZoom ? (
+          <ZoomInspector
+            zoom={selectedZoom}
+            durationMs={timelineDurationMs(state.clips)}
+            onUpdate={(patch) =>
+              dispatch({ type: "UPDATE_ZOOM", zoomId: selectedZoom.id, patch })
+            }
+            onDelete={() => dispatch({ type: "DELETE_ZOOM", zoomId: selectedZoom.id })}
+            onCollapse={() => setInspectorOpen(false)}
+          />
+        ) : selectedTextOverlay ? (
           <TextInspector
             overlay={selectedTextOverlay}
             durationMs={timelineDurationMs(state.clips)}
@@ -632,7 +662,7 @@ export default function App() {
             }
             onCollapse={() => setInspectorOpen(false)}
           />
-        ) : inspectorOpen ? (
+        ) : (
           <Inspector
             clip={selectedClip}
             source={selectedClip ? sources[selectedClip.sourceId] ?? null : null}
@@ -685,47 +715,114 @@ export default function App() {
               }
             }}
             onToggleAudio={toggleClipAudio}
+            canDelete={state.clips.length > 1}
             onDelete={deleteSelected}
             onCollapse={() => setInspectorOpen(false)}
           />
-        ) : null}
-      </div>
+        )}
+        </div>
+        )}
+        </div>
+        )}
 
-      <Timeline
-        clips={clips}
-        anchorClips={state.clips}
-        sources={sources}
-        pxPerSec={pxPerSec}
-        onPxPerSecChange={setPxPerSec}
-        compiledTimeline={compiledTimeline}
-        clock={playback.clock}
-        selectedClipId={state.selectedClipId}
-        textOverlays={textOverlays}
-        anchorTextOverlays={state.textOverlays}
-        selectedTextOverlayId={state.selectedTextOverlayId}
-        onSelectTextOverlay={(textOverlayId) =>
-          dispatch({ type: "SELECT_TEXT", textOverlayId })
-        }
-        onSeek={playback.seek}
-        onSelect={selectClip}
-        onPreviewFrame={playback.showFrame}
-        onPause={playback.pause}
-        onCloseGaps={() => dispatch({ type: "CLOSE_GAPS" })}
-        hiddenTracks={hiddenTracks}
-        lockedTracks={lockedTracks}
-        tool={tool}
-        pendingSource={pendingSource}
-        onDropSource={(source, atMs, track) => {
-          setPendingSource(null);
-          dispatch({ type: "ADD_SOURCE", source, atMs, track });
-        }}
-        onCancelDrop={() => setPendingSource(null)}
-        height={timelineHeight}
-        onHeightChange={(next) =>
-          setTimelineHeight(Math.min(MAX_TIMELINE_PX, Math.max(MIN_TIMELINE_PX, next)))
-        }
-        dispatch={dispatch}
-      />
+        {/* Colonne centrale : l'aperçu et le montage. La timeline ne traverse
+            plus toute la fenêtre — elle commence là où commence l'aperçu, si
+            bien que les panneaux latéraux tiennent toute la hauteur et que
+            l'œil garde une seule colonne de travail. */}
+        <div className="center">
+        <PreviewStage
+          videoA={videoA}
+          videoB={videoB}
+          audioA={audioA}
+          audioB={audioB}
+          activeIsA={playback.activeIsA}
+          inGap={playback.inGap}
+          framing={framing}
+          visibleClip={visibleClip}
+          transitionClip={transitionClip}
+          cropX={visibleClip?.cropX ?? 0}
+          sourceAspect={visibleSource ? sourceAspect(visibleSource.probe) : 16 / 9}
+          viewMode={viewMode}
+          onViewModeChange={setViewMode}
+          showSafeZones={showSafeZones}
+          onToggleSafeZones={() => setShowSafeZones((visible) => !visible)}
+          playing={playback.playing}
+          clock={playback.clock}
+          durationMs={playback.durationMs}
+          volume={volume}
+          onVolumeChange={setVolume}
+          onTogglePlay={playback.toggle}
+          onStepFrame={stepFrame}
+          onCommitCropX={
+            visibleClip
+              ? (cropX) => dispatch({ type: "SET_CLIP_CROP_X", clipId: visibleClip.id, cropX })
+              : null
+          }
+          zooms={zooms}
+          selectedZoom={selectedZoom}
+          onCommitZoomTarget={
+            selectedZoom
+              ? (x, y) =>
+                  dispatch({ type: "UPDATE_ZOOM", zoomId: selectedZoom.id, patch: { x, y } })
+              : null
+          }
+          textOverlays={textOverlays}
+          selectedTextOverlayId={state.selectedTextOverlayId}
+          onSelectTextOverlay={(textOverlayId) => {
+            dispatch({ type: "SELECT_TEXT", textOverlayId });
+            setInspectorOpen(true);
+          }}
+          onCommitTextPosition={(textOverlayId, x, y) =>
+            dispatch({ type: "UPDATE_TEXT", textOverlayId, patch: { x, y } })
+          }
+        />
+
+        <Timeline
+          clips={clips}
+          anchorClips={state.clips}
+          sources={sources}
+          pxPerSec={pxPerSec}
+          onPxPerSecChange={setPxPerSec}
+          compiledTimeline={compiledTimeline}
+          clock={playback.clock}
+          selectedClipId={state.selectedClipId}
+          textOverlays={textOverlays}
+          anchorTextOverlays={state.textOverlays}
+          selectedTextOverlayId={state.selectedTextOverlayId}
+          onSelectTextOverlay={(textOverlayId) =>
+            dispatch({ type: "SELECT_TEXT", textOverlayId })
+          }
+          zooms={zooms}
+          anchorZooms={state.zooms}
+          selectedZoomId={state.selectedZoomId}
+          onSelectZoom={(zoomId) => {
+            dispatch({ type: "SELECT_ZOOM", zoomId });
+            if (zoomId) setInspectorOpen(true);
+          }}
+          onSeek={playback.seek}
+          onSelect={selectClip}
+          onPreviewFrame={playback.showFrame}
+          onPause={playback.pause}
+          onCloseGaps={() => dispatch({ type: "CLOSE_GAPS" })}
+          hiddenTracks={hiddenTracks}
+          lockedTracks={lockedTracks}
+          tool={tool}
+          canPasteClip={state.clipboard !== null}
+          pendingSource={pendingSource}
+          onDropSource={(source, atMs, track) => {
+            setPendingSource(null);
+            dispatch({ type: "ADD_SOURCE", source, atMs, track });
+          }}
+          onCancelDrop={() => setPendingSource(null)}
+          height={timelineHeight}
+          onHeightChange={(next) =>
+            setTimelineHeight(Math.min(MAX_TIMELINE_PX, Math.max(MIN_TIMELINE_PX, next)))
+          }
+          dispatch={dispatch}
+        />
+        </div>
+
+      </div>
 
       {showShortcuts && (
         <ShortcutsPanel
@@ -751,6 +848,7 @@ export default function App() {
           sources={sources}
           compiledTimeline={compiledTimeline}
           textOverlays={state.textOverlays}
+          zooms={state.zooms}
           framing={framing}
           onSetFraming={(next) => dispatch({ type: "SET_FRAMING", framing: next })}
           missingIds={missingIds}

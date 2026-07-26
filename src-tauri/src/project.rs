@@ -37,11 +37,20 @@ fn is_safe_id(id: &str) -> bool {
 /// Chemins de proxy de tous les rushs du projet, formats 1 à 4 confondus.
 fn proxy_paths(project: &Value) -> Vec<&str> {
     let mut paths: Vec<&str> = Vec::new();
-    if let Some(path) = project.get("source").and_then(|s| s.get("proxyPath")).and_then(Value::as_str) {
+    if let Some(path) = project
+        .get("source")
+        .and_then(|s| s.get("proxyPath"))
+        .and_then(Value::as_str)
+    {
         paths.push(path);
     }
     if let Some(sources) = project.get("sources").and_then(Value::as_object) {
-        paths.extend(sources.values().filter_map(|s| s.get("proxyPath")).filter_map(Value::as_str));
+        paths.extend(
+            sources
+                .values()
+                .filter_map(|s| s.get("proxyPath"))
+                .filter_map(Value::as_str),
+        );
     }
     paths
 }
@@ -93,7 +102,8 @@ pub fn save_project(app: AppHandle, project: Value) -> Result<(), String> {
 
     // Passe-plat strict : ce qui est sérialisé ici est exactement ce que
     // l'interface a envoyé, champ pour champ.
-    let payload = serde_json::to_vec_pretty(&project).map_err(|e| format!("Sérialisation : {e}"))?;
+    let payload =
+        serde_json::to_vec_pretty(&project).map_err(|e| format!("Sérialisation : {e}"))?;
     let target = dir.join(format!("{id}.json"));
     let temp = dir.join(format!("{id}.json.tmp"));
     fs::write(&temp, payload).map_err(|e| format!("Écriture du projet impossible : {e}"))?;
@@ -119,7 +129,11 @@ pub fn load_last_project(app: AppHandle) -> Result<Option<Value>, String> {
         return Ok(None);
     };
     // Si le cache (proxy) a été nettoyé entre-temps, on repart de l'import.
-    Ok(if proxies_present(&project) { Some(project) } else { None })
+    Ok(if proxies_present(&project) {
+        Some(project)
+    } else {
+        None
+    })
 }
 
 /// Ouvre un projet désigné et le note comme dernier projet ouvert.
@@ -168,9 +182,20 @@ pub fn list_projects(app: AppHandle) -> Result<Vec<ProjectSummary>, String> {
         let thumb_path = proxy_thumb(&project);
         summaries.push(ProjectSummary {
             id: id.to_string(),
-            name: project.get("name").and_then(Value::as_str).unwrap_or("Sans titre").to_string(),
-            updated_at: project.get("updatedAt").and_then(Value::as_str).unwrap_or("").to_string(),
-            clip_count: project.get("clips").and_then(Value::as_array).map_or(0, Vec::len),
+            name: project
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Sans titre")
+                .to_string(),
+            updated_at: project
+                .get("updatedAt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            clip_count: project
+                .get("clips")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
             thumb_path,
         });
     }
@@ -182,12 +207,20 @@ pub fn list_projects(app: AppHandle) -> Result<Vec<ProjectSummary>, String> {
 /// Première vignette d'un rush du projet, si elle existe encore sur le disque.
 fn proxy_thumb(project: &Value) -> Option<String> {
     let first_thumbs = |source: &Value| -> Option<String> {
-        source.get("thumbPaths").and_then(Value::as_array)?.first()?.as_str().map(String::from)
+        source
+            .get("thumbPaths")
+            .and_then(Value::as_array)?
+            .first()?
+            .as_str()
+            .map(String::from)
     };
-    let candidate = project
-        .get("source")
-        .and_then(first_thumbs)
-        .or_else(|| project.get("sources").and_then(Value::as_object)?.values().find_map(first_thumbs));
+    let candidate = project.get("source").and_then(first_thumbs).or_else(|| {
+        project
+            .get("sources")
+            .and_then(Value::as_object)?
+            .values()
+            .find_map(first_thumbs)
+    });
     candidate.filter(|p| std::path::Path::new(p).is_file())
 }
 
@@ -243,7 +276,10 @@ mod tests {
 
         // Simule exactement ce que fait save_project, sans écrire sur le disque.
         let relu: Value = serde_json::from_str(&serde_json::to_string(&brut).unwrap()).unwrap();
-        assert_eq!(relu, brut, "le document doit ressortir identique, byte pour byte");
+        assert_eq!(
+            relu, brut,
+            "le document doit ressortir identique, byte pour byte"
+        );
     }
 
     #[test]
@@ -256,9 +292,15 @@ mod tests {
     #[test]
     fn les_proxys_sont_lus_dans_les_deux_formats() {
         let mono = serde_json::json!({ "source": { "proxyPath": "/tmp/inexistant.mp4" } });
-        assert!(!proxies_present(&mono), "un chemin qui n'existe pas ne doit jamais passer");
+        assert!(
+            !proxies_present(&mono),
+            "un chemin qui n'existe pas ne doit jamais passer"
+        );
 
         let multi = serde_json::json!({ "sources": {} });
-        assert!(!proxies_present(&multi), "aucun rush référencé : rien à ouvrir");
+        assert!(
+            !proxies_present(&multi),
+            "aucun rush référencé : rien à ouvrir"
+        );
     }
 }

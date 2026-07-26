@@ -310,14 +310,127 @@ export interface TextOverlay {
   fadeOutMs: number;
 }
 
+const finiteOr = (value: number, fallback: number): number =>
+  Number.isFinite(value) ? value : fallback;
+
+/**
+ * Zoom animé sur une portion du cadre de sortie.
+ *
+ * Le geste que ça décrit : « pendant ces quelques secondes, rapproche-toi de
+ * la mini-carte, puis reviens à la vue d'avant ». Le zoom est donc un objet
+ * BORNÉ DANS LE TEMPS posé sur la timeline, comme un titre — pas un réglage de
+ * clip. Il s'applique après l'aplatissement, sur l'image de sortie : ce qui est
+ * zoomé est ce qui est visible à cet instant, quel que soit le clip qui le
+ * fournit, et un fondu enchaîné se zoome donc entièrement.
+ *
+ * `x` et `y` désignent le point visé, en fraction du CADRE DE SORTIE (0,5 =
+ * centre), pas du rush. C'est ce qu'on montre du doigt dans l'aperçu.
+ */
+export interface ZoomRegion {
+  id: string;
+  timelineStartMs: number;
+  timelineEndMs: number;
+  /** Agrandissement au plus fort du zoom. 1 = aucun. */
+  scale: number;
+  /** Point visé dans le cadre de sortie, de 0 à 1. */
+  x: number;
+  y: number;
+  /** Durées des rampes, exprimées dans le temps de la timeline. */
+  rampInMs: number;
+  rampOutMs: number;
+}
+
+export const MIN_ZOOM_DURATION_MS = 200;
+export const MIN_ZOOM_SCALE = 1;
+export const MAX_ZOOM_SCALE = 4;
+/** Une rampe plus longue que ça ne se lit plus comme un mouvement voulu. */
+export const MAX_ZOOM_RAMP_MS = 3_000;
+
+export const clampZoomScale = (scale: number): number =>
+  Number.isFinite(scale) ? Math.min(MAX_ZOOM_SCALE, Math.max(MIN_ZOOM_SCALE, scale)) : 1;
+
+/**
+ * Une rampe ne peut pas dépasser la moitié de la durée du zoom : au-delà,
+ * l'aller et le retour se chevaucheraient et le zoom n'atteindrait jamais sa
+ * valeur. Même borne que les fondus, pour la même raison.
+ */
+export const clampZoomRampMs = (rampMs: number, durationMs: number): number => {
+  if (!Number.isFinite(rampMs) || rampMs <= 0) return 0;
+  return Math.min(rampMs, MAX_ZOOM_RAMP_MS, Math.max(0, durationMs / 2));
+};
+
+/**
+ * Agrandissement effectif à un instant de la timeline.
+ *
+ * UNE SEULE définition de la courbe, partout : l'aperçu la lit à chaque image,
+ * l'export en dérive son expression FFmpeg, et un test la fige. La dupliquer
+ * garantirait que le rendu final ne ressemble pas à ce qu'on a validé à
+ * l'écran — c'est déjà arrivé sur la découpe.
+ *
+ * Rampe linéaire à l'aller comme au retour. Hors des bornes du zoom, la valeur
+ * est exactement 1 : la vue d'avant est retrouvée à l'identique.
+ */
+export function zoomScaleAt(zoom: ZoomRegion, timelineMs: number): number {
+  if (timelineMs <= zoom.timelineStartMs || timelineMs >= zoom.timelineEndMs) return 1;
+  const peak = clampZoomScale(zoom.scale);
+  const elapsedMs = timelineMs - zoom.timelineStartMs;
+  const remainingMs = zoom.timelineEndMs - timelineMs;
+  const inGain = zoom.rampInMs > 0 ? Math.min(1, elapsedMs / zoom.rampInMs) : 1;
+  const outGain = zoom.rampOutMs > 0 ? Math.min(1, remainingMs / zoom.rampOutMs) : 1;
+  return 1 + (peak - 1) * Math.max(0, Math.min(inGain, outGain));
+}
+
+/**
+ * Zoom actif à un instant donné, ou null.
+ *
+ * Deux zooms ne se chevauchent jamais (le réducteur l'impose) : on peut donc
+ * en retenir un seul, sans avoir à composer des agrandissements.
+ */
+export const zoomAt = (zooms: ZoomRegion[], timelineMs: number): ZoomRegion | null =>
+  zooms.find(
+    (zoom) => timelineMs >= zoom.timelineStartMs && timelineMs < zoom.timelineEndMs,
+  ) ?? null;
+
+/**
+ * Décalage à appliquer pour que le point visé vienne au centre, en fraction du
+ * cadre, à un agrandissement donné.
+ *
+ * Borné pour ne jamais laisser entrer de bord noir : à l'agrandissement `s`, le
+ * centre de la fenêtre visible ne peut pas s'écarter du centre de plus de
+ * `(1 − 1/s)/2`. C'est cette borne qui fait qu'un zoom visant un coin s'arrête
+ * proprement sur le coin au lieu de sortir du cadre.
+ */
+export function zoomOffset(target: number, scale: number): number {
+  if (scale <= 1) return 0;
+  const limit = (1 - 1 / scale) / 2;
+  const wanted = Math.min(1, Math.max(0, target)) - 0.5;
+  return Math.min(limit, Math.max(-limit, wanted));
+}
+
+export function normalizeZoomRegion(zoom: ZoomRegion, durationMs: number): ZoomRegion {
+  const timelineStartMs = Math.max(0, Math.min(durationMs, finiteOr(zoom.timelineStartMs, 0)));
+  const timelineEndMs = Math.max(
+    Math.min(durationMs, timelineStartMs + MIN_ZOOM_DURATION_MS),
+    Math.min(durationMs, finiteOr(zoom.timelineEndMs, timelineStartMs + 2000)),
+  );
+  const zoomDurationMs = timelineEndMs - timelineStartMs;
+  return {
+    ...zoom,
+    timelineStartMs,
+    timelineEndMs,
+    scale: clampZoomScale(zoom.scale),
+    x: Math.min(1, Math.max(0, finiteOr(zoom.x, 0.5))),
+    y: Math.min(1, Math.max(0, finiteOr(zoom.y, 0.5))),
+    rampInMs: clampZoomRampMs(zoom.rampInMs, zoomDurationMs),
+    rampOutMs: clampZoomRampMs(zoom.rampOutMs, zoomDurationMs),
+  };
+}
+
 export const MAX_TEXT_LENGTH = 200;
 export const MIN_TEXT_DURATION_MS = 100;
 export const MIN_TEXT_SIZE_PX = 36;
 export const MAX_TEXT_SIZE_PX = 180;
 export const MAX_TEXT_FADE_MS = 2_000;
-
-const finiteOr = (value: number, fallback: number): number =>
-  Number.isFinite(value) ? value : fallback;
 
 export const clampTextFadeMs = (fadeMs: number, durationMs: number): number => {
   if (!Number.isFinite(fadeMs) || fadeMs <= 0) return 0;
@@ -362,13 +475,15 @@ export function normalizeTextOverlay(
 }
 
 export interface Project {
-  version: 8;
+  version: 9;
   id: string;
   name: string;
   /** Rushs du projet, indexés par leur empreinte. */
   sources: Record<string, SourceInfo>;
   clips: Clip[];
   textOverlays: TextOverlay[];
+  /** Zooms animés, posés sur la timeline comme les titres. */
+  zooms: ZoomRegion[];
   /** Passage au format vertical, partagé par l'aperçu et l'export. */
   framing: FramingMode;
   createdAt: string;
@@ -443,6 +558,8 @@ export interface ExportRequest {
   /** Plan audio : ce qui s'entend. Indépendant du plan vidéo. */
   audioSegments: ExportSegment[];
   textOverlays: TextOverlay[];
+  /** Zooms animés, appliqués au flux assemblé avant les titres. */
+  zooms: ZoomRegion[];
   mode: FramingMode;
   fileName: string;
   /** Vrai si au moins un rush a du son : les autres reçoivent du silence. */
@@ -760,7 +877,10 @@ type StoredTextOverlay = Partial<Omit<TextOverlay, "id" | "text">> & {
 };
 
 /** Forme d'un projet tel qu'il peut sortir du disque, tous formats confondus. */
-export type StoredProject = Omit<Project, "version" | "sources" | "clips" | "textOverlays" | "framing"> & {
+export type StoredProject = Omit<
+  Project,
+  "version" | "sources" | "clips" | "textOverlays" | "zooms" | "framing"
+> & {
   version: number;
   /** Format 1 et 2 : un seul rush, porté par le projet. */
   source?: SourceInfo | null;
@@ -770,7 +890,12 @@ export type StoredProject = Omit<Project, "version" | "sources" | "clips" | "tex
   framing?: FramingMode | null;
   clips: StoredClip[];
   textOverlays?: StoredTextOverlay[] | null;
+  /** Format 9 : zooms animés. Absent des projets antérieurs. */
+  zooms?: StoredZoomRegion[] | null;
 };
+
+/** Zoom tel qu'il peut apparaître sur le disque : tout champ peut manquer. */
+export type StoredZoomRegion = Partial<ZoomRegion> & { id?: unknown };
 
 /**
  * Ramène un projet du disque au format courant.
@@ -852,8 +977,29 @@ export function migrateProject(stored: StoredProject): Project {
     )
     .filter((overlay) => overlay.timelineEndMs > overlay.timelineStartMs);
 
+  // Projets antérieurs aux zooms : aucun zoom, donc aucun mouvement ajouté à
+  // un montage que l'utilisateur avait validé sans.
+  const zooms = (stored.zooms ?? [])
+    .filter((zoom) => zoom && typeof zoom.id === "string")
+    .map((zoom) =>
+      normalizeZoomRegion(
+        {
+          id: zoom.id as string,
+          timelineStartMs: zoom.timelineStartMs ?? 0,
+          timelineEndMs: zoom.timelineEndMs ?? 2000,
+          scale: zoom.scale ?? 1.6,
+          x: zoom.x ?? 0.5,
+          y: zoom.y ?? 0.5,
+          rampInMs: zoom.rampInMs ?? 400,
+          rampOutMs: zoom.rampOutMs ?? 400,
+        },
+        durationMs,
+      ),
+    )
+    .filter((zoom) => zoom.timelineEndMs > zoom.timelineStartMs);
+
   return {
-    version: 8,
+    version: 9,
     id: stored.id,
     name: stored.name,
     sources,
@@ -862,6 +1008,7 @@ export function migrateProject(stored: StoredProject): Project {
     // correctif) : on les compacte une fois pour toutes à l'entrée.
     clips: compactTrackIndices(clips),
     textOverlays,
+    zooms,
     // Projets antérieurs au cadrage porté par le projet : c'est le recadrage
     // centré qui était proposé par défaut dans la fenêtre d'export.
     framing: stored.framing === "blur" ? "blur" : "crop",

@@ -1,4 +1,5 @@
 import { Icon } from "./Icon";
+import { InspectorSection } from "./InspectorSection";
 import type { TextOverlay, TextStyle } from "../types";
 import {
   MAX_TEXT_FADE_MS,
@@ -45,8 +46,7 @@ export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onColla
           <Icon name="close" size={15} />
         </button>
       </div>
-      <section className="inspector-section">
-        <h3>Contenu</h3>
+      <InspectorSection title="Contenu" summary={overlay.text.split(/\r?\n/)[0]}>
         <textarea
           className="text-content-input"
           value={overlay.text}
@@ -56,9 +56,11 @@ export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onColla
           aria-label="Texte du titre"
         />
         <span className="muted small-text">{overlay.text.length}/{MAX_TEXT_LENGTH}</span>
-      </section>
-      <section className="inspector-section">
-        <h3>Style</h3>
+      </InspectorSection>
+      <InspectorSection
+        title="Style"
+        summary={STYLES.find((style) => style.value === overlay.style)?.label}
+      >
         <div className="chip-row">
           {STYLES.map((style) => (
             <button
@@ -83,9 +85,11 @@ export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onColla
           />
           <span className="slider-value">{Math.round(overlay.fontSizePx)} px</span>
         </label>
-      </section>
-      <section className="inspector-section">
-        <h3>Position</h3>
+      </InspectorSection>
+      <InspectorSection
+        title="Position"
+        summary={`${Math.round(overlay.x * 100)} % · ${Math.round(overlay.y * 100)} %`}
+      >
         {(["x", "y"] as const).map((axis) => (
           <label className="slider-row" key={axis}>
             <span className="fade-label">{axis.toUpperCase()}</span>
@@ -100,9 +104,11 @@ export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onColla
             <span className="slider-value">{Math.round(overlay[axis] * 100)} %</span>
           </label>
         ))}
-      </section>
-      <section className="inspector-section">
-        <h3>Timing</h3>
+      </InspectorSection>
+      <InspectorSection
+        title="Timing"
+        summary={`${(overlay.timelineStartMs / 1000).toFixed(1)} s · ${duration.toFixed(1)} s`}
+      >
         <div className="text-time-grid">
           <label>
             <span>Début</span>
@@ -132,9 +138,15 @@ export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onColla
             />
           </label>
         </div>
-      </section>
-      <section className="inspector-section">
-        <h3>Animation</h3>
+      </InspectorSection>
+      <InspectorSection
+        title="Animation"
+        summary={
+          overlay.fadeInMs === 0 && overlay.fadeOutMs === 0
+            ? "Aucune"
+            : `${fadeLabel(overlay.fadeInMs)} / ${fadeLabel(overlay.fadeOutMs)}`
+        }
+      >
         <div className="fade-control">
           <label className="slider-row">
             <span className="fade-label">Entrée</span>
@@ -172,13 +184,13 @@ export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onColla
             Retirer les fondus
           </button>
         )}
-      </section>
-      <section className="inspector-section">
+      </InspectorSection>
+      <div className="panel-danger">
         <button type="button" className="ghost small warn" onClick={onDelete}>
           <Icon name="trash" size={15} />
           Supprimer le titre
         </button>
-      </section>
+      </div>
     </aside>
   );
 }

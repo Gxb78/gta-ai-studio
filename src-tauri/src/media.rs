@@ -264,6 +264,73 @@ fn escape_filter_path(path: &Path) -> String {
         .replace('\'', "\\'")
 }
 
+/// Expression `zoompan` d'un zoom animé.
+///
+/// Elle DOIT décrire exactement la même courbe que `zoomScaleAt` côté
+/// TypeScript : deux rampes linéaires, un palier, et la valeur 1 hors des
+/// bornes. Si les deux divergent, l'utilisateur valide un mouvement à l'écran
+/// et en obtient un autre dans le fichier — c'est précisément ce que la règle
+/// « l'aperçu EST la sortie » interdit.
+///
+/// `zoompan` ne sait pas revenir en arrière dans le temps : il évalue `z` image
+/// par image à partir de `it`, l'horodatage d'entrée. On lui donne donc une
+/// expression fermée du temps, sans récurrence sur la valeur précédente.
+///
+/// Le décalage reprend `zoomOffset` : le point visé vient au centre, borné pour
+/// qu'aucun bord noir n'entre dans le cadre. `zoompan` exprime cette borne
+/// naturellement, puisque `x` est la position du COIN de la fenêtre et qu'on la
+/// contraint entre 0 et `iw - iw/zoom`.
+fn zoompan_filter(zooms: &[ExportZoom], fps: f64) -> String {
+    let mut z_expr = String::from("1");
+    let mut x_expr = String::from("0");
+    let mut y_expr = String::from("0");
+
+    for zoom in zooms {
+        let start = zoom.timeline_start_ms / 1000.0;
+        let end = zoom.timeline_end_ms / 1000.0;
+        if end <= start {
+            continue;
+        }
+        let peak = zoom.scale.clamp(1.0, 4.0);
+        let duration = end - start;
+        // Mêmes bornes que `clampZoomRampMs` : jamais plus de la moitié de la
+        // durée, sinon l'aller et le retour se chevaucheraient.
+        let half = duration / 2.0;
+        let ramp_in = zoom.ramp_in_ms.max(0.0).min(3000.0).min(half * 1000.0) / 1000.0;
+        let ramp_out = zoom.ramp_out_ms.max(0.0).min(3000.0).min(half * 1000.0) / 1000.0;
+
+        // Gain d'enveloppe : min(rampe d'entrée, rampe de sortie), borné à 1.
+        let gain_in = if ramp_in > 0.0 {
+            format!("min(1,(it-{start:.6})/{ramp_in:.6})")
+        } else {
+            "1".to_string()
+        };
+        let gain_out = if ramp_out > 0.0 {
+            format!("min(1,({end:.6}-it)/{ramp_out:.6})")
+        } else {
+            "1".to_string()
+        };
+        let gain = format!("max(0,min({gain_in},{gain_out}))");
+        let inside = format!("between(it,{start:.6},{end:.6})");
+        z_expr = format!("if({inside},1+{delta:.6}*{gain},{z_expr})", delta = peak - 1.0);
+
+        // Le point visé, en fraction du cadre, ramené au coin de la fenêtre.
+        // `zoom` est la valeur courante calculée par le filtre lui-même.
+        x_expr = format!(
+            "if({inside},max(0,min(iw-iw/zoom,iw*{x:.6}-(iw/zoom)/2)),{x_expr})",
+            x = zoom.x.clamp(0.0, 1.0)
+        );
+        y_expr = format!(
+            "if({inside},max(0,min(ih-ih/zoom,ih*{y:.6}-(ih/zoom)/2)),{y_expr})",
+            y = zoom.y.clamp(0.0, 1.0)
+        );
+    }
+
+    format!(
+        "zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d=1:s={OUT_WIDTH}x{OUT_HEIGHT}:fps={fps:.3}"
+    )
+}
+
 fn drawtext_filter(overlay: &ExportTextOverlay, text_path: &Path, font_path: &Path) -> String {
     let style = match overlay.style.as_str() {
         "impact" => "borderw=8:bordercolor=black",
@@ -558,6 +625,25 @@ pub struct ExportTextOverlay {
     pub fade_out_ms: f64,
 }
 
+/// Zoom animé sur l'image de sortie.
+///
+/// Les bornes et les rampes sont exprimées dans le temps de la TIMELINE, comme
+/// côté TypeScript : le filtre s'applique après l'assemblage, sur le flux
+/// final, donc son horloge est celle du montage.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportZoom {
+    pub timeline_start_ms: f64,
+    pub timeline_end_ms: f64,
+    pub scale: f64,
+    pub x: f64,
+    pub y: f64,
+    #[serde(default)]
+    pub ramp_in_ms: f64,
+    #[serde(default)]
+    pub ramp_out_ms: f64,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportRequest {
@@ -570,6 +656,9 @@ pub struct ExportRequest {
     pub audio_segments: Vec<ExportSegment>,
     #[serde(default)]
     pub text_overlays: Vec<ExportTextOverlay>,
+    /// Zooms animés. Absents des projets antérieurs au format 9.
+    #[serde(default)]
+    pub zooms: Vec<ExportZoom>,
     pub mode: String,
     pub file_name: String,
     /// Vrai si au moins un rush a du son : les autres reçoivent du silence.
@@ -1268,6 +1357,18 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     assemble_video_parts(&mut graph, &parts)?;
 
     let mut video_output_label = "vbase".to_string();
+
+    // Le zoom s'applique sur l'image assemblée et AVANT les titres : un titre
+    // est une incrustation de l'interface, il ne grossit pas avec l'image.
+    // L'aperçu place sa couche zoomée au même endroit de la pile.
+    if !request.zooms.is_empty() {
+        graph += &format!(
+            "[{video_output_label}]{}[vzoom];",
+            zoompan_filter(&request.zooms, request.frame_fps)
+        );
+        video_output_label = "vzoom".to_string();
+    }
+
     for (index, overlay) in request.text_overlays.iter().enumerate() {
         let next_label = format!("vtext{index}");
         let font = if overlay.style == "impact" {

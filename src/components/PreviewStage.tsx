@@ -15,9 +15,23 @@
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
 import type { Clip, FramingMode, TextOverlay } from "../types";
-import { cropXPercent, textFadeGainAt, videoFadeGainAt } from "../types";
+import type { ZoomRegion } from "../types";
+import {
+  OUTPUT_HEIGHT,
+  OUTPUT_WIDTH,
+  clampCropX,
+  cropXPercent,
+  textFadeGainAt,
+  videoFadeGainAt,
+  zoomAt,
+  zoomOffset,
+  zoomScaleAt,
+} from "../types";
 import type { PlaybackClock } from "../playback/usePlayback";
 import { PlaybackTimecode } from "./PlaybackTimecode";
+
+/** Format de sortie, en rapport largeur/hauteur. */
+const OUTPUT_RATIO = OUTPUT_WIDTH / OUTPUT_HEIGHT;
 
 /** Définition du fond flou. Volontairement minuscule : il est flouté ensuite. */
 const BLUR_W = 90;
@@ -71,6 +85,12 @@ interface Props {
    * déplacement ne remplit pas l'historique d'annulation.
    */
   onCommitCropX: ((cropX: number) => void) | null;
+  /** Zooms animés du montage, appliqués à l'image de sortie. */
+  zooms: ZoomRegion[];
+  /** Zoom sélectionné : c'est le seul dont on montre et déplace le point visé. */
+  selectedZoom: ZoomRegion | null;
+  /** Point visé déplacé à la souris. Appelé une fois, au relâchement. */
+  onCommitZoomTarget: ((x: number, y: number) => void) | null;
   textOverlays: TextOverlay[];
   selectedTextOverlayId: string | null;
   onSelectTextOverlay: (id: string) => void;
@@ -84,10 +104,19 @@ export function PreviewStage(props: Props) {
     cropX, sourceAspect,
     viewMode, onViewModeChange, showSafeZones, onToggleSafeZones, playing, clock,
     durationMs, volume, onVolumeChange, onTogglePlay, onStepFrame, onCommitCropX,
+    zooms, selectedZoom, onCommitZoomTarget,
     textOverlays, selectedTextOverlayId, onSelectTextOverlay, onCommitTextPosition,
   } = props;
 
   const frameRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * Couche qui porte le zoom. Elle enveloppe TOUT ce qui compose l'image de
+   * sortie — les deux balises vidéo, le fond flou, la couche de fondu au noir —
+   * mais PAS les titres : à l'export, `drawtext` est appliqué après le zoom,
+   * donc un titre ne grossit pas avec l'image. L'aperçu doit mentir aussi peu
+   * ici qu'ailleurs.
+   */
+  const zoomLayerRef = useRef<HTMLDivElement | null>(null);
   const blurRef = useRef<HTMLCanvasElement | null>(null);
   const fadeRef = useRef<HTMLDivElement | null>(null);
   const textNodesRef = useRef(new Map<string, HTMLDivElement>());
@@ -102,22 +131,59 @@ export function PreviewStage(props: Props) {
    */
   const draggedRef = useRef(false);
   const effectiveCropX = dragCropX ?? cropX;
-  // Le cadrage ne se déplace que là où il a un sens : sur le cadre de sortie,
-  // en mode recadrage, et si un clip est visible pour le recevoir.
-  const cropDraggable = framing === "crop" && onCommitCropX !== null;
+  /**
+   * Largeur conservée par le cadrage, en fraction de la largeur du rush.
+   *
+   * Un rush 16:9 recadré en 9:16 ne garde qu'un peu moins d'un tiers de sa
+   * largeur ; c'est cette fraction qui donne la taille du viseur et la course
+   * disponible.
+   */
+  const keptFraction = Math.min(1, OUTPUT_RATIO / sourceAspect);
+  // Le cadrage ne se déplace que là où il a un sens : en mode recadrage, si un
+  // clip est visible pour le recevoir, et si le rush est réellement plus large
+  // que la sortie — un rush déjà vertical n'a aucune marge à parcourir.
+  const cropDraggable =
+    framing === "crop" && onCommitCropX !== null && keptFraction < 0.999;
+
+  /**
+   * Course réelle du cadrage, en pixels.
+   *
+   * La même dans les deux vues, et ce n'est pas une coïncidence : en vue
+   * « sortie » c'est la largeur d'image qui déborde du cadre 9:16, en vue
+   * « rush entier » c'est la largeur de rush que le viseur peut parcourir.
+   * Les deux valent `hauteur × (format du rush − format de sortie)`.
+   *
+   * C'est CETTE valeur que le geste doit diviser. L'ancien code divisait par la
+   * largeur du cadre : sur un rush 16:9, le cadrage filait plus de deux fois
+   * trop vite et l'image fuyait sous le doigt.
+   */
+  const cropTravelPx = (): number => {
+    const el = frameRef.current;
+    if (!el) return 0;
+    return el.clientHeight * (sourceAspect - OUTPUT_RATIO);
+  };
 
   /**
    * Déplacement horizontal du cadrage à la souris.
    *
    * Un simple clic reste un clic (lecture / pause) : le geste ne devient un
    * déplacement qu'au-delà d'un seuil, comme sur la timeline.
+   *
+   * Le SENS dépend de ce qu'on tire. En vue « sortie » on pousse l'IMAGE
+   * derrière un cadre fixe : la tirer vers la droite révèle sa partie gauche,
+   * donc le cadrage recule. En vue « rush entier » on déplace le VISEUR sur une
+   * image fixe : il suit la main. Un viseur qui partirait à gauche quand la
+   * main va à droite serait injouable.
    */
   const beginCropDrag = (event: React.PointerEvent) => {
     if (!cropDraggable || event.button !== 0) return;
-    const width = frameRef.current?.clientWidth ?? 0;
-    if (width === 0) return;
+    const travel = cropTravelPx();
+    if (travel <= 1) return;
+    const direction = outputView ? -1 : 1;
     const startX = event.clientX;
     const origin = cropX;
+    const at = (clientX: number): number =>
+      clampCropX(origin + (direction * 2 * (clientX - startX)) / travel);
     let engaged = false;
     const abort = new AbortController();
     const options = { signal: abort.signal } as const;
@@ -125,24 +191,20 @@ export function PreviewStage(props: Props) {
     window.addEventListener(
       "pointermove",
       (move: PointerEvent) => {
-        const dx = move.clientX - startX;
-        if (!engaged && Math.abs(dx) < 4) return;
+        if (!engaged && Math.abs(move.clientX - startX) < 4) return;
         engaged = true;
         draggedRef.current = true;
-        // Tirer l'image vers la droite révèle sa partie gauche : le cadrage
-        // recule d'autant. Une largeur de cadre parcourt toute la marge.
-        setDragCropX(Math.min(1, Math.max(-1, origin - (2 * dx) / width)));
+        setDragCropX(at(move.clientX));
       },
       options,
     );
     const stop = (up: PointerEvent) => {
       abort.abort();
-      const dx = up.clientX - startX;
       if (!engaged) {
         setDragCropX(null);
         return;
       }
-      const next = Math.min(1, Math.max(-1, origin - (2 * dx) / width));
+      const next = at(up.clientX);
       setDragCropX(null);
       onCommitCropX?.(next);
     };
@@ -223,6 +285,88 @@ export function PreviewStage(props: Props) {
     return clock.subscribe(updateFade);
   }, [clock, visibleClip]);
 
+  /**
+   * Zoom appliqué à chaque image, depuis l'horloge impérative — comme les
+   * fondus, et pour la même raison : repasser par un rendu React à chaque image
+   * coûterait le budget de la lecture.
+   *
+   * `transform-origin` est fixé au centre et le décalage est exprimé en
+   * pourcentage de la couche, donc en fraction du cadre de sortie : c'est
+   * exactement ce que `zoomOffset` calcule, et ce que l'export applique.
+   */
+  useEffect(() => {
+    const updateZoom = (playheadMs: number) => {
+      const node = zoomLayerRef.current;
+      if (!node) return;
+      // Le zoom décrit le cadre de SORTIE : en vue « rush entier » on regarde
+      // volontairement à côté, on ne l'applique donc pas.
+      const zoom = outputView ? zoomAt(zooms, playheadMs) : null;
+      if (!zoom) {
+        node.style.transform = "";
+        return;
+      }
+      const scale = zoomScaleAt(zoom, playheadMs);
+      if (scale <= 1) {
+        node.style.transform = "";
+        return;
+      }
+      const dx = zoomOffset(zoom.x, scale) * 100;
+      const dy = zoomOffset(zoom.y, scale) * 100;
+      node.style.transform = `scale(${scale}) translate(${-dx}%, ${-dy}%)`;
+    };
+    updateZoom(clock.getPlayheadMs());
+    return clock.subscribe(updateZoom);
+  }, [clock, outputView, zooms]);
+
+  /** Point visé en cours de déplacement : il prime sur celui du zoom. */
+  const [dragTarget, setDragTarget] = useState<{ x: number; y: number } | null>(null);
+  const zoomTarget = dragTarget ?? (selectedZoom ? { x: selectedZoom.x, y: selectedZoom.y } : null);
+
+  /**
+   * Déplacement du point visé, en fraction du cadre de sortie.
+   *
+   * Le repère se saisit lui-même : contrairement au cadrage, il ne s'agit pas
+   * de pousser l'image mais de désigner un endroit. Le point suit donc le
+   * pointeur exactement, et un clic simple le pose là où on a cliqué.
+   */
+  const beginZoomTargetDrag = (event: React.PointerEvent) => {
+    event.stopPropagation();
+    if (event.button !== 0 || !onCommitZoomTarget) return;
+    const frame = frameRef.current;
+    if (!frame) return;
+    const bounds = frame.getBoundingClientRect();
+    const abort = new AbortController();
+    const options = { signal: abort.signal } as const;
+    const at = (clientX: number, clientY: number) => ({
+      x: Math.min(1, Math.max(0, (clientX - bounds.left) / bounds.width)),
+      y: Math.min(1, Math.max(0, (clientY - bounds.top) / bounds.height)),
+    });
+    setDragTarget(at(event.clientX, event.clientY));
+    window.addEventListener(
+      "pointermove",
+      (move: PointerEvent) => {
+        draggedRef.current = true;
+        setDragTarget(at(move.clientX, move.clientY));
+      },
+      options,
+    );
+    const stop = (up: PointerEvent) => {
+      abort.abort();
+      const next = at(up.clientX, up.clientY);
+      setDragTarget(null);
+      onCommitZoomTarget(next.x, next.y);
+    };
+    window.addEventListener("pointerup", stop, options);
+    window.addEventListener(
+      "pointercancel",
+      () => {
+        abort.abort();
+        setDragTarget(null);
+      },
+      options,
+    );
+  };
+
   const beginTextDrag = (event: React.PointerEvent, overlay: TextOverlay) => {
     event.stopPropagation();
     if (event.button !== 0 || !outputView) return;
@@ -268,9 +412,20 @@ export function PreviewStage(props: Props) {
       ? `${cropXPercent(transitionClip.cropX)}% 50%`
       : objectPosition;
 
-  // Le viseur 9:16 du mode « rush entier » se place là où le cadrage regarde :
-  // il montre la portion réellement conservée, pas un rectangle décoratif.
-  const guideLeft = `${cropXPercent(effectiveCropX)}%`;
+  /**
+   * Viseur 9:16 du mode « rush entier ».
+   *
+   * `left: P%` place son BORD GAUCHE à P % de la largeur du rush ; la
+   * translation de −P % de sa PROPRE largeur le ramène d'autant. Le bord gauche
+   * atterrit donc à `P × (1 − largeur du viseur)`, ce qui est exactement la
+   * définition de `object-position: P% ` — donc exactement ce que fait le
+   * filtre `crop` de l'export.
+   *
+   * Un `translateX(-50%)` fixe, comme avant, centrait le viseur sur la
+   * position : à cadrage extrême il débordait de moitié hors du rush et
+   * annonçait une portion que l'export n'écrit pas. L'aperçu ne ment pas.
+   */
+  const guidePercent = cropXPercent(effectiveCropX);
 
   return (
     <div className="stage">
@@ -297,10 +452,15 @@ export function PreviewStage(props: Props) {
           tabIndex={-1}
           title={
             cropDraggable
-              ? "Cliquer pour lire · tirer horizontalement pour déplacer le cadrage"
+              ? outputView
+                ? "Cliquer pour lire · tirer l'image pour choisir la partie gardée"
+                : "Cliquer pour lire · tirer pour déplacer le viseur 9:16"
               : "Cliquer pour lire ou mettre en pause"
           }
         >
+          {/* Couche zoomée : tout ce qui compose l'image de sortie. Les titres
+              et les repères restent en dehors, comme à l'export. */}
+          <div className="zoom-layer" ref={zoomLayerRef}>
           {blurred && (
             <canvas
               className="stage-blur"
@@ -335,6 +495,18 @@ export function PreviewStage(props: Props) {
           <audio ref={audioA} preload="auto" />
           <audio ref={audioB} preload="auto" />
           <div ref={fadeRef} className="preview-video-fade" aria-hidden="true" />
+          </div>
+
+          {outputView && zoomTarget && (
+            <div
+              className="zoom-target"
+              style={{ left: `${zoomTarget.x * 100}%`, top: `${zoomTarget.y * 100}%` }}
+              onPointerDown={beginZoomTargetDrag}
+              title="Point visé par le zoom — tirer pour le déplacer"
+            >
+              <span aria-hidden="true" />
+            </div>
+          )}
 
           {inGap && (
             <div className="preview-gap">
@@ -369,8 +541,15 @@ export function PreviewStage(props: Props) {
           {!outputView && (
             <div
               className="guide-916"
-              style={{ left: guideLeft }}
-              title="Portion conservée par le cadrage vertical"
+              style={{
+                left: `${guidePercent}%`,
+                transform: `translateX(-${guidePercent}%)`,
+              }}
+              title={
+                cropDraggable
+                  ? "Portion conservée — tirer le viseur pour la déplacer"
+                  : "Portion conservée par le cadrage vertical"
+              }
             >
               <span>9:16</span>
             </div>
@@ -394,34 +573,38 @@ export function PreviewStage(props: Props) {
       </div>
 
       <div className="viewer-bar">
+        {/* Les trois commandes de lecture forment un seul groupe soudé : ce sont
+            les seules de la barre qu'on utilise sans quitter l'image des yeux. */}
         <div className="viewer-group">
-          <button
-            type="button"
-            className="icon-btn ghost"
-            onClick={() => onStepFrame(-1)}
-            title="Image précédente · ←"
-            aria-label="Image précédente"
-          >
-            <Icon name="stepBack" size={16} />
-          </button>
-          <button
-            type="button"
-            className="play-btn"
-            onClick={onTogglePlay}
-            title={playing ? "Pause · Espace" : "Lecture · Espace"}
-            aria-label={playing ? "Pause" : "Lecture"}
-          >
-            <Icon name={playing ? "pause" : "play"} size={18} />
-          </button>
-          <button
-            type="button"
-            className="icon-btn ghost"
-            onClick={() => onStepFrame(1)}
-            title="Image suivante · →"
-            aria-label="Image suivante"
-          >
-            <Icon name="stepForward" size={16} />
-          </button>
+          <div className="transport">
+            <button
+              type="button"
+              className="icon-btn ghost"
+              onClick={() => onStepFrame(-1)}
+              title="Image précédente · ←"
+              aria-label="Image précédente"
+            >
+              <Icon name="stepBack" size={16} />
+            </button>
+            <button
+              type="button"
+              className="play-btn"
+              onClick={onTogglePlay}
+              title={playing ? "Pause · Espace" : "Lecture · Espace"}
+              aria-label={playing ? "Pause" : "Lecture"}
+            >
+              <Icon name={playing ? "pause" : "play"} size={18} />
+            </button>
+            <button
+              type="button"
+              className="icon-btn ghost"
+              onClick={() => onStepFrame(1)}
+              title="Image suivante · →"
+              aria-label="Image suivante"
+            >
+              <Icon name="stepForward" size={16} />
+            </button>
+          </div>
           <PlaybackTimecode clock={clock} durationMs={durationMs} />
         </div>
 

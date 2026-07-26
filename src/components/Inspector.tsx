@@ -5,6 +5,7 @@
 // niveaux sont donc séparés visuellement, pour qu'on ne croie jamais régler un
 // clip alors qu'on règle le montage entier.
 
+import { EmptyState } from "./EmptyState";
 import { Icon } from "./Icon";
 import { InspectorSection } from "./InspectorSection";
 import { sourceName } from "./MediaPanel";
@@ -37,6 +38,8 @@ interface Props {
   effectiveTransitionMs: number;
   onSetTransitionIn: (durationMs: number) => void;
   onToggleAudio: () => void;
+  /** Faux sur le dernier clip : le réducteur en garde toujours un au montage. */
+  canDelete: boolean;
   onDelete: () => void;
   onCollapse: () => void;
 }
@@ -96,10 +99,11 @@ export function Inspector(props: Props) {
       </InspectorSection>
 
       {!clip || !source ? (
-        <p className="muted small-text panel-empty">
-          Sélectionne un clip sur la timeline pour régler son cadrage, sa vitesse et son
-          son.
-        </p>
+        <EmptyState
+          icon="cursor"
+          title="Aucun clip sélectionné."
+          hint="Clique un clip sur la timeline pour régler son cadrage, sa vitesse, ses fondus et son son."
+        />
       ) : (
         <>
           <InspectorSection title="Clip" summary={sourceName(source)}>
@@ -325,7 +329,17 @@ export function Inspector(props: Props) {
           </InspectorSection>
 
           <div className="panel-danger">
-            <button type="button" className="ghost small warn" onClick={props.onDelete}>
+            <button
+              type="button"
+              className="ghost small warn"
+              onClick={props.onDelete}
+              disabled={!props.canDelete}
+              title={
+                props.canDelete
+                  ? "Supprimer le clip"
+                  : "Le montage garde toujours au moins un clip"
+              }
+            >
               <Icon name="trash" size={15} />
               Supprimer le clip
             </button>

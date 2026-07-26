@@ -62,7 +62,16 @@ export function TopBar(props: Props) {
   return (
     <header className="topbar">
       <div className="topbar-left">
-        <span className="brand-dot" aria-hidden="true" />
+        {/* Identité de l'application, puis identité du projet : deux choses
+            différentes, donc un séparateur entre les deux. Sans lui, le nom du
+            projet se lit comme la suite du nom du logiciel. */}
+        <span className="brand">
+          <span className="brand-dot" aria-hidden="true" />
+          <span className="brand-name">
+            GTA <strong>Studio</strong>
+          </span>
+        </span>
+        <span className="topbar-sep" aria-hidden="true" />
         {editing ? (
           <input
             className="name-input"
@@ -216,6 +225,8 @@ export function TopBar(props: Props) {
             </div>
           )}
         </div>
+
+        <span className="topbar-sep" aria-hidden="true" />
 
         <button type="button" className="primary" onClick={props.onExport}>
           <Icon name="export" size={15} />

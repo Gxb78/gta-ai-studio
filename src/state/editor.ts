@@ -13,9 +13,11 @@ import type {
   SourceInfo,
   StoredProject,
   TextOverlay,
+  ZoomRegion,
 } from "../types";
 import {
   MIN_CLIP_MS,
+  MIN_ZOOM_DURATION_MS,
   applyRate,
   clampAudioFadeMs,
   clampVideoFadeMs,
@@ -31,6 +33,7 @@ import {
   firstFreeTrack,
   migrateProject,
   normalizeTextOverlay,
+  normalizeZoomRegion,
   neighbourLimits,
   resolveOverlaps,
   sortClips,
@@ -47,12 +50,17 @@ export interface EditorState {
   /** Vérité committée (celle qu'on sauvegarde et exporte). */
   clips: Clip[];
   textOverlays: TextOverlay[];
+  /** Zooms animés posés sur la timeline. */
+  zooms: ZoomRegion[];
   /** Clips pendant un geste en cours (trim, déplacement), sinon null. */
   transientClips: Clip[] | null;
   /** Titres pendant un geste de timeline, sinon null. */
   transientTextOverlays: TextOverlay[] | null;
+  /** Zooms pendant un geste de timeline, sinon null. */
+  transientZooms: ZoomRegion[] | null;
   selectedClipId: string | null;
   selectedTextOverlayId: string | null;
+  selectedZoomId: string | null;
   /**
    * Pistes masquées par leur en-tête. Un masquage retire la piste des DEUX
    * plans (image et son) : c'est un interrupteur de piste, pas un réglage
@@ -64,6 +72,12 @@ export interface EditorState {
   hiddenTracks: number[];
   /** Pistes verrouillées : aucun geste de timeline n'y touche. */
   lockedTracks: number[];
+  /**
+   * Clip copié, en attente de collage. C'est de l'état de SESSION, comme le
+   * masquage et le verrouillage : il décrit ce que l'utilisateur est en train
+   * de faire, pas le montage, et n'est donc pas enregistré dans le projet.
+   */
+  clipboard: Clip | null;
   past: EditSnapshot[];
   future: EditSnapshot[];
 }
@@ -71,21 +85,78 @@ export interface EditorState {
 interface EditSnapshot {
   clips: Clip[];
   textOverlays: TextOverlay[];
+  zooms: ZoomRegion[];
 }
 
 export const initialEditorState: EditorState = {
   project: null,
   clips: [],
   textOverlays: [],
+  zooms: [],
   transientClips: null,
   transientTextOverlays: null,
+  transientZooms: null,
   selectedClipId: null,
   selectedTextOverlayId: null,
+  selectedZoomId: null,
   hiddenTracks: [],
   lockedTracks: [],
+  clipboard: null,
   past: [],
   future: [],
 };
+
+/**
+ * Prépare la copie d'un clip à poser à `atMs`.
+ *
+ * La piste est cherchée à partir de celle de l'original : on ne crée une piste
+ * neuve qu'en dernier recours, sinon dupliquer trois fois ferait trois pistes.
+ * Une copie qui atterrit sur une surcouche arrive muette, comme tout ce qui se
+ * pose au-dessus de la piste principale.
+ */
+const placeCopy = (clips: Clip[], origin: Clip, atMs: number): Clip => {
+  const startMs = Math.max(0, atMs);
+  const endMs = startMs + clipDurationMs(origin);
+  const track = firstFreeTrack(clips, startMs, endMs, origin.track);
+  return {
+    ...origin,
+    id: newClipId(),
+    track,
+    timelineStartMs: startMs,
+    audioEnabled: track === 0 ? origin.audioEnabled : false,
+    // La transition décrit une jonction avec le clip précédent : elle ne suit
+    // pas la copie ailleurs sur la timeline.
+    transitionInMs: 0,
+  };
+};
+
+/**
+ * Ramène la sélection dans le montage donné.
+ *
+ * Annuler une duplication, un collage ou une découpe fait disparaître le clip
+ * qui venait d'être sélectionné : la sélection désignait alors un identifiant
+ * qui n'existe plus. L'inspecteur affichait « aucun clip sélectionné » pendant
+ * que la timeline n'en surlignait aucun, et Suppr comme M ne faisaient plus
+ * rien — sans que rien n'explique pourquoi.
+ */
+const keepSelection = (
+  clips: Clip[],
+  textOverlays: TextOverlay[],
+  zooms: ZoomRegion[],
+  state: EditorState,
+): Pick<EditorState, "selectedClipId" | "selectedTextOverlayId" | "selectedZoomId"> => ({
+  selectedClipId: clips.some((clip) => clip.id === state.selectedClipId)
+    ? state.selectedClipId
+    : null,
+  selectedTextOverlayId: textOverlays.some(
+    (overlay) => overlay.id === state.selectedTextOverlayId,
+  )
+    ? state.selectedTextOverlayId
+    : null,
+  selectedZoomId: zooms.some((zoom) => zoom.id === state.selectedZoomId)
+    ? state.selectedZoomId
+    : null,
+});
 
 const clampClipFades = (clip: Clip): Clip => {
   const durationMs = clipDurationMs(clip);
@@ -154,8 +225,30 @@ export type EditorAction =
     }
   | { type: "TEXT_GESTURE_COMMIT" }
   | { type: "TEXT_GESTURE_CANCEL" }
+  /** Déplacement ou rognage d'un zoom en cours : aucune entrée d'historique. */
+  | {
+      type: "ZOOM_TRANSIENT";
+      zoomId: string;
+      timelineStartMs: number;
+      timelineEndMs: number;
+    }
+  | { type: "ZOOM_GESTURE_COMMIT" }
+  | { type: "ZOOM_GESTURE_CANCEL" }
+  | { type: "SELECT_ZOOM"; zoomId: string | null }
+  /** Nouveau zoom posé au playhead, visant le centre par défaut. */
+  | { type: "ADD_ZOOM"; atMs: number }
+  | {
+      type: "UPDATE_ZOOM";
+      zoomId: string;
+      patch: Partial<Pick<ZoomRegion, "timelineStartMs" | "timelineEndMs" | "scale" | "x" | "y" | "rampInMs" | "rampOutMs">>;
+    }
+  | { type: "DELETE_ZOOM"; zoomId: string }
   | { type: "SPLIT_AT"; timelineMs: number }
   | { type: "DELETE_CLIP"; clipId: string }
+  | { type: "DUPLICATE_CLIP"; clipId: string }
+  | { type: "CLIP_TO_NEW_TRACK"; clipId: string }
+  | { type: "COPY_CLIP"; clipId: string }
+  | { type: "PASTE_CLIP"; atMs: number }
   /** Trim en cours : aucune entrée d'historique. */
   | { type: "TRIM_TRANSIENT"; clipId: string; side: "left" | "right"; edgeSrcMs: number }
   /** Déplacement en cours : aucune entrée d'historique. */
@@ -179,6 +272,9 @@ export const effectiveClips = (state: EditorState): Clip[] =>
 export const effectiveTextOverlays = (state: EditorState): TextOverlay[] =>
   state.transientTextOverlays ?? state.textOverlays;
 
+export const effectiveZooms = (state: EditorState): ZoomRegion[] =>
+  state.transientZooms ?? state.zooms;
+
 // Compacté à CHAQUE commit, jamais sur l'état transitoire : c'est le même
 // principe que la borne de piste posée pendant un geste, appliqué une image
 // plus tard. Idempotent sur des indices déjà compacts, donc sans coût quand
@@ -186,27 +282,65 @@ export const effectiveTextOverlays = (state: EditorState): TextOverlay[] =>
 const snapshot = (state: EditorState): EditSnapshot => ({
   clips: state.clips,
   textOverlays: state.textOverlays,
+  zooms: state.zooms,
 });
+
+/**
+ * Impose que deux zooms ne se chevauchent jamais.
+ *
+ * C'est ce qui permet à la lecture comme à l'export de n'en retenir qu'UN à un
+ * instant donné, sans avoir à composer deux agrandissements — et donc de garder
+ * une seule expression FFmpeg. Un zoom qui empiète sur le précédent est repoussé
+ * derrière lui ; s'il n'a plus la place de durer, il disparaît.
+ */
+const resolveZoomOverlaps = (zooms: ZoomRegion[], durationMs: number): ZoomRegion[] => {
+  const sorted = [...zooms].sort((a, b) => a.timelineStartMs - b.timelineStartMs);
+  const kept: ZoomRegion[] = [];
+  let cursor = 0;
+  for (const zoom of sorted) {
+    const startMs = Math.max(zoom.timelineStartMs, cursor);
+    const endMs = Math.max(zoom.timelineEndMs, startMs);
+    if (endMs - startMs < MIN_ZOOM_DURATION_MS) continue;
+    const placed = normalizeZoomRegion(
+      { ...zoom, timelineStartMs: startMs, timelineEndMs: endMs },
+      durationMs,
+    );
+    if (placed.timelineEndMs - placed.timelineStartMs < MIN_ZOOM_DURATION_MS) continue;
+    kept.push(placed);
+    cursor = placed.timelineEndMs;
+  }
+  return kept;
+};
 
 const pushHistory = (
   state: EditorState,
   nextClips: Clip[],
   nextTextOverlays = state.textOverlays,
+  nextZooms = state.zooms,
 ): EditorState => {
   const clips = compactTrackIndices(nextClips);
   const durationMs = timelineDurationMs(clips);
   const textOverlays = nextTextOverlays
     .map((overlay) => normalizeTextOverlay(overlay, durationMs))
     .filter((overlay) => overlay.timelineEndMs > overlay.timelineStartMs);
+  const zooms = resolveZoomOverlaps(nextZooms, durationMs);
   return {
     ...state,
     clips,
     textOverlays,
+    zooms,
     transientClips: null,
     transientTextOverlays: null,
+    transientZooms: null,
     past: [...state.past.slice(-(HISTORY_LIMIT - 1)), snapshot(state)],
     future: [],
   };
+};
+
+let zoomCounter = 0;
+const newZoomId = (): string => {
+  zoomCounter += 1;
+  return `zoom-${zoomCounter}-${Math.random().toString(36).slice(2, 8)}`;
 };
 
 let clipCounter = 0;
@@ -267,6 +401,7 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         project,
         clips: project.clips,
         textOverlays: project.textOverlays,
+        zooms: project.zooms,
       };
     }
 
@@ -552,6 +687,114 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
     case "TEXT_GESTURE_CANCEL":
       return state.transientTextOverlays ? { ...state, transientTextOverlays: null } : state;
 
+    /**
+     * Zoom déplacé ou rogné à la souris.
+     *
+     * Le geste ne passe PAS par `resolveZoomOverlaps` : cette fonction repousse
+     * les zooms les uns derrière les autres et en supprime, ce qui, image par
+     * image, ferait fuir le voisin devant le pointeur puis disparaître. Pendant
+     * le geste, le zoom est simplement borné par ses voisins COMMITTÉS — il
+     * bute contre eux et s'arrête, ce qui est lisible. La normalisation
+     * complète n'intervient qu'au commit.
+     */
+    case "ZOOM_TRANSIENT": {
+      const target = state.zooms.find((zoom) => zoom.id === action.zoomId);
+      if (!target) return state;
+      const others = state.zooms.filter((zoom) => zoom.id !== target.id);
+      const lowerMs = others
+        .filter((zoom) => zoom.timelineEndMs <= target.timelineStartMs)
+        .reduce((bound, zoom) => Math.max(bound, zoom.timelineEndMs), 0);
+      const upperMs = others
+        .filter((zoom) => zoom.timelineStartMs >= target.timelineEndMs)
+        .reduce(
+          (bound, zoom) => Math.min(bound, zoom.timelineStartMs),
+          timelineDurationMs(state.clips),
+        );
+      const startMs = Math.max(lowerMs, action.timelineStartMs);
+      const endMs = Math.min(upperMs, action.timelineEndMs);
+      if (endMs - startMs < MIN_ZOOM_DURATION_MS) return state;
+      const next = normalizeZoomRegion(
+        { ...target, timelineStartMs: startMs, timelineEndMs: endMs },
+        timelineDurationMs(state.clips),
+      );
+      return {
+        ...state,
+        transientZooms: state.zooms.map((zoom) => (zoom.id === target.id ? next : zoom)),
+      };
+    }
+
+    case "ZOOM_GESTURE_COMMIT":
+      if (!state.transientZooms) return state;
+      return pushHistory(state, state.clips, state.textOverlays, state.transientZooms);
+
+    case "ZOOM_GESTURE_CANCEL":
+      return state.transientZooms ? { ...state, transientZooms: null } : state;
+
+    case "SELECT_ZOOM":
+      return { ...state, selectedZoomId: action.zoomId, selectedTextOverlayId: null };
+
+    case "ADD_ZOOM": {
+      const durationMs = timelineDurationMs(state.clips);
+      if (durationMs < MIN_ZOOM_DURATION_MS) return state;
+      // Le zoom se pose au playhead, sur la première fenêtre libre : le poser
+      // par-dessus un zoom existant le ferait disparaître au passage par
+      // `resolveZoomOverlaps`, sans que l'utilisateur comprenne pourquoi.
+      const wantedMs = Math.max(0, Math.min(durationMs - MIN_ZOOM_DURATION_MS, action.atMs));
+      const startMs = state.zooms.reduce(
+        (cursor, zoom) =>
+          cursor < zoom.timelineEndMs && zoom.timelineStartMs <= cursor
+            ? zoom.timelineEndMs
+            : cursor,
+        wantedMs,
+      );
+      if (durationMs - startMs < MIN_ZOOM_DURATION_MS) return state;
+      const zoom = normalizeZoomRegion(
+        {
+          id: newZoomId(),
+          timelineStartMs: startMs,
+          timelineEndMs: Math.min(durationMs, startMs + 2000),
+          // Un zoom par défaut se voit sans déformer : 1,6× cadre bien la
+          // mini-carte d'un rush 1080p sans que l'image devienne molle.
+          scale: 1.6,
+          x: 0.5,
+          y: 0.5,
+          rampInMs: 400,
+          rampOutMs: 400,
+        },
+        durationMs,
+      );
+      return {
+        ...pushHistory(state, state.clips, state.textOverlays, [...state.zooms, zoom]),
+        selectedClipId: null,
+        selectedTextOverlayId: null,
+        selectedZoomId: zoom.id,
+      };
+    }
+
+    case "UPDATE_ZOOM": {
+      if (!state.zooms.some((zoom) => zoom.id === action.zoomId)) return state;
+      const zooms = state.zooms.map((zoom) =>
+        zoom.id === action.zoomId ? { ...zoom, ...action.patch } : zoom,
+      );
+      return {
+        ...pushHistory(state, state.clips, state.textOverlays, zooms),
+        selectedZoomId: state.selectedZoomId,
+      };
+    }
+
+    case "DELETE_ZOOM": {
+      if (!state.zooms.some((zoom) => zoom.id === action.zoomId)) return state;
+      return {
+        ...pushHistory(
+          state,
+          state.clips,
+          state.textOverlays,
+          state.zooms.filter((zoom) => zoom.id !== action.zoomId),
+        ),
+        selectedZoomId: state.selectedZoomId === action.zoomId ? null : state.selectedZoomId,
+      };
+    }
+
     case "SPLIT_AT": {
       // Un clip explicitement sélectionné prime, même s'il est recouvert :
       // sinon un clip de la piste du dessous deviendrait inéditable.
@@ -614,6 +857,67 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
       const sorted = sortClips(next);
       const fallback = sorted[Math.min(index, sorted.length - 1)];
       return { ...pushHistory(state, next), selectedClipId: fallback ? fallback.id : null };
+    }
+
+    /**
+     * Duplication et collage posent une COPIE, jamais la même référence : deux
+     * clips qui partageraient un identifiant se sélectionneraient et se
+     * déplaceraient ensemble. La copie garde tous les réglages (bornes source,
+     * vitesse, volume, fondus, cadrage) — c'est ce qui les rend utiles — sauf
+     * la transition d'entrée, qui décrit une jonction précise avec le clip
+     * précédent et n'a aucun sens ailleurs.
+     */
+    case "DUPLICATE_CLIP": {
+      const clip = state.clips.find((c) => c.id === action.clipId);
+      if (!clip) return state;
+      const copy = placeCopy(state.clips, clip, clipEndMs(clip));
+      return {
+        ...pushHistory(state, resolveOverlaps([...state.clips, copy], copy.id)),
+        selectedClipId: copy.id,
+      };
+    }
+
+    /**
+     * Monte le clip sur une piste neuve, au-dessus de toutes les autres.
+     *
+     * C'est le remplaçant explicite de la rangée fantôme qui s'affichait
+     * pendant les déplacements : une action nommée, invoquée quand on la veut,
+     * plutôt qu'une rangée qui décalait la vue à chaque prise de clip.
+     *
+     * `pushHistory` recompacte les indices de piste : si le clip était déjà
+     * seul sur la piste du haut, l'opération se referme sur elle-même et ne
+     * laisse pas de piste vide derrière elle.
+     */
+    case "CLIP_TO_NEW_TRACK": {
+      const clip = state.clips.find((c) => c.id === action.clipId);
+      if (!clip) return state;
+      const track = trackCount(state.clips);
+      if (clip.track === track - 1 && clipsOnTrack(state.clips, clip.track).length === 1) {
+        return state;
+      }
+      const next = state.clips.map((c) =>
+        c.id === clip.id
+          ? // Une surcouche arrive muette : elle ne doit pas couper le son du dessous.
+            { ...c, track, audioEnabled: false }
+          : c,
+      );
+      return { ...pushHistory(state, next), selectedClipId: clip.id };
+    }
+
+    // Copier ne touche pas au montage : pas d'entrée d'historique.
+    case "COPY_CLIP": {
+      const clip = state.clips.find((c) => c.id === action.clipId);
+      if (!clip) return state;
+      return { ...state, clipboard: { ...clip } };
+    }
+
+    case "PASTE_CLIP": {
+      if (!state.clipboard) return state;
+      const copy = placeCopy(state.clips, state.clipboard, Math.max(0, action.atMs));
+      return {
+        ...pushHistory(state, resolveOverlaps([...state.clips, copy], copy.id)),
+        selectedClipId: copy.id,
+      };
     }
 
     // Un geste repart toujours des clips COMMITTÉS : appliquer le delta sur l'état
@@ -716,6 +1020,9 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         ...state,
         clips: previous.clips,
         textOverlays: previous.textOverlays,
+        zooms: previous.zooms,
+        transientZooms: null,
+        ...keepSelection(previous.clips, previous.textOverlays, previous.zooms, state),
         transientClips: null,
         transientTextOverlays: null,
         past: state.past.slice(0, -1),
@@ -730,6 +1037,9 @@ export function editorReducer(state: EditorState, action: EditorAction): EditorS
         ...state,
         clips: next.clips,
         textOverlays: next.textOverlays,
+        zooms: next.zooms,
+        transientZooms: null,
+        ...keepSelection(next.clips, next.textOverlays, next.zooms, state),
         transientClips: null,
         transientTextOverlays: null,
         past: [...state.past, snapshot(state)],

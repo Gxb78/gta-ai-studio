@@ -5,22 +5,29 @@
  * Les animations sont réservées aux commandes, où elles ne coûtent rien. */
 
 :root {
-  /* Base graphite neutre : les sombres ne sont plus teintés, seule la couleur
-     d'accent porte la teinte. L'accent est un bleu franc, pas un indigo. */
-  --bg: #0a0c11;
-  --surface: #12151d;
-  --surface-2: #171b25;
-  --surface-3: #1e2431;
-  --border: #262c3a;
-  --border-strong: #38415a;
-  --text: #eceff6;
-  --muted: #98a1b5;
-  --accent: #5b8cf5;
-  --accent-hi: #7aa4ff;
-  --accent-soft: rgba(91, 140, 245, 0.16);
+  /* Base graphite très légèrement bleutée : les sombres restent neutres à
+     l'œil, l'accent seul porte la couleur. L'accent est un ambre franc — la
+     même famille que l'image d'un rush nocturne, ce qui évite qu'une commande
+     active se confonde avec un reflet dans l'aperçu. */
+  --bg: #070910;
+  --surface: #0d1017;
+  --surface-2: #141821;
+  --surface-3: #1c212d;
+  --border: #232936;
+  --border-strong: #364052;
+  --text: #eef1f7;
+  --muted: #929cb0;
+  --accent: #f5a02e;
+  --accent-hi: #ffb851;
+  --accent-soft: rgba(245, 160, 46, 0.14);
+  /* Texte posé SUR l'accent. Un jeton, pas une valeur recopiée : changer
+     l'accent sans changer ce contraste est la façon la plus simple de rendre
+     l'action principale illisible. */
+  --on-accent: #2a1802;
   --warn: #ffc46b;
   --danger: #ff6b7d;
-  /* Le temps a sa propre couleur, chaude, distincte de l'accent des commandes. */
+  /* Le temps a sa propre couleur, distincte de l'accent des commandes : sur la
+     timeline, le playhead ne doit jamais se lire comme « sélectionné ». */
   --playhead: #ff4d6d;
   --radius: 8px;
   --radius-sm: 6px;
@@ -30,8 +37,10 @@
      se distinguent par leur valeur de gris et un filet de 1 px — pas par un
      relief. C'est ce qui donne le rendu plat des éditeurs modernes. */
   --shadow-float: 0 12px 32px rgba(0, 0, 0, 0.45);
-  /* Largeur de la colonne d'en-têtes de pistes. */
-  --head-w: 104px;
+  /* Largeur de la colonne d'en-têtes de pistes. Juste de quoi loger l'étiquette
+     et les trois bascules : chaque pixel pris ici est un pixel de moins pour le
+     montage lui-même. */
+  --head-w: 96px;
   /* Hauteur de la règle : la colonne d'en-têtes s'aligne dessus. */
   --ruler-h: 28px;
 }
@@ -56,6 +65,24 @@ html, body, #root {
   outline-offset: 2px;
   border-radius: var(--radius-sm);
 }
+
+/* Barres de défilement discrètes, partout. Celle du système est claire, épaisse
+   et large de 17 px : dans un panneau de 264 px, elle prend 6 % de la largeur
+   utile et casse le noir de l'interface à chaque liste un peu longue. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--border-strong); background-clip: padding-box; }
+::-webkit-scrollbar-corner { background: transparent; }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
@@ -88,11 +115,11 @@ button:disabled { opacity: 0.35; cursor: default; }
 button.primary {
   background: linear-gradient(160deg, var(--accent-hi), var(--accent));
   border-color: transparent;
-  color: #06101f;
+  color: var(--on-accent);
   font-weight: 600;
 }
 button.primary:hover:not(:disabled) {
-  background: linear-gradient(160deg, #9bbcff, var(--accent-hi));
+  background: linear-gradient(160deg, #ffca7c, var(--accent-hi));
   border-color: transparent;
 }
 
@@ -181,22 +208,47 @@ input:focus { border-color: var(--accent); }
 
 /* --- Panneaux latéraux ---------------------------------------------------------- */
 
+/* Rail : icône + libellé. Assez large pour nommer chaque entrée, assez étroit
+   pour que la largeur reste acquise à l'aperçu et à la timeline. */
 .tool-rail {
   flex: none;
-  width: 48px;
+  width: 72px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
-  padding: 10px 0;
+  gap: 2px;
+  padding: 8px 6px;
   border-right: 1px solid var(--border);
   background: var(--surface);
 }
 .rail-sep {
-  width: 20px;
+  width: 28px;
   height: 1px;
   background: var(--border);
-  margin: 6px 0;
+  margin: 8px 0;
+}
+
+.rail-btn {
+  width: 100%;
+  height: auto;
+  padding: 8px 2px 6px;
+  flex-direction: column;
+  gap: 5px;
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+  border-radius: var(--radius);
+}
+.rail-btn:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: transparent;
+  color: var(--text);
+}
+.rail-btn.active { color: var(--accent); background: var(--accent-soft); }
+.rail-label {
+  font-size: 10.5px;
+  line-height: 1;
+  letter-spacing: 0.1px;
 }
 
 .panel {
@@ -208,50 +260,209 @@ input:focus { border-color: var(--accent); }
   gap: 12px;
   padding: 12px;
   overflow-y: auto;
+  /* Un panneau latéral ne défile jamais horizontalement : si son contenu
+     déborde en largeur, c'est le contenu qu'il faut tronquer. */
+  overflow-x: hidden;
   background: var(--surface);
 }
-.panel-media { border-right: 1px solid var(--border); }
-.panel-text { border-right: 1px solid var(--border); }
-.panel-inspector { border-left: 1px solid var(--border); width: 288px; }
+/* Colonne de gauche en deux volets : bibliothèque en haut, inspecteur en bas.
+   Les deux panneaux ne se distinguent plus par un bord vertical — ils sont dans
+   la même colonne — mais par le filet horizontal de la poignée. */
+.side-column {
+  flex: none;
+  width: 296px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+}
+.side-column .panel { width: auto; flex: 1; }
+/* Volet du bas : hauteur imposée quand il partage la colonne, sinon il la
+   remplit. `flex: none` l'empêche de se faire écraser par le volet du haut. */
+.side-pane-bottom {
+  flex: none;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.side-pane-bottom:only-child { flex: 1; }
+.side-pane-bottom .panel { height: 100%; }
+
+/* Poignée : une bande de préhension, comme celle de la timeline. */
+.side-grip {
+  flex: none;
+  height: 7px;
+  cursor: ns-resize;
+  touch-action: none;
+  border-top: 1px solid var(--border);
+}
+.side-grip:hover { background: var(--accent-soft); }
+
+.panel-inspector { width: auto; }
 .panel-head { display: flex; align-items: center; justify-content: space-between; }
-.panel h2 { margin: 0; font-size: 13px; font-weight: 650; letter-spacing: 0.2px; }
+.panel h2 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.9px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
 .panel-action { width: 100%; }
 .panel-empty { margin: 0; }
-.panel-foot { margin: auto 0 0; padding-top: 10px; border-top: 1px solid var(--border); }
+
+/* État vide : centré, aéré, jamais collé en haut du panneau — sinon il se lit
+   comme un message d'erreur tronqué plutôt que comme un panneau au repos. */
+.empty-state {
+  /* Dans le panneau Médias, l'état vide traverse les deux colonnes. */
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+  padding: 26px 8px;
+}
+.empty-icon {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  margin-bottom: 4px;
+  border-radius: 50%;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.empty-state p { margin: 0; }
+.empty-title { font-size: 13px; font-weight: 600; }
+.empty-state .small-text { line-height: 1.5; max-width: 30ch; }
+.panel-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: auto 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.panel-foot p { margin: 0; }
+.panel-danger { padding-top: 4px; border-top: 1px solid var(--border); }
 .small-text { font-size: 12px; }
 
-.media-list { display: flex; flex-direction: column; gap: 6px; }
-.media-item {
+/* Filtre + présentation : une seule ligne, jamais deux. Les deux îlots font
+   exactement la même hauteur — le groupe de bascules ajoute sa bordure et son
+   remplissage à celle de ses boutons, il faut donc les rétrécir d'autant. */
+.panel-tools { display: flex; align-items: center; gap: 8px; }
+.panel-tools .btn-group { height: 32px; }
+.panel-tools .icon-btn.ghost { width: 26px; height: 26px; }
+.search-field {
+  flex: 1;
+  min-width: 0;
   display: flex;
   align-items: center;
-  gap: 9px;
-  padding: 6px;
+  gap: 7px;
+  padding: 0 9px;
+  height: 32px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+}
+.search-field:focus-within { border-color: var(--accent); }
+.search-field input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  font-size: 13px;
+}
+.search-field input:focus { border-color: transparent; }
+.search-field input::-webkit-search-cancel-button { filter: invert(0.6); }
+
+.media-list { display: flex; flex-direction: column; gap: 6px; }
+/* Grille : deux colonnes fixes. Une grille auto-remplie ferait varier la taille
+   des vignettes avec la largeur du panneau, donc l'aspect du rush avec elle. */
+/* `minmax(0, 1fr)` et non `1fr` : la taille minimale par défaut d'une colonne
+   de grille est son contenu, donc un nom de rush long élargit la colonne, puis
+   le panneau, et fait apparaître une barre de défilement horizontale. */
+.media-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+
+.media-item,
+.media-card {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--surface-2);
   cursor: grab;
   touch-action: none;
 }
-.media-item:hover { border-color: var(--border-strong); }
+.media-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px;
+}
+.media-card { display: flex; flex-direction: column; gap: 6px; padding: 6px; }
+.media-item:hover,
+.media-card:hover { border-color: var(--border-strong); }
 .media-missing { border-color: rgba(255, 196, 107, 0.45); }
+/* Un rush importé mais jamais posé : présent sans être signalé comme un défaut. */
+.media-unused .media-thumb { opacity: 0.72; }
+
+.media-thumb-wrap { position: relative; flex: none; line-height: 0; }
+.media-card .media-thumb-wrap { width: 100%; }
 .media-thumb {
-  flex: none;
+  display: block;
   width: 58px;
   height: 34px;
   object-fit: cover;
-  border-radius: 4px;
+  border-radius: 5px;
   background: #000;
 }
-.media-thumb-empty { display: block; }
-.media-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.media-card .media-thumb { width: 100%; height: 64px; }
+.media-thumb-empty { background: var(--surface-3); }
+/* Badges posés sur la vignette : ils ne coûtent aucune hauteur au panneau. */
+.media-duration {
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.68);
+  color: #fff;
+  font-size: 10.5px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+.media-flag {
+  position: absolute;
+  right: 4px;
+  top: 4px;
+  display: flex;
+  padding: 2px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.68);
+  color: var(--warn);
+}
+.media-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; width: 100%; flex: 1; }
 .media-name {
-  font-size: 13px;
+  max-width: 100%;
+  font-size: 12.5px;
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.media-add { flex: none; }
+.media-relocate { height: 26px; padding: 0 7px; font-size: 11.5px; }
+/* Appui en cours : la carte s'enfonce, sans transition — le retour doit être
+   immédiat, c'est ce qui distingue un clic pris en compte d'un clic perdu. */
+.media-item.is-pressed,
+.media-card.is-pressed { border-color: var(--accent); background: var(--surface-3); }
 
 .text-list { display: flex; flex-direction: column; gap: 6px; }
 .text-list-item {
@@ -283,9 +494,9 @@ input:focus { border-color: var(--accent); }
 .text-time-grid label { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 11px; }
 .text-time-grid input { width: 100%; }
 
-/* Sections repliables : un filet les s?pare, le titre est cliquable sur toute
-   sa largeur. Pas de cadre par section ? une pile de bo?tes dans une bo?te est
-   exactement le bruit visuel que l'inspecteur doit ?viter. */
+/* Sections repliables : un filet les sépare, le titre est cliquable sur toute
+   sa largeur. Pas de cadre par section — une pile de boîtes dans une boîte est
+   exactement le bruit visuel que l'inspecteur doit éviter. */
 .inspector-section {
   display: flex;
   flex-direction: column;
@@ -314,7 +525,7 @@ input:focus { border-color: var(--accent); }
   font-weight: 650;
   color: inherit;
 }
-/* Une seule ic?ne pour les deux ?tats : ferm?e elle pointe ? droite. */
+/* Une seule icône pour les deux états : fermée elle pointe à droite. */
 .section-head .icon { transition: transform 130ms var(--ease); transform: rotate(-90deg); }
 .inspector-section.open .section-head .icon { transform: none; }
 .section-note {
@@ -322,7 +533,7 @@ input:focus { border-color: var(--accent); }
   text-transform: none;
   letter-spacing: 0;
 }
-/* Repli?e, la section montre sa valeur : replier ne doit jamais cacher l'?tat. */
+/* Repliée, la section montre sa valeur : replier ne doit jamais cacher l'état. */
 .section-summary {
   margin-left: auto;
   font-size: 12px;
@@ -418,14 +629,45 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
 }
 .topbar-left, .topbar-right { display: flex; align-items: center; gap: 8px; min-width: 0; }
 
+.brand { display: flex; align-items: center; gap: 8px; flex: none; }
 .brand-dot {
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   flex: none;
-  border-radius: 5px;
-  background: var(--accent);
+  border-radius: 6px;
+  background: linear-gradient(150deg, var(--accent-hi), var(--accent));
 }
-.name-btn { font-weight: 600; color: var(--text); max-width: 280px; overflow: hidden; }
+.brand-name {
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.2px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.brand-name strong { color: var(--text); font-weight: 700; }
+
+/* Séparateur vertical : il sépare deux groupes, il ne décore pas. */
+.topbar-sep {
+  flex: none;
+  width: 1px;
+  height: 18px;
+  margin: 0 2px;
+  background: var(--border);
+}
+/* Le contenu d'un bouton est centré par défaut : un nom trop long se faisait
+   donc rogner des DEUX côtés, et son début disparaissait sous la pastille. Un
+   nom se lit depuis son début, et se tronque par la fin. */
+.name-btn {
+  font-weight: 600;
+  color: var(--text);
+  max-width: 280px;
+  min-width: 0;
+  justify-content: flex-start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+  line-height: 32px;
+}
 .name-input { height: 30px; padding: 0 8px; width: 220px; }
 
 .save-state {
@@ -470,6 +712,50 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
   height: 32px;
   font-size: 13px;
 }
+/* Menu contextuel d'un clip : posé en coordonnées FENÊTRE, donc `fixed`. Le
+   placer dans le flux de la timeline le ferait défiler avec elle.
+   Serré : il s'ouvre SUR le montage et masque ce qu'on est en train de
+   regarder, chaque pixel de trop est un pixel d'image caché. */
+.clip-menu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  /* `.menu` pose `right: 0` pour s'accrocher à droite de son ancre. Sans ce
+     `auto`, la boîte se retrouve tendue entre `left` et `right` et occupe
+     TOUTE la largeur de la fenêtre. Toute variante de `.menu` positionnée par
+     la gauche doit relâcher `right`. */
+  right: auto;
+  min-width: 158px;
+  padding: 3px;
+  border-radius: 9px;
+  z-index: 60;
+}
+.clip-menu .menu-item {
+  height: 27px;
+  gap: 9px;
+  padding: 0 8px;
+  font-size: 12.5px;
+  border-radius: 5px;
+}
+/* Filet de groupe, tracé par l'entrée qui ouvre le groupe : pas d'élément
+   séparateur à insérer, donc rien à maintenir en phase avec la liste. */
+.clip-menu .menu-item.group {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 5px 5px;
+  height: 31px;
+}
+/* Raccourci : une mention discrète alignée à droite, pas une touche dessinée —
+   la puce `kbd` doublerait la hauteur de la ligne pour rien. */
+.menu-key {
+  margin-left: auto;
+  padding-left: 12px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.menu-item.warn { color: var(--warn); }
+.menu-item.warn:hover:not(:disabled) { background: rgba(255, 107, 125, 0.12); }
 .menu-item kbd { margin-left: auto; }
 .menu-item:hover:not(:disabled) { background: var(--surface-3); border-color: transparent; }
 .menu-info {
@@ -496,9 +782,21 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
 
 /* --- Aperçu : canvas 9:16 réel ---------------------------------------------------- */
 
+/* Colonne centrale : aperçu au-dessus, montage en dessous. C'est elle qui
+   prend toute la largeur restante ; les panneaux latéraux tiennent donc la
+   pleine hauteur de la fenêtre. */
+.center {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .stage {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   background: var(--bg);
@@ -539,6 +837,17 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
   opacity: 0;
 }
 .preview-video.visible { opacity: 1; }
+
+/* Couche zoomée. `transform` est écrit directement par PreviewStage depuis
+   l'horloge, sans transition : la valeur est déjà interpolée par l'enveloppe du
+   zoom, une transition CSS par-dessus ajouterait un retard à chaque image.
+   L'origine est le centre, comme la fenêtre de `zoompan` à l'export. */
+.zoom-layer {
+  position: absolute;
+  inset: 0;
+  transform-origin: 50% 50%;
+  will-change: transform;
+}
 /* cover = le recadrage 9:16 de l'export ; contain = le fond flou. */
 .preview-video.fit-cover { object-fit: cover; }
 .preview-video.fit-contain { object-fit: contain; }
@@ -582,7 +891,7 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
   font-weight: 500;
   text-shadow: 0.04em 0.04em 0.05em rgba(0, 0, 0, 0.9);
 }
-.preview-text.selected { outline: 1px dashed rgba(122, 164, 255, 0.9); outline-offset: 5px; }
+.preview-text.selected { outline: 1px dashed rgba(255, 184, 81, 0.9); outline-offset: 5px; }
 
 /* Fond flou : un canvas minuscule, étiré et flouté. Le surdimensionnement évite
    que le flou laisse voir les bords. */
@@ -596,14 +905,16 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
 }
 
 /* Viseur 9:16 du mode « rush entier » : il se place là où le cadrage regarde. */
+/* La translation horizontale est posée par PreviewStage, en fonction du
+   cadrage : elle vaut −P % de la largeur du viseur quand `left` vaut P %. Une
+   valeur fixe ici la contredirait. */
 .guide-916 {
   position: absolute;
   top: 0;
   bottom: 0;
-  transform: translateX(-50%);
   aspect-ratio: 9 / 16;
   height: 100%;
-  border: 1px solid rgba(122, 164, 255, 0.65);
+  border: 1px solid rgba(255, 184, 81, 0.65);
   box-shadow: 0 0 0 4000px rgba(6, 8, 12, 0.55);
   pointer-events: none;
   display: flex;
@@ -618,6 +929,29 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
   background: rgba(8, 11, 16, 0.7);
   border-radius: 999px;
   padding: 3px 10px;
+}
+
+/* Point visé par le zoom. Dessiné HORS de la couche zoomée : il désigne un
+   endroit du cadre de sortie, il ne grossit donc pas avec l'image. */
+.zoom-target {
+  position: absolute;
+  width: 34px;
+  height: 34px;
+  margin: -17px 0 0 -17px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-hi);
+  background: rgba(245, 160, 46, 0.14);
+  cursor: grab;
+  display: grid;
+  place-items: center;
+  z-index: 6;
+}
+.zoom-target:active { cursor: grabbing; }
+.zoom-target span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--accent-hi);
 }
 
 /* Zones de sécurité TikTok : ce qui sort de ce cadre sera mangé par l'interface
@@ -670,28 +1004,50 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
   border-top: 1px solid var(--border);
   background: var(--surface);
 }
-.viewer-group { display: flex; align-items: center; gap: 8px; }
+.viewer-group { display: flex; align-items: center; gap: 10px; }
 
+/* Groupe de transport : un seul îlot posé sur la barre, pas trois boutons
+   flottants. Le bouton de lecture est la seule surface pleine de la barre. */
+.transport {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 22px;
+}
 .play-btn {
   width: 36px;
   height: 36px;
   padding: 0;
   border-radius: 50%;
-  background: var(--accent);
+  background: linear-gradient(160deg, var(--accent-hi), var(--accent));
   border-color: transparent;
-  color: #06101f;
+  color: var(--on-accent);
 }
-.play-btn:hover:not(:disabled) { background: var(--accent-hi); border-color: transparent; }
+.play-btn:hover:not(:disabled) {
+  background: linear-gradient(160deg, #ffca7c, var(--accent-hi));
+  border-color: transparent;
+}
+.transport .icon-btn.ghost { border-radius: 50%; }
 
+/* Le timecode est la valeur qu'on lit le plus souvent de toute l'application :
+   chiffres à chasse fixe, largeur figée pour qu'il ne tremble pas en lecture. */
 .time {
   display: flex;
   align-items: baseline;
   gap: 6px;
+  padding: 0 10px;
+  height: 30px;
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  border: 1px solid var(--border);
   font-variant-numeric: tabular-nums;
-  min-width: 150px;
+  min-width: 158px;
   justify-content: center;
 }
-.time-now { font-size: 15px; font-weight: 600; letter-spacing: -0.2px; }
+.time-now { font-size: 15px; font-weight: 600; letter-spacing: -0.2px; line-height: 28px; }
 .time-sep, .time-total { color: var(--muted); font-size: 12px; }
 
 .volume { display: flex; align-items: center; gap: 7px; color: var(--muted); }
@@ -711,20 +1067,27 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
   place-items: center;
   background: var(--bg);
 }
+/* Carte d'accueil : une vraie surface, pas du texte posé sur le vide. C'est le
+   premier écran de l'application, il doit avoir l'air construit. */
 .import-card {
   text-align: center;
-  max-width: 460px;
+  width: 460px;
+  max-width: 100%;
   display: flex;
   flex-direction: column;
   gap: 18px;
   align-items: center;
-  padding: 40px;
+  padding: 40px 44px 36px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow-float);
 }
 .brand-mark {
   width: 54px;
   height: 54px;
-  border-radius: 14px;
-  background: var(--accent);
+  border-radius: 16px;
+  background: linear-gradient(150deg, var(--accent-hi), var(--accent));
   display: grid;
   place-items: center;
 }
@@ -732,7 +1095,7 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
   width: 0;
   height: 0;
   border: 9px solid transparent;
-  border-left-color: #fff;
+  border-left-color: var(--on-accent);
   margin-left: 5px;
 }
 .import-card h1 { margin: 0; font-size: 30px; font-weight: 650; letter-spacing: -0.3px; }
@@ -746,6 +1109,7 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
   flex-direction: column;
   gap: 7px;
   font-size: 13px;
+  text-align: left;
 }
 .import-facts li::before {
   content: "";
@@ -826,23 +1190,43 @@ body.resizing-v, body.resizing-v * { cursor: ns-resize !important; }
 }
 
 .track-head {
+  position: relative;
   height: var(--track-h, 140px);
   margin-top: var(--track-gap, 6px);
-  padding: 7px 8px;
+  padding: 6px 7px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
   border-radius: var(--radius-sm);
   background: var(--surface-3);
+  overflow: hidden;
 }
-.track-head:first-of-type { margin-top: 14px; }
+/* Filet vertical : il dit d'un coup d'œil laquelle est la piste principale,
+   celle qui reste visible quand aucune surcouche ne la recouvre. */
+.track-head-base::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+}
+.track-head:first-of-type { margin-top: 8px; }
 .track-head-drop { height: var(--drop-h, 40px); background: transparent; }
 .track-head.is-hidden { opacity: 0.55; }
 .track-head.is-locked { background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--border-strong); }
-.track-label { font-size: 12px; font-weight: 700; letter-spacing: 0.4px; color: var(--muted); }
+.track-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  padding-left: 2px;
+}
 .track-head-base .track-label { color: var(--text); }
-.track-buttons { display: flex; gap: 2px; }
-.icon-btn.tiny { width: 24px; height: 24px; }
+.track-buttons { display: flex; gap: 1px; }
+.icon-btn.tiny { width: 23px; height: 23px; border-radius: 5px; }
 .timeline-scroll {
   flex: 1;
   min-height: 0;
@@ -914,10 +1298,83 @@ body.moving, body.moving * { cursor: grabbing !important; }
 }
 .tick span {
   font-size: 10px;
-  color: #aeb5cf;
+  color: var(--muted);
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.3px;
 }
+
+/* Bande des zooms : un zoom n'appartient à aucune piste, il agit sur l'image de
+   sortie. Il a donc sa propre ligne, plus fine que celle des titres. */
+.zoom-lane-head {
+  height: var(--zoom-h, 26px);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+.zoom-lane {
+  position: relative;
+  height: var(--zoom-h, 26px);
+  border-bottom: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.012);
+  touch-action: none;
+}
+.zoom-clip {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  min-width: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 4px;
+  background: rgba(245, 160, 46, 0.22);
+  border: 1px solid rgba(245, 160, 46, 0.55);
+  color: var(--accent-hi);
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  touch-action: none;
+  contain: paint;
+}
+.zoom-clip.selected {
+  background: rgba(245, 160, 46, 0.34);
+  border-color: var(--accent-hi);
+  box-shadow: inset 0 0 0 1px var(--accent-hi);
+}
+/* Maintien acquis : même signal que sur un clip, un filet blanc franc. */
+.zoom-clip.grabbed {
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.85);
+  z-index: 3;
+}
+/* Poignées de rognage : invisibles, elles n'existent que pour le pointeur. La
+   largeur est posée en ligne, elle dépend de celle du bloc. */
+.zoom-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  cursor: ew-resize;
+  touch-action: none;
+}
+.zoom-handle-l { left: 0; }
+.zoom-handle-r { right: 0; }
+/* Repère d'aimantation : le bord qui a accroché, pas les deux. */
+.zoom-snap {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: #fff;
+  pointer-events: none;
+}
+.zoom-snap-end { left: auto; right: 0; }
 
 .title-lane {
   position: relative;
@@ -926,10 +1383,12 @@ body.moving, body.moving * { cursor: grabbing !important; }
   background: rgba(255, 255, 255, 0.012);
   touch-action: none;
 }
+/* Hauteur déduite de `--title-h` plutôt que fixée : la bande Titres a maigri,
+   un titre haut de 35 px dans une bande de 32 px débordait sur la piste V2. */
 .title-clip {
   position: absolute;
-  top: 6px;
-  height: 35px;
+  top: 4px;
+  height: calc(var(--title-h, 32px) - 9px);
   min-width: 12px;
   display: flex;
   align-items: center;
@@ -973,7 +1432,7 @@ body.moving, body.moving * { cursor: grabbing !important; }
   letter-spacing: 0;
 }
 .title-clip.selected {
-  border-color: #b9d0ff;
+  border-color: var(--accent-hi);
   box-shadow: inset 0 0 0 1px var(--accent-hi);
   z-index: 3;
 }
@@ -999,7 +1458,10 @@ body.moving, body.moving * { cursor: grabbing !important; }
   touch-action: none;
   border-radius: var(--radius);
 }
-.track:first-of-type { margin-top: 14px; }
+/* Doit rester égal à `.track-head:first-of-type` : ces deux décalages ouvrent
+   la même colonne, l'un dans le défilement, l'autre hors de lui. Les faire
+   diverger décale les en-têtes de leurs pistes. */
+.track:first-of-type { margin-top: 8px; }
 .track:not(.track-base) {
   background: rgba(255, 255, 255, 0.018);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
@@ -1009,7 +1471,7 @@ body.moving, body.moving * { cursor: grabbing !important; }
 .track-drop {
   height: var(--drop-h, 40px);
   background: var(--accent-soft);
-  box-shadow: inset 0 0 0 1px rgba(122, 164, 255, 0.4);
+  box-shadow: inset 0 0 0 1px rgba(245, 160, 46, 0.4);
 }
 /* Piste désactivée ou verrouillée : l'état se lit sur la piste elle-même, pas
    seulement sur son en-tête. */
@@ -1063,12 +1525,20 @@ body.moving, body.moving * { cursor: grabbing !important; }
    très claire, et sans ombre portée à recalculer pendant les gestes. */
 .clip.selected {
   border-color: var(--accent-hi);
-  box-shadow: inset 0 0 0 2px rgba(91, 140, 245, 0.55), inset 0 0 0 3px rgba(9, 10, 17, 0.6);
+  box-shadow: inset 0 0 0 2px rgba(245, 160, 46, 0.7), inset 0 0 0 3px rgba(9, 10, 17, 0.6);
 }
 .clip.active {
   border-color: var(--accent-hi);
   box-shadow: inset 0 0 0 2px var(--accent), inset 0 0 0 3px rgba(9, 10, 17, 0.6);
   z-index: 4;
+}
+/* Maintien acquis : le clip est saisi et va suivre le pointeur. Un filet blanc
+   franc, posé une seule fois — pas d'ombre ni de transition, le clip est
+   repeint à chaque image du geste. Il passe au-dessus des autres pour qu'on
+   suive celui qu'on déplace. */
+.clip.grabbed {
+  box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.85);
+  z-index: 6;
 }
 
 .clip-thumbs { position: absolute; inset: 0 0 var(--audio-h, 28px) 0; pointer-events: none; }
@@ -1092,7 +1562,7 @@ body.moving, body.moving * { cursor: grabbing !important; }
   bottom: 0;
   height: var(--audio-h, 28px);
   max-width: 50%;
-  background: rgba(91, 140, 245, 0.34);
+  background: rgba(245, 160, 46, 0.3);
   pointer-events: none;
   z-index: 1;
 }
@@ -1120,6 +1590,16 @@ body.moving, body.moving * { cursor: grabbing !important; }
 .clip-video-fade.fade-out {
   right: 0;
   clip-path: polygon(0 0, 100% 0, 100% 100%);
+}
+.clip-transition-in {
+  position: absolute;
+  inset: 0 auto 0 0;
+  max-width: 50%;
+  z-index: 2;
+  pointer-events: none;
+  background:
+    linear-gradient(135deg, rgba(103, 232, 249, 0.48) 0 2px, transparent 2px 7px);
+  border-right: 1px solid rgba(103, 232, 249, 0.9);
 }
 .clip-duration {
   position: absolute;
@@ -1246,20 +1726,10 @@ body.moving, body.moving * { cursor: grabbing !important; }
   top: 4px;
   transform: translateX(-50%);
   display: flex;
-.clip-transition-in {
-  position: absolute;
-  inset: 0 auto 0 0;
-  max-width: 50%;
-  z-index: 2;
-  pointer-events: none;
-  background:
-    linear-gradient(135deg, rgba(103, 232, 249, 0.48) 0 2px, transparent 2px 7px);
-  border-right: 1px solid rgba(103, 232, 249, 0.9);
-}
   gap: 6px;
   align-items: baseline;
   background: var(--accent);
-  color: #06101f;
+  color: var(--on-accent);
   font-size: 11px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
@@ -1409,20 +1879,20 @@ body.moving, body.moving * { cursor: grabbing !important; }
   content: "";
   position: absolute;
   inset: 0;
-  background: linear-gradient(135deg, #3a4d80, #5b8cf5);
+  background: linear-gradient(135deg, #33415c, #64789c);
 }
 .option-blur::before {
   content: "";
   position: absolute;
   inset: 0;
-  background: linear-gradient(135deg, #232d4a, #3d5590);
+  background: linear-gradient(135deg, #222b3d, #45566f);
   filter: blur(6px);
 }
 .option-blur::after {
   content: "";
   position: absolute;
   inset: 34% 0;
-  background: linear-gradient(135deg, #3a4d80, #5b8cf5);
+  background: linear-gradient(135deg, #33415c, #64789c);
 }
 .option-label { font-size: 13px; font-weight: 600; }
 .option-note { font-size: 11px; }

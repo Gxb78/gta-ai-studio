@@ -1,3 +1,4 @@
+import { EmptyState } from "./EmptyState";
 import { Icon } from "./Icon";
 import type { TextOverlay } from "../types";
 import { formatTime } from "../types";
@@ -30,7 +31,11 @@ export function TextPanel({ overlays, selectedId, onAdd, onSelect, onCollapse }:
         Ajouter un titre
       </button>
       {overlays.length === 0 ? (
-        <p className="muted small-text panel-empty">Aucun titre dans ce montage.</p>
+        <EmptyState
+          icon="text"
+          title="Aucun titre dans ce montage."
+          hint="Un titre se pose au playhead, puis se déplace dans la bande Titres de la timeline."
+        />
       ) : (
         <div className="text-list">
           {[...overlays]

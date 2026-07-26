@@ -9,6 +9,7 @@ import type {
   FramingMode,
   SourceInfo,
   TextOverlay,
+  ZoomRegion,
 } from "../types";
 import type {
   CompiledSegment,
@@ -113,6 +114,7 @@ interface Props {
   /** Plan vidéo. */
   compiledTimeline: CompiledTimeline;
   textOverlays: TextOverlay[];
+  zooms: ZoomRegion[];
   /** Plan audio, indépendant du plan vidéo. */
   /**
    * Cadrage du projet. Il n'est PAS choisi ici : l'aperçu le montre déjà, et
@@ -134,6 +136,7 @@ export function ExportDialog(props: Props) {
     sources,
     compiledTimeline,
     textOverlays,
+    zooms,
     framing,
     onSetFraming,
     missingIds,
@@ -181,6 +184,9 @@ export function ExportDialog(props: Props) {
         mode: framing,
         fileName: sanitized,
         textOverlays: textOverlays.filter((overlay) => overlay.text.trim().length > 0),
+        // Un zoom sans agrandissement n'a rien à faire dans le graphe : il
+        // coûterait une passe de `zoompan` pour reproduire l'image d'entrée.
+        zooms: zooms.filter((zoom) => zoom.scale > 1),
       });
       setOutputPath(path);
       setPhase("done");
