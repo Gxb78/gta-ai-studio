@@ -162,6 +162,9 @@ fn validate_segments(segments: &[ExportSegment], sources: &[ExportSource]) -> Re
         if segment.source_index >= sources.len() {
             return Err("Un segment référence un rush inconnu.".into());
         }
+        if segment.src_out_ms > sources[segment.source_index].duration_ms + 0.001 {
+            return Err("Un segment dépasse la durée de son rush.".into());
+        }
         if !segment.transition_in_ms.is_finite()
             || !(0.0..=3000.0).contains(&segment.transition_in_ms)
         {
@@ -180,6 +183,9 @@ fn validate_segments(segments: &[ExportSegment], sources: &[ExportSource]) -> Re
                 || segment.transition_in_ms > current_duration + 0.001
             {
                 return Err("Transition plus longue que l'un des plans adjacents.".into());
+            }
+            if previous.audio_fade_out_ms > 0.0 || segment.audio_fade_in_ms > 0.0 {
+                return Err("Transition audio incompatible avec un fondu de clip.".into());
             }
             if segment.src_in_ms + 0.001 < half * segment.playback_rate
                 || sources[previous.source_index].duration_ms - previous.src_out_ms + 0.001
@@ -383,12 +389,12 @@ fn atempo_chain(rate: f64) -> String {
     }
 }
 
-fn audio_volume_filter(segment: &ExportSegment) -> String {
+fn audio_volume_filter(segment: &ExportSegment, prefix_ms: f64) -> String {
     if segment.audio_fade_in_ms <= 0.0 && segment.audio_fade_out_ms <= 0.0 {
         return format!("volume={:.6}", segment.volume);
     }
 
-    let offset = segment.audio_fade_offset_ms / 1000.0;
+    let offset = (segment.audio_fade_offset_ms - prefix_ms) / 1000.0;
     let clip_duration = segment.audio_clip_duration_ms / 1000.0;
     let mut factors = vec![format!("{:.6}", segment.volume)];
     if segment.audio_fade_in_ms > 0.0 {
@@ -450,6 +456,28 @@ fn assemble_video_parts(graph: &mut String, parts: &[(usize, f64, f64)]) -> Resu
     }
     graph.push_str(&format!("[{assembled_label}]null[vbase];"));
     Ok("vbase".into())
+}
+
+fn assemble_audio_parts(graph: &mut String, parts: &[(usize, f64, f64)]) -> Result<String, String> {
+    let Some(&(first_label, _, _)) = parts.first() else {
+        return Err("Aucune partie audio à assembler.".into());
+    };
+    let mut assembled_label = format!("a{first_label}");
+    for (chain_index, (label, _, transition)) in parts.iter().enumerate().skip(1) {
+        let next_label = format!("amix{chain_index}");
+        if *transition > 0.0 {
+            graph.push_str(&format!(
+                "[{assembled_label}][a{label}]acrossfade=d={transition:.6}:c1=tri:c2=tri[{next_label}];"
+            ));
+        } else {
+            graph.push_str(&format!(
+                "[{assembled_label}][a{label}]concat=n=2:v=0:a=1[{next_label}];"
+            ));
+        }
+        assembled_label = next_label;
+    }
+    graph.push_str(&format!("[{assembled_label}]anull[ac];"));
+    Ok("ac".into())
 }
 
 #[derive(Serialize, Clone)]
@@ -1177,7 +1205,8 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     }
 
     // --- Branche audio : uniquement le plan audio -------------------------------
-    let mut audio_parts: Vec<usize> = Vec::new();
+    // label, durée en secondes, chevauchement avec la partie précédente.
+    let mut audio_parts: Vec<(usize, f64, f64)> = Vec::new();
     let mut next_audio = 0usize;
     if request.has_audio {
         let push_silence = |graph: &mut String, duration: f64, index: &mut usize| {
@@ -1188,40 +1217,45 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
             *index += 1;
             i
         };
-        for segment in &request.audio_segments {
+        for (request_index, segment) in request.audio_segments.iter().enumerate() {
             if segment.gap_before_ms > 0.0 {
-                audio_parts.push(push_silence(
-                    &mut graph,
-                    segment.gap_before_ms / 1000.0,
-                    &mut next_audio,
-                ));
+                let duration = segment.gap_before_ms / 1000.0;
+                let label = push_silence(&mut graph, duration, &mut next_audio);
+                audio_parts.push((label, duration, 0.0));
             }
-            let start = segment.src_in_ms / 1000.0;
-            let end = segment.src_out_ms / 1000.0;
+            let prefix_ms = segment.transition_in_ms / 2.0;
+            let suffix_ms = request
+                .audio_segments
+                .get(request_index + 1)
+                .map(|next| next.transition_in_ms / 2.0)
+                .unwrap_or(0.0);
+            let start = (segment.src_in_ms - prefix_ms * segment.playback_rate) / 1000.0;
+            let end = (segment.src_out_ms + suffix_ms * segment.playback_rate) / 1000.0;
             let input = segment.source_index;
+            let duration =
+                (segment.src_out_ms - segment.src_in_ms) / segment.playback_rate / 1000.0
+                    + (prefix_ms + suffix_ms) / 1000.0;
+            let transition = segment.transition_in_ms / 1000.0;
             if request.sources[input].has_audio {
                 let i = next_audio;
                 let tempo = atempo_chain(segment.playback_rate);
-                let volume = audio_volume_filter(segment);
+                let volume = audio_volume_filter(segment, prefix_ms);
                 graph += &format!(
                     "[{input}:a]atrim=start={start:.3}:end={end:.3},asetpts=PTS-STARTPTS,{tempo},{volume},{AFMT}[a{i}];"
                 );
-                audio_parts.push(i);
+                audio_parts.push((i, duration, transition));
                 next_audio += 1;
             } else {
                 // Rush muet : le silence est déjà à la bonne durée de timeline.
-                let duration =
-                    (segment.src_out_ms - segment.src_in_ms) / segment.playback_rate / 1000.0;
-                audio_parts.push(push_silence(&mut graph, duration, &mut next_audio));
+                let label = push_silence(&mut graph, duration, &mut next_audio);
+                audio_parts.push((label, duration, transition));
             }
         }
         // Le plan audio peut s'arrêter avant l'image : on complète au silence.
         if audio_tail_ms > 1.0 {
-            audio_parts.push(push_silence(
-                &mut graph,
-                audio_tail_ms / 1000.0,
-                &mut next_audio,
-            ));
+            let duration = audio_tail_ms / 1000.0;
+            let label = push_silence(&mut graph, duration, &mut next_audio);
+            audio_parts.push((label, duration, 0.0));
         }
     }
 
@@ -1255,10 +1289,7 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
                 "Trop de segments sonores ({MAX_SEGMENTS} maximum)."
             ));
         }
-        for i in &audio_parts {
-            graph += &format!("[a{i}]");
-        }
-        graph += &format!("concat=n={m}:v=0:a=1[ac];");
+        assemble_audio_parts(&mut graph, &audio_parts)?;
     }
     // Un point-virgule final ferait échouer FFmpeg sur une chaîne de filtres vide.
     while graph.ends_with(';') {
@@ -1587,6 +1618,20 @@ mod tests {
     }
 
     #[test]
+    fn le_graphe_audio_enchaine_concat_et_acrossfade() {
+        let mut graph = String::new();
+        let label =
+            assemble_audio_parts(&mut graph, &[(0, 4.5, 0.0), (1, 5.0, 1.0), (2, 2.0, 0.0)])
+                .expect("assemblage audio");
+        assert_eq!(label, "ac");
+        assert_eq!(
+            graph,
+            "[a0][a1]acrossfade=d=1.000000:c1=tri:c2=tri[amix1];\
+[amix1][a2]concat=n=2:v=0:a=1[amix2];[amix2]anull[ac];"
+        );
+    }
+
+    #[test]
     fn un_fondu_video_reprend_apres_une_interruption() {
         let interrupted = ExportSegment {
             src_in_ms: 700.0,
@@ -1685,8 +1730,12 @@ mod tests {
             ..segment(0.0)
         };
         assert_eq!(
-            audio_volume_filter(&segment),
+            audio_volume_filter(&segment, 0.0),
             "volume='0.800000*min(1,max(0,(t+0.500000)/1.000000))*min(1,max(0,(5.000000-0.500000-t)/2.000000))':eval=frame"
+        );
+        assert_eq!(
+            audio_volume_filter(&segment, 250.0),
+            "volume='0.800000*min(1,max(0,(t+0.250000)/1.000000))*min(1,max(0,(5.000000-0.250000-t)/2.000000))':eval=frame"
         );
     }
 }

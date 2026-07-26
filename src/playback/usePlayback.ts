@@ -53,6 +53,11 @@ export function decideMediaPrime(ready: boolean, elapsedMs: number): MediaPrimeD
   return elapsedMs < MAX_CUT_HOLD_MS ? "hold" : "fallback";
 }
 
+export function audioTransitionGains(progress: number): [number, number] {
+  const mix = Math.max(0, Math.min(1, progress));
+  return [1 - mix, mix];
+}
+
 export interface PlaybackClock {
   getPlayheadMs: () => number;
   subscribe: (listener: (playheadMs: number) => void) => () => void;
@@ -423,7 +428,67 @@ export function usePlayback(
   const syncAudio = useCallback(
     (timelineMs: number, shouldPlay: boolean, force = false) => {
       const elements = [audioA.current, audioB.current];
-      const segments = compiledRef.current.audio.segments;
+      const audioPlan = compiledRef.current.audio;
+      const segments = audioPlan.segments;
+      const transition = audioPlan.transitions.find(
+        (candidate) =>
+          timelineMs >= candidate.startMs && timelineMs < candidate.endMs,
+      );
+      if (transition) {
+        const from = segments[transition.fromIndex];
+        const to = segments[transition.toIndex];
+        const fromSource = from ? sourcesRef.current[from.clip.sourceId] : undefined;
+        const toSource = to ? sourcesRef.current[to.clip.sourceId] : undefined;
+        const first = audioA.current;
+        const second = audioB.current;
+        if (from && to && fromSource && toSource && first && second) {
+          const outgoing = second.dataset.clipId === from.clip.id ? second : first;
+          const incoming = outgoing === first ? second : first;
+          audioActiveIsARef.current = outgoing === first;
+          currentAudioIndexRef.current =
+            timelineMs < transition.boundaryMs ? transition.fromIndex : transition.toIndex;
+          const [outgoingGain, incomingGain] = audioTransitionGains(
+            (timelineMs - transition.startMs) / transition.durationMs,
+          );
+          const syncElement = (
+            element: HTMLAudioElement,
+            segment: CompiledSegment,
+            source: SourceInfo,
+            mixGain: number,
+          ) => {
+            const targetMs = timelineTimeToSourceTime(segment.clip, timelineMs);
+            const baseRate = segment.clip.playbackRate;
+            element.volume = Math.min(
+              1,
+              previewVolumeRef.current *
+                segment.clip.volume *
+                audioFadeGainAt(segment.sourceClip, timelineMs) *
+                mixGain,
+            );
+            if (element.dataset.clipId !== segment.clip.id || force) {
+              element.dataset.clipId = segment.clip.id;
+              element.playbackRate = baseRate;
+              assign(element, source, targetMs);
+            } else {
+              const driftMs = element.currentTime * 1000 - targetMs;
+              if (Math.abs(driftMs) > AUDIO_DRIFT_HARD_MS) {
+                element.playbackRate = baseRate;
+                seekWhenReady(element, targetMs / 1000);
+              } else if (Math.abs(driftMs) > AUDIO_DRIFT_OK_MS) {
+                element.playbackRate =
+                  baseRate * (driftMs < 0 ? 1 + AUDIO_NUDGE : 1 - AUDIO_NUDGE);
+              } else if (element.playbackRate !== baseRate) {
+                element.playbackRate = baseRate;
+              }
+            }
+            if (shouldPlay && element.paused) void element.play().catch(() => undefined);
+            if (!shouldPlay && !element.paused) element.pause();
+          };
+          syncElement(outgoing, from, fromSource, outgoingGain);
+          syncElement(incoming, to, toSource, incomingGain);
+          return;
+        }
+      }
       let index = currentAudioIndexRef.current;
       const current = segments[index];
       if (!current || timelineMs < current.startMs || timelineMs >= current.endMs) {
@@ -513,6 +578,10 @@ export function usePlayback(
       if (idle && upcoming && audioPrimeRef.current?.clipId !== upcoming.clip.id) {
         const nextSource = sourcesRef.current[upcoming.clip.sourceId];
         if (nextSource) {
+          const upcomingTransition = audioPlan.transitions.find(
+            (candidate) => candidate.fromIndex === index && candidate.toIndex === index + 1,
+          );
+          const primeTimelineMs = upcomingTransition?.startMs ?? upcoming.startMs;
           audioPrimeRef.current?.cancel();
           idle.dataset.clipId = upcoming.clip.id;
           idle.playbackRate = upcoming.clip.playbackRate;
@@ -526,7 +595,7 @@ export function usePlayback(
             idle,
             upcoming.clip.id,
             nextSource,
-            upcoming.clip.srcInMs,
+            timelineTimeToSourceTime(upcoming.clip, primeTimelineMs),
           );
         }
       }

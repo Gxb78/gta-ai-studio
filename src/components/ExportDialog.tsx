@@ -57,9 +57,8 @@ function toSegments(
       videoFadeOutMs: audio ? 0 : sourceClip.videoFadeOutMs,
       videoFadeOffsetMs: audio ? 0 : compiled.startMs - sourceClip.timelineStartMs,
       videoClipDurationMs: audio ? clipDurationMs(clip) : clipDurationMs(sourceClip),
-      transitionInMs: audio
-        ? 0
-        : transitions.find((transition) => transition.toIndex === segmentIndex)?.durationMs ?? 0,
+      transitionInMs:
+        transitions.find((transition) => transition.toIndex === segmentIndex)?.durationMs ?? 0,
       gapBeforeMs: Math.max(0, clip.timelineStartMs - cursor),
       cropX: clip.cropX,
     });
@@ -85,7 +84,12 @@ function buildRequest(
     false,
     compiledTimeline.video.transitions,
   );
-  const audioSegments = toSegments(audioPlanSegments, indexOf, true);
+  const audioSegments = toSegments(
+    audioPlanSegments,
+    indexOf,
+    true,
+    compiledTimeline.audio.transitions,
+  );
 
   // La définition de sortie est imposée (1080×1920) et appliquée segment par
   // segment ; seule la cadence se cale sur le premier rush.

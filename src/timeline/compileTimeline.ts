@@ -144,6 +144,51 @@ function compilePlan(
   };
 }
 
+/**
+ * Reprend une transition vidéo dans le plan sonore seulement si les deux plans
+ * décrivent exactement la même coupe. Une surcouche muette peut ainsi fondre à
+ * l'image pendant que le son de la piste inférieure reste parfaitement continu.
+ */
+function compileAudioTransitions(
+  audioSegments: readonly CompiledSegment[],
+  videoPlan: CompiledPlan,
+  sources: Readonly<Record<string, SourceInfo>>,
+): CompiledTransition[] {
+  const transitions: CompiledTransition[] = [];
+  for (const videoTransition of videoPlan.transitions) {
+    const videoFrom = videoPlan.segments[videoTransition.fromIndex];
+    const videoTo = videoPlan.segments[videoTransition.toIndex];
+    const fromIndex = audioSegments.findIndex(
+      (segment) =>
+        segment.sourceClipId === videoFrom.sourceClipId &&
+        Math.abs(segment.endMs - videoTransition.boundaryMs) <= GAP_EPSILON_MS,
+    );
+    const toIndex = fromIndex + 1;
+    const audioFrom = audioSegments[fromIndex];
+    const audioTo = audioSegments[toIndex];
+    if (
+      !audioFrom ||
+      !audioTo ||
+      audioTo.sourceClipId !== videoTo.sourceClipId ||
+      Math.abs(audioTo.startMs - videoTransition.boundaryMs) > GAP_EPSILON_MS ||
+      audioFrom.endMs - audioFrom.startMs + GAP_EPSILON_MS < videoTransition.durationMs ||
+      audioTo.endMs - audioTo.startMs + GAP_EPSILON_MS < videoTransition.durationMs ||
+      audioFrom.sourceClip.audioFadeOutMs > 0 ||
+      audioTo.sourceClip.audioFadeInMs > 0 ||
+      !sources[audioFrom.clip.sourceId]?.probe.hasAudio ||
+      !sources[audioTo.clip.sourceId]?.probe.hasAudio
+    ) {
+      continue;
+    }
+    transitions.push({
+      ...videoTransition,
+      fromIndex,
+      toIndex,
+    });
+  }
+  return transitions;
+}
+
 export function compileTimeline(
   clips: readonly Clip[],
   hiddenTracks: ReadonlySet<number>,
@@ -166,9 +211,13 @@ export function compileTimeline(
     );
   }
 
+  const video = compilePlan(videoClips, clips, durationMs, sources, true);
+  const audio = compilePlan(audioClips, clips, durationMs, sources, false);
+  audio.transitions = compileAudioTransitions(audio.segments, video, sources);
+
   return {
-    video: compilePlan(videoClips, clips, durationMs, sources, true),
-    audio: compilePlan(audioClips, clips, durationMs, sources, false),
+    video,
+    audio,
     gaps: timelineGaps(videoClips),
     clipsByTrack,
     trackCount: countTracks(mutableClips),

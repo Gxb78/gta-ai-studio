@@ -37,6 +37,7 @@ import {
   findSegmentIndex,
 } from "../src/timeline/compileTimeline";
 import {
+  audioTransitionGains,
   createPlaybackClock,
   decideMediaPrime,
   mediaIsPrimed,
@@ -1040,6 +1041,46 @@ check(
     },
   ],
 );
+check(
+  "le son reprend la même transition quand les deux plans coïncident",
+  compiledTransition.audio.transitions,
+  compiledTransition.video.transitions,
+);
+const transitionSurCoucheMuette = compileTimeline(
+  [
+    clip("son-continu", 0, 0, 0, 8_000, "S2"),
+    { ...transitionClips[0], id: "overlay-out", track: 1, audioEnabled: false },
+    {
+      ...transitionClips[1],
+      id: "overlay-in",
+      track: 1,
+      audioEnabled: false,
+    },
+  ],
+  new Set(),
+  { S0: source("S0"), S1: source("S1"), S2: source("S2") },
+);
+check(
+  "une transition de surcouche muette ne coupe pas le son continu du dessous",
+  {
+    audioSegments: transitionSurCoucheMuette.audio.segments.length,
+    audioTransitions: transitionSurCoucheMuette.audio.transitions.length,
+  },
+  { audioSegments: 1, audioTransitions: 0 },
+);
+const transitionAvecFonduAudio = compileTimeline(
+  [transitionClips[0], { ...transitionClips[1], audioFadeInMs: 500 }],
+  new Set(),
+  { S0: source("S0"), S1: source("S1") },
+);
+check(
+  "un fondu audio explicite reste prioritaire sur le fondu enchaîné sonore",
+  transitionAvecFonduAudio.audio.transitions,
+  [],
+);
+check("gains audio au début", audioTransitionGains(0), [1, 0]);
+check("gains audio au centre", audioTransitionGains(0.5), [0.5, 0.5]);
+check("gains audio à la fin", audioTransitionGains(1), [0, 1]);
 const sansPoigneeEntrante = compileTimeline(
   [transitionClips[0], { ...transitionClips[1], srcInMs: 0, srcOutMs: 4_000 }],
   new Set(),
