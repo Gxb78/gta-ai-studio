@@ -1,16 +1,27 @@
 // Export TikTok 1080×1920. Le seul moment où FFmpeg travaille sur le rush original.
 
 import { useEffect, useRef, useState } from "react";
-import { exportTimeline, onExportProgress, revealPath } from "../ipc";
+import { CANCELLED, cancelExport, exportTimeline, onExportProgress, revealPath } from "../ipc";
 import { Icon } from "./Icon";
-import type { Clip, ExportRequest, ExportSegment, FramingMode, SourceInfo } from "../types";
+import type {
+  ExportRequest,
+  ExportSegment,
+  FramingMode,
+  SourceInfo,
+  TextOverlay,
+  ZoomRegion,
+} from "../types";
+import type {
+  CompiledSegment,
+  CompiledTimeline,
+  CompiledTransition,
+} from "../timeline/compileTimeline";
 import {
   OUTPUT_HEIGHT,
   OUTPUT_WIDTH,
+  clipDurationMs,
   clipEndMs,
   formatTime,
-  sortClips,
-  timelineGaps,
   usedSources,
 } from "../types";
 
@@ -19,10 +30,18 @@ import {
  * vers la sienne et précédé de son éventuel trou (noir silencieux).
  */
 /** Segments d'un plan, chacun précédé de son éventuel silence ou noir. */
-function toSegments(clips: Clip[], indexOf: Map<string, number>): ExportSegment[] {
+function toSegments(
+  compiledSegments: readonly CompiledSegment[],
+  indexOf: Map<string, number>,
+  audio: boolean,
+  transitions: readonly CompiledTransition[] = [],
+): ExportSegment[] {
   let cursor = 0;
   const segments: ExportSegment[] = [];
-  for (const clip of sortClips(clips)) {
+  const sorted = [...compiledSegments].sort((a, b) => a.startMs - b.startMs);
+  for (let segmentIndex = 0; segmentIndex < sorted.length; segmentIndex++) {
+    const compiled = sorted[segmentIndex];
+    const { clip, sourceClip } = compiled;
     const index = indexOf.get(clip.sourceId);
     if (index === undefined) continue;
     segments.push({
@@ -30,6 +49,17 @@ function toSegments(clips: Clip[], indexOf: Map<string, number>): ExportSegment[
       srcInMs: clip.srcInMs,
       srcOutMs: clip.srcOutMs,
       playbackRate: clip.playbackRate,
+      volume: clip.volume,
+      audioFadeInMs: audio ? sourceClip.audioFadeInMs : 0,
+      audioFadeOutMs: audio ? sourceClip.audioFadeOutMs : 0,
+      audioFadeOffsetMs: audio ? compiled.startMs - sourceClip.timelineStartMs : 0,
+      audioClipDurationMs: audio ? clipDurationMs(sourceClip) : clipDurationMs(clip),
+      videoFadeInMs: audio ? 0 : sourceClip.videoFadeInMs,
+      videoFadeOutMs: audio ? 0 : sourceClip.videoFadeOutMs,
+      videoFadeOffsetMs: audio ? 0 : compiled.startMs - sourceClip.timelineStartMs,
+      videoClipDurationMs: audio ? clipDurationMs(clip) : clipDurationMs(sourceClip),
+      transitionInMs:
+        transitions.find((transition) => transition.toIndex === segmentIndex)?.durationMs ?? 0,
       gapBeforeMs: Math.max(0, clip.timelineStartMs - cursor),
       cropX: clip.cropX,
     });
@@ -40,20 +70,37 @@ function toSegments(clips: Clip[], indexOf: Map<string, number>): ExportSegment[
 
 function buildRequest(
   sources: Record<string, SourceInfo>,
-  clips: Clip[],
-  audioClips: Clip[],
+  compiledTimeline: CompiledTimeline,
 ): Pick<ExportRequest, "sources" | "segments" | "audioSegments" | "hasAudio" | "frameFps"> {
+  const videoSegments = compiledTimeline.video.segments;
+  const audioPlanSegments = compiledTimeline.audio.segments;
   // Les deux plans partagent la même liste de rushs : les index concordent.
+  const clips = videoSegments.map((segment) => segment.clip);
+  const audioClips = audioPlanSegments.map((segment) => segment.clip);
   const used = usedSources(sources, clips.concat(audioClips));
   const indexOf = new Map(used.map((source, index) => [source.id, index]));
-  const segments = toSegments(clips, indexOf);
-  const audioSegments = toSegments(audioClips, indexOf);
+  const segments = toSegments(
+    videoSegments,
+    indexOf,
+    false,
+    compiledTimeline.video.transitions,
+  );
+  const audioSegments = toSegments(
+    audioPlanSegments,
+    indexOf,
+    true,
+    compiledTimeline.audio.transitions,
+  );
 
   // La définition de sortie est imposée (1080×1920) et appliquée segment par
   // segment ; seule la cadence se cale sur le premier rush.
   const reference = used[0];
   return {
-    sources: used.map((source) => ({ path: source.originalPath, hasAudio: source.probe.hasAudio })),
+    sources: used.map((source) => ({
+      path: source.originalPath,
+      hasAudio: source.probe.hasAudio,
+      durationMs: source.probe.durationMs,
+    })),
     segments,
     audioSegments,
     // Un montage sans aucun clip sonore sort muet, plutôt que du silence encodé.
@@ -65,9 +112,10 @@ function buildRequest(
 interface Props {
   sources: Record<string, SourceInfo>;
   /** Plan vidéo. */
-  clips: Clip[];
+  compiledTimeline: CompiledTimeline;
+  textOverlays: TextOverlay[];
+  zooms: ZoomRegion[];
   /** Plan audio, indépendant du plan vidéo. */
-  audioClips: Clip[];
   /**
    * Cadrage du projet. Il n'est PAS choisi ici : l'aperçu le montre déjà, et
    * deux valeurs distinctes rendraient l'aperçu menteur. On peut le changer
@@ -84,8 +132,19 @@ interface Props {
 type Phase = "config" | "running" | "done" | "error";
 
 export function ExportDialog(props: Props) {
-  const { sources, clips, audioClips, framing, onSetFraming, missingIds, defaultName, onClose } =
-    props;
+  const {
+    sources,
+    compiledTimeline,
+    textOverlays,
+    zooms,
+    framing,
+    onSetFraming,
+    missingIds,
+    defaultName,
+    onClose,
+  } = props;
+  const clips = compiledTimeline.video.segments.map((segment) => segment.clip);
+  const audioClips = compiledTimeline.audio.segments.map((segment) => segment.clip);
   const [fileName, setFileName] = useState(defaultName);
   const [phase, setPhase] = useState<Phase>("config");
   const [percent, setPercent] = useState(0);
@@ -108,7 +167,7 @@ export function ExportDialog(props: Props) {
   }, []);
 
   const sanitized = fileName.replace(/[^A-Za-z0-9 _-]/g, "").trim();
-  const gaps = timelineGaps(clips);
+  const gaps = compiledTimeline.gaps;
   const gapTotalMs = gaps.reduce((sum, gap) => sum + (gap.endMs - gap.startMs), 0);
   // Un rush introuvable fait échouer FFmpeg : autant le dire avant de lancer.
   const missingUsed = usedSources(sources, clips.concat(audioClips)).filter((source) =>
@@ -121,13 +180,23 @@ export function ExportDialog(props: Props) {
     setPercent(0);
     try {
       const path = await exportTimeline({
-        ...buildRequest(sources, clips, audioClips),
+        ...buildRequest(sources, compiledTimeline),
         mode: framing,
         fileName: sanitized,
+        textOverlays: textOverlays.filter((overlay) => overlay.text.trim().length > 0),
+        // Un zoom sans agrandissement n'a rien à faire dans le graphe : il
+        // coûterait une passe de `zoompan` pour reproduire l'image d'entrée.
+        zooms: zooms.filter((zoom) => zoom.scale > 1),
       });
       setOutputPath(path);
       setPhase("done");
     } catch (e) {
+      // Une annulation n'est pas un échec : FFmpeg a été tué à la demande de
+      // l'utilisateur. On revient au réglage plutôt que d'afficher une erreur.
+      if (String(e) === CANCELLED) {
+        setPhase("config");
+        return;
+      }
       setError(String(e));
       setPhase("error");
     }
@@ -216,6 +285,11 @@ export function ExportDialog(props: Props) {
               <div className="progress-fill" style={{ width: `${Math.round(percent)}%` }} />
             </div>
             <span className="muted">Rendu en cours… {Math.round(percent)}%</span>
+            <div className="modal-actions">
+              <button className="ghost" onClick={() => void cancelExport()}>
+                Annuler l'export
+              </button>
+            </div>
           </div>
         )}
 

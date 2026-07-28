@@ -20,7 +20,7 @@ Reste à faire sur cette couche (petites finitions attendues après le premier `
 
 - Drag & drop d'un fichier sur la fenêtre.
 - Plusieurs rushs par projet ; bibliothèque des projets récents.
-- Vitesse par clip (x0.5–x3), volume/mute par clip.
+- Vitesse par clip (x0.25–x4), volume/mute et fondus audio par clip.
 - Recadrage 9:16 ajustable (décalage horizontal du crop par clip, aperçu dans le guide).
 - Miniatures de meilleure qualité, densité adaptative au zoom.
 
@@ -35,7 +35,8 @@ Reste à faire sur cette couche (petites finitions attendues après le premier `
 
 - Détection de moments forts (audio + mouvement) sur le proxy, en fond.
 - Suggestions de cuts : « garde ces 3 passages », premier jet de montage à partir d'un brief court.
-- S'inspirer des idées de `legacy/` (analyse, scoring) sans réintroduire pipeline HTTP/SQLite/jobs.
+- Consulter la carte `docs/LEGACY_SALVAGE.md` et, seulement si nécessaire, le tag
+  `legacy-v0.7.2-archive`, sans réintroduire le pipeline HTTP/SQLite/jobs.
 
 ## Dette assumée de la v0.1 (à traiter quand ça gêne)
 

@@ -170,6 +170,12 @@ const PATHS = {
     </>
   ),
   plus: <path d="M12 5v14M5 12h14" />,
+  text: (
+    <>
+      <path d="M4 5.5h16M12 5.5v13M8 18.5h8" />
+      <path d="M4 9V5.5M20 9V5.5" />
+    </>
+  ),
   projects: (
     <>
       <rect x="3" y="5" width="18" height="14.5" rx="2" />
@@ -187,6 +193,62 @@ const PATHS = {
     <>
       <rect x="4" y="3.5" width="16" height="17" rx="2" />
       <path d="M4 8h16M4 16h16" strokeDasharray="3 3" />
+    </>
+  ),
+  /** Chevron vers le bas : replier/déplier une section. Une rotation CSS suffit
+   *  pour l'état inverse, plutôt qu'une seconde icône à maintenir. */
+  chevron: <path d="M6.5 9.5 12 15l5.5-5.5" />,
+  /** Curseurs de réglage. Distinct de l'engrenage, qui désigne les paramètres
+   *  de l'application : régler un clip et régler le logiciel sont deux choses. */
+  sliders: (
+    <>
+      <path d="M4 7h9M17 7h3M4 17h3M11 17h9" />
+      <circle cx="15" cy="7" r="2.3" />
+      <circle cx="9" cy="17" r="2.3" />
+    </>
+  ),
+  layers: (
+    <>
+      <path d="M12 3.5 20.5 8 12 12.5 3.5 8z" />
+      <path d="M4.5 12 12 16l7.5-4M4.5 16 12 20l7.5-4" />
+    </>
+  ),
+  duplicate: (
+    <>
+      <rect x="3.5" y="3.5" width="12" height="12" rx="2" />
+      <path d="M18.5 8.5h2v12h-12v-2" />
+      <path d="M9.5 6.5v6M6.5 9.5h6" />
+    </>
+  ),
+  copy: (
+    <>
+      <rect x="8.5" y="3.5" width="12" height="12" rx="2" />
+      <path d="M15.5 18.5v2h-12v-12h2" />
+    </>
+  ),
+  paste: (
+    <>
+      <path d="M9 4.5H6.5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-12a2 2 0 0 0-2-2H15" />
+      <rect x="9" y="2.5" width="6" height="4" rx="1.2" />
+    </>
+  ),
+  search: (
+    <>
+      <circle cx="10.5" cy="10.5" r="6" />
+      <path d="M15 15l4.5 4.5" />
+    </>
+  ),
+  grid: (
+    <>
+      <rect x="3.5" y="3.5" width="7" height="7" rx="1.4" />
+      <rect x="13.5" y="3.5" width="7" height="7" rx="1.4" />
+      <rect x="3.5" y="13.5" width="7" height="7" rx="1.4" />
+      <rect x="13.5" y="13.5" width="7" height="7" rx="1.4" />
+    </>
+  ),
+  rows: (
+    <>
+      <path d="M4 6.5h16M4 12h16M4 17.5h16" />
     </>
   ),
 } as const;

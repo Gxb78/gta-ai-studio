@@ -8,6 +8,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
+import type { HardwareCapabilities } from "../types";
 
 /** Où en est la sauvegarde automatique du projet. */
 export type SaveState = "clean" | "saving" | "saved" | "error";
@@ -25,6 +26,8 @@ interface Props {
   onShowShortcuts: () => void;
   onNewProject: () => void;
   onExport: () => void;
+  hardware: HardwareCapabilities | null;
+  onRefreshHardware: () => void;
 }
 
 const SAVE_LABEL: Record<SaveState, string> = {
@@ -42,13 +45,18 @@ export function TopBar(props: Props) {
 
   // Fermeture au clic extérieur : un menu qui reste ouvert derrière l'aperçu
   // est plus gênant que pas de menu du tout.
+  //
+  // En phase de CAPTURE, pas de bulle : la timeline arrête la propagation de
+  // son propre `pointerdown` sur ses repères et ses clips (pour ne pas aussi
+  // déclencher un déplacement ou une lecture derrière), ce qui empêchait ce
+  // menu de jamais apprendre qu'on avait cliqué ailleurs.
   useEffect(() => {
     if (!menuOpen) return;
     const onDown = (event: PointerEvent) => {
       if (!menuRef.current?.contains(event.target as Node)) setMenuOpen(false);
     };
-    window.addEventListener("pointerdown", onDown);
-    return () => window.removeEventListener("pointerdown", onDown);
+    window.addEventListener("pointerdown", onDown, true);
+    return () => window.removeEventListener("pointerdown", onDown, true);
   }, [menuOpen]);
 
   const commitName = () => {
@@ -59,7 +67,16 @@ export function TopBar(props: Props) {
   return (
     <header className="topbar">
       <div className="topbar-left">
-        <span className="brand-dot" aria-hidden="true" />
+        {/* Identité de l'application, puis identité du projet : deux choses
+            différentes, donc un séparateur entre les deux. Sans lui, le nom du
+            projet se lit comme la suite du nom du logiciel. */}
+        <span className="brand">
+          <span className="brand-dot" aria-hidden="true" />
+          <span className="brand-name">
+            GTA <strong>Studio</strong>
+          </span>
+        </span>
+        <span className="topbar-sep" aria-hidden="true" />
         {editing ? (
           <input
             className="name-input"
@@ -132,7 +149,11 @@ export function TopBar(props: Props) {
           <button
             type="button"
             className={"icon-btn ghost" + (menuOpen ? " active" : "")}
-            onClick={() => setMenuOpen((open) => !open)}
+            onClick={() => {
+              const next = !menuOpen;
+              setMenuOpen(next);
+              if (next) props.onRefreshHardware();
+            }}
             title="Paramètres"
             aria-label="Paramètres"
           >
@@ -174,9 +195,43 @@ export function TopBar(props: Props) {
                 <Icon name="plus" size={15} />
                 Nouveau projet
               </button>
+              <div
+                className="menu-info"
+                title={
+                  props.hardware
+                    ? [
+                        props.hardware.ffmpegVersion,
+                        props.hardware.ffprobeVersion,
+                        ...props.hardware.diagnostics,
+                      ].join("\n")
+                    : "Diagnostic matériel en cours"
+                }
+              >
+                <Icon
+                  name={props.hardware?.nvencAvailable ? "saved" : "settings"}
+                  size={15}
+                />
+                <span>
+                  {props.hardware?.nvencAvailable
+                    ? "Accélération NVIDIA active"
+                    : props.hardware
+                      ? "Encodage CPU"
+                      : "Diagnostic matériel…"}
+                  {props.hardware?.gpuName && <small>{props.hardware.gpuName}</small>}
+                  {props.hardware && (
+                    <small>
+                      {props.hardware.mediaToolsBundled
+                        ? "FFmpeg embarqué"
+                        : "FFmpeg système"}
+                    </small>
+                  )}
+                </span>
+              </div>
             </div>
           )}
         </div>
+
+        <span className="topbar-sep" aria-hidden="true" />
 
         <button type="button" className="primary" onClick={props.onExport}>
           <Icon name="export" size={15} />

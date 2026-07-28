@@ -16,6 +16,7 @@ __pycache__/
 # Archives legacy : caches et binaires lourds
 legacy/apps/desktop/.sidecar-build/
 legacy/**/binaries/*.exe
+src-tauri/binaries/*.exe
 
 # Configuration locale et secrets
 .env
@@ -36,3 +37,6 @@ data/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Outillage local Claude Code (worktrees, config de lancement de dev)
+.claude/

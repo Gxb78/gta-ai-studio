@@ -35,6 +35,9 @@ const GROUPS: { title: string; rows: Row[] }[] = [
     rows: [
       { keys: ["S"], label: "Couper au playhead" },
       { keys: ["Suppr"], label: "Supprimer le clip sélectionné" },
+      { keys: ["Ctrl", "D"], label: "Dupliquer le clip, juste après lui" },
+      { keys: ["Ctrl", "C"], label: "Copier le clip sélectionné" },
+      { keys: ["Ctrl", "V"], label: "Coller le clip copié au playhead" },
       { keys: ["M"], label: "Couper ou rendre le son du clip" },
       { keys: ["I"], label: "Début du clip au playhead" },
       { keys: ["O"], label: "Fin du clip au playhead" },
@@ -48,6 +51,10 @@ const GROUPS: { title: string; rows: Row[] }[] = [
   {
     title: "Timeline",
     rows: [
+      { keys: ["Clic"], label: "Sélectionner un clip" },
+      { keys: ["Clic maintenu"], label: "Déplacer un clip" },
+      { keys: ["Clic droit"], label: "Menu du clip" },
+      { keys: ["Clic"], label: "Sélectionner un zoom dans sa bande" },
       { keys: ["Molette"], label: "Défiler horizontalement" },
       { keys: ["Ctrl", "Molette"], label: "Zoomer sous le curseur" },
       { keys: ["Maj"], label: "Mode précis pendant un geste" },

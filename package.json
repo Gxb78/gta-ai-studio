@@ -10,6 +10,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.json --noEmit && vite build",
+    "prepare:ffmpeg": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/provision-ffmpeg.ps1",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --disable-warning=ExperimentalWarning --import ./tests/register.mjs tests/timeline.test.ts",
     "tauri": "tauri"

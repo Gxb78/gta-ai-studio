@@ -4,10 +4,11 @@
 // Un projet dont les fichiers de montage ont été nettoyés reste listé : on
 // préfère un message clair au clic plutôt qu'une liste qui cache des entrées.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
 import { listProjects, loadProject, mediaUrl } from "../ipc";
 import type { ProjectSummary, StoredProject } from "../types";
+import { UnsupportedProjectVersionError, isProjectVersionSupported } from "../types";
 
 interface Props {
   /** Projet actuellement ouvert, pour le signaler dans la liste. */
@@ -34,6 +35,10 @@ export function ProjectsDialog({ currentId, onOpen, onNewProject, onClose }: Pro
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [opening, setOpening] = useState<string | null>(null);
+  // Fermer la boîte de dialogue (clic sur le fond, Échap…) pendant qu'un
+  // chargement est en vol ne doit pas faire basculer l'app sur ce projet une
+  // fois la promesse résolue : l'utilisateur a déjà annulé son choix.
+  const closedRef = useRef(false);
 
   useEffect(() => {
     void listProjects()
@@ -42,6 +47,9 @@ export function ProjectsDialog({ currentId, onOpen, onNewProject, onClose }: Pro
         setProjects([]);
         setError(String(e));
       });
+    return () => {
+      closedRef.current = true;
+    };
   }, []);
 
   const open = async (id: string) => {
@@ -49,12 +57,19 @@ export function ProjectsDialog({ currentId, onOpen, onNewProject, onClose }: Pro
     setOpening(id);
     try {
       const project = await loadProject(id);
+      if (closedRef.current) return;
       if (!project) throw new Error("Projet introuvable.");
+      // Refuse plutôt que de migrer en aveugle un format plus récent que ce
+      // que ce build sait lire : migrer perdrait ses champs inconnus, et le
+      // projet ouvert écraserait aussitôt le fichier d'origine par l'autosave.
+      if (!isProjectVersionSupported(project.version)) {
+        throw new UnsupportedProjectVersionError(project.version);
+      }
       onOpen(project);
     } catch (e) {
-      setError(String(e));
+      if (!closedRef.current) setError(String(e));
     } finally {
-      setOpening(null);
+      if (!closedRef.current) setOpening(null);
     }
   };
 
@@ -82,9 +97,14 @@ export function ProjectsDialog({ currentId, onOpen, onNewProject, onClose }: Pro
               <button
                 key={project.id}
                 type="button"
-                className={"project-card" + (project.id === currentId ? " current" : "")}
+                className={
+                  "project-card" +
+                  (project.id === currentId ? " current" : "") +
+                  (project.readable ? "" : " unreadable")
+                }
                 onClick={() => void open(project.id)}
                 disabled={opening !== null}
+                title={project.readable ? undefined : "Fichier de projet illisible ou corrompu"}
               >
                 {project.thumbPath ? (
                   <img src={mediaUrl(project.thumbPath)} alt="" draggable={false} />
@@ -94,11 +114,13 @@ export function ProjectsDialog({ currentId, onOpen, onNewProject, onClose }: Pro
                 <span className="project-meta">
                   <span className="project-name">{project.name}</span>
                   <span className="muted small-text">
-                    {project.clipCount} clip{project.clipCount > 1 ? "s" : ""} ·{" "}
-                    {shortDate(project.updatedAt)}
+                    {project.readable
+                      ? `${project.clipCount} clip${project.clipCount > 1 ? "s" : ""} · ${shortDate(project.updatedAt)}`
+                      : "Fichier corrompu — clique pour plus de détails"}
                   </span>
                 </span>
                 {project.id === currentId && <span className="badge">Ouvert</span>}
+                {!project.readable && <span className="badge badge-warn">Illisible</span>}
               </button>
             ))}
           </div>

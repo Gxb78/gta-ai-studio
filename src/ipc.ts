@@ -3,10 +3,12 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
   ExportProgress,
   ExportRequest,
+  HardwareCapabilities,
   ImportProgress,
   Project,
   ProjectSummary,
@@ -66,8 +68,23 @@ export async function onFilesDropped(
   }
 }
 
+/**
+ * Message renvoyé par le backend quand un import ou un export a été
+ * réellement annulé (FFmpeg tué, pas seulement abandonné en arrière-plan) —
+ * voir `CANCELLED` dans src-tauri/src/media.rs, dont cette valeur est le
+ * miroir exact. L'interface s'en sert pour ne jamais afficher une annulation
+ * comme un échec.
+ */
+export const CANCELLED = "__cancelled__";
+
 export const importSource = (path: string): Promise<SourceInfo> =>
   invoke<SourceInfo>("import_source", { path });
+
+/** Tue le FFmpeg de l'import en cours, s'il y en a un. */
+export const cancelImport = (): Promise<void> => invoke<void>("cancel_import");
+
+export const getHardwareCapabilities = (): Promise<HardwareCapabilities> =>
+  invoke<HardwareCapabilities>("hardware_capabilities");
 
 export const saveProject = (project: Project): Promise<void> =>
   invoke<void>("save_project", { project });
@@ -91,6 +108,9 @@ export const pathsExist = (paths: string[]): Promise<boolean[]> =>
 export const exportTimeline = (request: ExportRequest): Promise<string> =>
   invoke<string>("export_timeline", { request });
 
+/** Tue le FFmpeg de l'export en cours, s'il y en a un. */
+export const cancelExport = (): Promise<void> => invoke<void>("cancel_export");
+
 export const revealPath = (path: string): Promise<void> =>
   invoke<void>("reveal_path", { path });
 
@@ -103,3 +123,31 @@ export const onExportProgress = (
   callback: (progress: ExportProgress) => void,
 ): Promise<UnlistenFn> =>
   listen<ExportProgress>("export://progress", (event) => callback(event.payload));
+
+/**
+ * Écoute la demande de fermeture de la fenêtre.
+ *
+ * Tauri attend que la promesse renvoyée par le handler se résolve avant de
+ * détruire la fenêtre : c'est la fenêtre de temps où vider une sauvegarde en
+ * attente avant que le processus ne parte. Le handler ne doit JAMAIS rejeter —
+ * une exception qui remonte empêcherait Tauri d'appeler `destroy()`, et la
+ * fenêtre resterait bloquée, impossible à fermer.
+ *
+ * `getCurrentWindow()` lève une exception SYNCHRONE si le pont Tauri n'est pas
+ * encore prêt (fenêtre pas encore enregistrée côté backend, ou l'app servie
+ * hors d'un webview Tauri pendant le développement). Cet appel vit dans un
+ * `useEffect` sans limite d'erreur autour : une exception qui remonte jusque
+ * là fait planter tout l'arbre React au montage — écran noir, sans indice.
+ * On la rattrape et on rend un « désabonnement » qui ne fait rien plutôt que
+ * de laisser un raté d'initialisation dérégler tout le reste de l'appli.
+ */
+export const onCloseRequested = (handler: () => Promise<void>): Promise<UnlistenFn> => {
+  try {
+    return getCurrentWindow().onCloseRequested(async () => {
+      await handler();
+    });
+  } catch (error) {
+    console.error("Écoute de la fermeture de fenêtre indisponible :", error);
+    return Promise.resolve(() => {});
+  }
+};

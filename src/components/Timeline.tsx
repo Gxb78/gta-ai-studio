@@ -12,45 +12,69 @@
 //   - les vignettes sont indexées sur le temps source absolu, donc les <img> sont
 //     réutilisées pendant un redimensionnement au lieu d'être démontées.
 
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { EditorAction } from "../state/editor";
+import type { PlaybackClock } from "../playback/usePlayback";
+import { compileTimeline, type CompiledTimeline } from "../timeline/compileTimeline";
 import type { Tool } from "./ToolRail";
-import type { Clip, SourceInfo } from "../types";
+import type { Clip, SourceInfo, TextOverlay, ZoomRegion } from "../types";
 import {
+  MIN_CLIP_MS,
+  MIN_TEXT_DURATION_MS,
+  MIN_ZOOM_DURATION_MS,
   clipDurationMs,
   clipEndMs,
-  clipsOnTrack,
-  flattenTracks,
   formatTime,
   quantizeToFrame,
-  sortClips,
   sourceAspect,
   timelineTimeToSourceTime,
-  timelineDurationMs,
-  timelineGaps,
-  trackCount,
 } from "../types";
 import { mediaUrl } from "../ipc";
+import { ClipMenu, type ClipMenuTarget } from "./ClipMenu";
 import { Icon } from "./Icon";
+import { SplitMenu, type SplitCandidate, type SplitMenuTarget } from "./SplitMenu";
 
 /** Hauteur de la piste et de la bande audio. Le CSS les lit via des variables :
- *  la largeur d'un créneau de vignette en dépend, elles ne doivent pas diverger. */
-const TRACK_HEIGHT_PX = 152;
-const AUDIO_LANE_PX = 28;
+ *  la largeur d'un créneau de vignette en dépend, elles ne doivent pas diverger.
+ *
+ *  Ces hauteurs décident du nombre de pistes visibles sans défilement. À 152 px,
+ *  deux pistes plus la règle et la bande Titres dépassaient déjà la hauteur par
+ *  défaut de la zone : la piste principale sortait de l'écran alors même qu'on
+ *  la regardait. Une piste doit rester lisible, pas confortable — c'est
+ *  l'aperçu qui montre l'image, la timeline montre la structure. */
+const TRACK_HEIGHT_PX = 84;
+const AUDIO_LANE_PX = 22;
 /** Bordure de `.clip`. Avec box-sizing: border-box elle mange de la hauteur
  *  utile : l'oublier fausse le ratio du créneau et le rognage revient. */
 const CLIP_BORDER_PX = 1;
 const THUMB_STRIP_PX = TRACK_HEIGHT_PX - 2 * CLIP_BORDER_PX - AUDIO_LANE_PX;
 /** Pas de quantification de la fenêtre visible transmise aux vignettes. */
 const THUMB_WINDOW_QUANTUM = 128;
+/** Référence stable : évite de recréer un tableau vide à chaque rendu. */
+const EMPTY_TRACK_CLIPS: readonly Clip[] = [];
 /** Écart vertical entre deux pistes. */
-const TRACK_GAP_PX = 6;
+const TRACK_GAP_PX = 4;
 /** Bandeau de dépôt affiché au-dessus pendant un déplacement. */
-const DROP_TRACK_PX = 40;
+const DROP_TRACK_PX = 30;
+const TITLE_LANE_PX = 32;
+/** Bande des zooms : plus fine, elle ne porte qu'un intervalle et son taux. */
+const ZOOM_LANE_PX = 26;
 const SNAP_PX = 9;
 const EDGE_SCROLL_PX = 48;
 const EDGE_SCROLL_SPEED = 20;
 const MOVE_THRESHOLD_PX = 5;
+/**
+ * Durée de maintien avant qu'un appui puisse déplacer un clip.
+ *
+ * Un simple clic sélectionne, il ne déplace pas : le seuil en distance seul ne
+ * suffisait pas, une main qui tremble de six pixels sur un clic déplaçait le
+ * montage. Le déplacement demande donc de MAINTENIR le bouton. Contrepartie
+ * assumée : on ne peut plus attraper un clip et le jeter d'un geste vif, il
+ * faut marquer le temps — c'est le prix d'un montage qu'on ne bouge pas par
+ * accident. Le curseur passe en « saisie » dès que le maintien est acquis :
+ * c'est ce qui dit que le clip est prêt à suivre.
+ */
+const MOVE_HOLD_MS = 160;
 /** Ralentissement du geste quand Maj est enfoncée. */
 const FINE_FACTOR = 5;
 const MIN_PX_PER_SEC = 2;
@@ -67,9 +91,13 @@ interface Props {
   sources: Record<string, SourceInfo>;
   pxPerSec: number;
   onPxPerSecChange: (next: number) => void;
-  playheadMs: number;
-  playing: boolean;
+  compiledTimeline: CompiledTimeline;
+  clock: PlaybackClock;
   selectedClipId: string | null;
+  textOverlays: TextOverlay[];
+  anchorTextOverlays: TextOverlay[];
+  selectedTextOverlayId: string | null;
+  onSelectTextOverlay: (textOverlayId: string | null) => void;
   onSeek: (timelineMs: number) => void;
   onSelect: (clipId: string | null) => void;
   /** Affiche l'image source à `srcMs` pendant un trim (feedback image par image). */
@@ -83,6 +111,27 @@ interface Props {
   lockedTracks: ReadonlySet<number>;
   /** Outil courant : la lame coupe au clic au lieu de déplacer. */
   tool: Tool;
+  /** Zooms animés, affichés dans leur propre bande sous les titres. */
+  zooms: ZoomRegion[];
+  /**
+   * Zooms COMMITTÉS. Ils servent de points d'aimantation : viser les positions
+   * transitoires ferait suivre l'aimant au zoom que le geste est en train de
+   * déplacer — un geste ne mesure jamais ses propres effets.
+   */
+  anchorZooms: ZoomRegion[];
+  selectedZoomId: string | null;
+  onSelectZoom: (zoomId: string | null) => void;
+  /**
+   * Le geste sur un zoom (déplacement, redimensionnement, ou simple clic)
+   * vient de se conclure, qu'il ait été commité ou annulé. C'est le seul bon
+   * moment pour un effet qui change la mise en page (ouvrir l'inspecteur,
+   * par exemple) : le déclencher dès le `pointerdown` — donc pendant que le
+   * geste lit encore la géométrie en direct — décale la timeline sous le
+   * curseur au milieu du geste.
+   */
+  onZoomGestureEnd?: () => void;
+  /** Un clip est dans le presse-papiers de session : « Coller » a de quoi poser. */
+  canPasteClip: boolean;
   /** Média en cours de dépôt depuis le panneau Médias, sinon null. */
   pendingSource: SourceInfo | null;
   onDropSource: (source: SourceInfo, atMs: number, track: number) => void;
@@ -109,6 +158,10 @@ interface Gesture {
   appliedFine: boolean;
   /** Un déplacement ne commence qu'au-delà d'un seuil, pour ne pas gêner la sélection. */
   engaged: boolean;
+  /** Instant à partir duquel le maintien est acquis (voir MOVE_HOLD_MS). */
+  holdUntilMs: number;
+  /** Maintien acquis : le geste peut désormais devenir un déplacement. */
+  armed: boolean;
   lastValueMs: number | null;
   lastTrack: number | null;
   raf: number | null;
@@ -124,11 +177,61 @@ interface GestureHud {
   snapped: boolean;
 }
 
+type TextGestureKind = "trim-left" | "trim-right" | "move";
+
+interface TextGesture {
+  kind: TextGestureKind;
+  overlayId: string;
+  origin: TextOverlay;
+  startClientX: number;
+  startScrollLeft: number;
+  pointerX: number;
+  fine: boolean;
+  appliedFine: boolean;
+  engaged: boolean;
+  /** Mêmes règles de maintien que pour un clip : voir MOVE_HOLD_MS. */
+  holdUntilMs: number;
+  armed: boolean;
+  lastStartMs: number | null;
+  lastEndMs: number | null;
+  raf: number | null;
+  abort: AbortController;
+}
+
+interface ZoomGesture {
+  kind: TextGestureKind;
+  zoomId: string;
+  origin: ZoomRegion;
+  startClientX: number;
+  startScrollLeft: number;
+  pointerX: number;
+  fine: boolean;
+  appliedFine: boolean;
+  engaged: boolean;
+  /** Mêmes règles de maintien que pour un clip : voir MOVE_HOLD_MS. */
+  holdUntilMs: number;
+  armed: boolean;
+  lastStartMs: number | null;
+  lastEndMs: number | null;
+  raf: number | null;
+  abort: AbortController;
+}
+
+interface TextGestureHud {
+  overlayId: string;
+  kind: TextGestureKind;
+  snapped: boolean;
+  edge: "start" | "end";
+}
+
 export function Timeline(props: Props) {
+  if (import.meta.env.DEV) console.count("[render] Timeline");
   const {
-    clips, anchorClips, sources, pxPerSec, onPxPerSecChange, playheadMs, playing,
-    selectedClipId, onSeek, onSelect, onPreviewFrame, onPause, onCloseGaps,
-    hiddenTracks, lockedTracks, tool, pendingSource, onDropSource, onCancelDrop,
+    clips, anchorClips, sources, pxPerSec, onPxPerSecChange, compiledTimeline, clock,
+    selectedClipId, textOverlays, anchorTextOverlays, selectedTextOverlayId,
+    onSelectTextOverlay, onSeek, onSelect, onPreviewFrame, onPause, onCloseGaps,
+    zooms, anchorZooms, selectedZoomId, onSelectZoom, onZoomGestureEnd,
+    hiddenTracks, lockedTracks, tool, canPasteClip, pendingSource, onDropSource, onCancelDrop,
     height, onHeightChange, dispatch,
   } = props;
 
@@ -137,18 +240,63 @@ export function Timeline(props: Props) {
   const headersRef = useRef<HTMLDivElement | null>(null);
   const [viewport, setViewport] = useState({ scrollLeft: 0, width: 1000 });
   const [hud, setHud] = useState<GestureHud | null>(null);
+  /** Clip sur lequel un menu contextuel est ouvert, sinon null. */
+  const [clipMenu, setClipMenu] = useState<ClipMenuTarget | null>(null);
+  /** Menu de coupe étendue (clips/titres/zooms à la même position), sinon null. */
+  const [splitMenu, setSplitMenu] = useState<SplitMenuTarget | null>(null);
+  /**
+   * Clip dont le maintien est acquis : il est prêt à suivre le pointeur.
+   *
+   * Posé UNE fois quand le maintien est acquis, effacé UNE fois à la fin du
+   * geste — donc deux rendus par geste, jamais un par image. Sans ce retour,
+   * seul le curseur changeait, et le curseur est ce qu'on regarde le moins
+   * quand on vise un clip.
+   */
+  const [grabbedClipId, setGrabbedClipId] = useState<string | null>(null);
+  const [textHud, setTextHud] = useState<TextGestureHud | null>(null);
+  const [zoomHud, setZoomHud] = useState<TextGestureHud | null>(null);
   const gestureRef = useRef<Gesture | null>(null);
+  const textGestureRef = useRef<TextGesture | null>(null);
+  const zoomGestureRef = useRef<ZoomGesture | null>(null);
   const zoomAnchorRef = useRef<{ timeMs: number; viewportX: number } | null>(null);
+  const playheadElementRef = useRef<HTMLDivElement | null>(null);
 
   const pxPerMs = pxPerSec / 1000;
-  const sorted = sortClips(clips);
-  const totalMs = timelineDurationMs(clips);
+  /**
+   * Aplatissement calculé sur `clips` — TRANSITOIRE pendant un déplacement ou
+   * un trim (voir `effectiveClips`), committé le reste du temps — et non sur
+   * `compiledTimeline` (toujours committé, c'est ce que reçoit la lecture).
+   *
+   * Sans ce second aplatissement, la position/largeur d'un clip et les trous
+   * affichés restaient figés à leur valeur d'avant-geste pendant tout un
+   * déplacement ou un trim : seul le petit encart HUD bougeait, le rectangle
+   * du clip lui-même semblait immobile jusqu'au relâchement. `compiledTimeline`
+   * reste committé exprès pour la lecture (voir `usePlayback`) : les deux
+   * balises vidéo ne doivent pas se resynchroniser à chaque image d'un geste
+   * qu'on n'a pas encore validé.
+   */
+  const liveTimeline = useMemo(
+    () => compileTimeline(clips, hiddenTracks, sources),
+    [clips, hiddenTracks, sources],
+  );
+  // Déjà groupés par piste ET triés par `timelineStartMs` dans compileTimeline
+  // (voir CompiledTimeline.clipsByTrack) : re-filtrer tous les clips à chaque
+  // piste ici referait, à chaque rendu, ce que le compilateur vient de payer
+  // une fois pour tout le montage.
+  const clipsByTrack = liveTimeline.clipsByTrack;
+  // `durationMs` exclut les pistes masquées (il mesure ce que l'export
+  // produirait). La zone navigable, elle, doit rester assez large pour TOUS
+  // les clips, pistes masquées comprises : sinon, masquer la piste la plus
+  // longue rétrécit le défilement et rend ses propres clips inatteignables
+  // alors qu'ils sont toujours affichés sur leur piste.
+  const fullExtentMs = clips.reduce((max, clip) => Math.max(max, clipEndMs(clip)), 0);
+  const totalMs = Math.max(liveTimeline.video.durationMs, fullExtentMs);
   const totalPx = totalMs * pxPerMs;
   // Un trou, c'est un instant où RIEN n'est visible : il se lit sur le montage
   // aplati, pas sur la seule piste principale — et sans les pistes désactivées,
   // sinon la timeline annoncerait des trous que l'export n'a pas, ou l'inverse.
-  const gaps = timelineGaps(flattenTracks(clips, hiddenTracks));
-  const sourceCount = new Set(clips.map((clip) => clip.sourceId)).size;
+  const gaps = liveTimeline.gaps;
+  const sourceCount = liveTimeline.sourceCount;
   // Une piste vide n'est proposée que pendant un déplacement : le reste du
   // temps elle ne ferait qu'occuper de la hauteur pour rien.
   //
@@ -158,17 +306,115 @@ export function Timeline(props: Props) {
   // piste fantôme d'autant — si le pointeur ne bouge pas, il se retrouve
   // de nouveau dessus l'image suivante, et ainsi de suite. Un montage s'est
   // retrouvé avec 76 pistes de cette façon en moins de deux secondes.
-  const occupied = trackCount(anchorClips);
-  // Piste vide proposée pendant un déplacement OU pendant le dépôt d'un média :
-  // c'est le seul moyen de poser une surcouche sur une piste neuve. Toujours
-  // UNE seule, jamais plus, quel que soit l'endroit où le pointeur traîne.
-  const dropTrackVisible = hud?.kind === "move" || pendingSource !== null;
+  const occupied = compiledTimeline.trackCount;
+  // Piste vide proposée UNIQUEMENT pendant le dépôt d'un média venu du panneau :
+  // là, la question « au-dessus ou dans les pistes existantes ? » se pose
+  // vraiment, puisqu'on introduit quelque chose de neuf.
+  //
+  // Elle ne s'affiche PLUS pendant le déplacement d'un clip déjà posé. Elle
+  // apparaissait dès l'appui, avant le moindre mouvement, et poussait toutes
+  // les pistes vers le bas : sur un montage à deux pistes, maintenir le clic
+  // pour intervertir deux clips faisait sauter la timeline entière alors que
+  // le seul choix réel était « l'une ou l'autre ». Une rangée qui n'offre un
+  // choix qu'une fois sur dix ne vaut pas un décalage de toute la vue à chaque
+  // prise. Pour poser un clip existant sur une piste neuve, le menu du clic
+  // droit propose « Nouvelle piste au-dessus ».
+  const dropTrackVisible = pendingSource !== null;
   const tracks = occupied + (dropTrackVisible ? 1 : 0);
   const trackOrder = Array.from({ length: tracks }, (_, i) => tracks - 1 - i);
 
   // Valeurs fraîches lisibles depuis la boucle rAF sans la faire dépendre du rendu.
-  const liveRef = useRef({ pxPerMs, playheadMs, anchorClips, sources, maxTrack: occupied });
-  liveRef.current = { pxPerMs, playheadMs, anchorClips, sources, maxTrack: occupied };
+  const liveRef = useRef({
+    pxPerMs,
+    anchorClips,
+    anchorTextOverlays,
+    anchorZooms,
+    sources,
+    maxTrack: occupied,
+    totalMs,
+  });
+  liveRef.current = {
+    pxPerMs,
+    anchorClips,
+    anchorTextOverlays,
+    anchorZooms,
+    sources,
+    maxTrack: occupied,
+    totalMs,
+  };
+
+  // --- Réticule global ---------------------------------------------------------
+  // Un seul repère vertical, sur toute la hauteur (règle, titres, zooms,
+  // pistes), qui accroche exactement les mêmes points que les gestes : zéro,
+  // le playhead, et le bord de tout clip, titre ou zoom. Il répond à la même
+  // question partout — « si je clique ici, où est-ce que ça tombe vraiment ? »
+  // — au lieu d'un calcul au pixel près différent par outil. La lame l'utilise
+  // pour couper exactement là où il pointe (voir `beginGesture`).
+  const crosshairRef = useRef<HTMLDivElement | null>(null);
+  const crosshairLabelRef = useRef<HTMLSpanElement | null>(null);
+
+  /**
+   * Position accrochée pour un `clientX` donné, en temps TIMELINE.
+   *
+   * Mêmes anchors que le déplacement d'un clip (zéro, playhead, bords des
+   * clips), étendus aux titres et aux zooms : le réticule doit s'aligner sur
+   * CE que l'œil voit dans les trois bandes, pas seulement sur les pistes.
+   */
+  const resolveCrosshairMs = useCallback((clientX: number): number => {
+    const el = scrollRef.current;
+    if (!el) return 0;
+    const { pxPerMs: livePx, anchorClips, anchorTextOverlays, anchorZooms } = liveRef.current;
+    const rect = el.getBoundingClientRect();
+    const rawMs = Math.max(0, (el.scrollLeft + clientX - rect.left) / livePx);
+    const tolerance = SNAP_PX / livePx;
+    let best = rawMs;
+    let distance = tolerance;
+    // Comparaison directe, sans construire de tableau d'anchors : cette
+    // fonction tourne désormais à chaque échantillon brut de la souris (voir
+    // le réticule plus bas), potentiellement plusieurs centaines de fois par
+    // seconde — une allocation par appel, multipliée par le nombre de clips,
+    // titres et zooms, coûterait plus cher que la comparaison elle-même.
+    const check = (anchor: number) => {
+      const d = anchor > rawMs ? anchor - rawMs : rawMs - anchor;
+      if (d < distance) {
+        distance = d;
+        best = anchor;
+      }
+    };
+    check(0);
+    check(clock.getPlayheadMs());
+    for (const clip of anchorClips) {
+      check(clip.timelineStartMs);
+      check(clipEndMs(clip));
+    }
+    for (const overlay of anchorTextOverlays) {
+      check(overlay.timelineStartMs);
+      check(overlay.timelineEndMs);
+    }
+    for (const zoom of anchorZooms) {
+      check(zoom.timelineStartMs);
+      check(zoom.timelineEndMs);
+    }
+    return best;
+  }, [clock]);
+
+  // Démontage pendant un geste (fermeture du projet, par exemple) : sans ce
+  // nettoyage, la boucle rAF continue de tourner, les écouteurs fenêtre
+  // survivent et les classes de curseur restent posées sur <body> — l'appli
+  // entière se retrouve avec un curseur de déplacement définitif.
+  useEffect(
+    () => () => {
+      document.body.classList.remove("trimming", "moving", "resizing-v");
+      for (const ref of [gestureRef, textGestureRef, zoomGestureRef]) {
+        const gesture = ref.current;
+        if (!gesture) continue;
+        if (gesture.raf !== null) cancelAnimationFrame(gesture.raf);
+        gesture.abort.abort();
+        ref.current = null;
+      }
+    },
+    [],
+  );
 
   // --- Fenêtre visible -------------------------------------------------------
   const syncViewport = useCallback(() => {
@@ -241,6 +487,7 @@ export function Timeline(props: Props) {
       if (next === pxPerSec) return;
       const el = scrollRef.current;
       if (el) {
+        const playheadMs = clock.getPlayheadMs();
         const anchorPx = playheadMs * pxPerMs - el.scrollLeft;
         zoomAnchorRef.current = {
           timeMs: playheadMs,
@@ -249,7 +496,7 @@ export function Timeline(props: Props) {
       }
       onPxPerSecChange(next);
     },
-    [onPxPerSecChange, playheadMs, pxPerMs, pxPerSec],
+    [clock, onPxPerSecChange, pxPerMs, pxPerSec],
   );
 
   const zoomToFit = useCallback(() => {
@@ -260,17 +507,25 @@ export function Timeline(props: Props) {
     onPxPerSecChange(Math.min(MAX_PX_PER_SEC, Math.max(MIN_PX_PER_SEC, target)));
   }, [onPxPerSecChange, totalMs]);
 
-  // --- Suivi du playhead pendant la lecture ----------------------------------
   useEffect(() => {
-    if (!playing) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    const playheadPx = playheadMs * pxPerMs;
-    if (playheadPx < el.scrollLeft + 40 || playheadPx > el.scrollLeft + el.clientWidth - 120) {
-      el.scrollLeft = Math.max(0, playheadPx - el.clientWidth / 3);
-      syncViewport();
-    }
-  }, [playing, playheadMs, pxPerMs, syncViewport]);
+    let lastViewportSync = 0;
+    return clock.subscribe((playheadMs) => {
+      const playheadPx = playheadMs * pxPerMs;
+      if (playheadElementRef.current) {
+        playheadElementRef.current.style.transform = `translate3d(${playheadPx}px, 0, 0)`;
+      }
+      const el = scrollRef.current;
+      if (!el) return;
+      if (playheadPx < el.scrollLeft + 40 || playheadPx > el.scrollLeft + el.clientWidth - 120) {
+        el.scrollLeft = Math.max(0, playheadPx - el.clientWidth / 3);
+        const now = performance.now();
+        if (now - lastViewportSync >= 33) {
+          lastViewportSync = now;
+          syncViewport();
+        }
+      }
+    });
+  }, [clock, pxPerMs, syncViewport]);
 
   // --- Scrub (règle et fond de piste) ----------------------------------------
   const scrubTo = useCallback(
@@ -284,6 +539,9 @@ export function Timeline(props: Props) {
   );
 
   const handleScrubDown = (event: React.PointerEvent) => {
+    // Le clic droit ouvre (ou ouvrirait) un menu contextuel, il ne doit pas
+    // aussi déplacer le playhead — seul le bouton gauche pilote le scrub.
+    if (event.button !== 0) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     scrubTo(event.clientX);
   };
@@ -320,8 +578,9 @@ export function Timeline(props: Props) {
   const runGestureFrame = useCallback(() => {
     const gesture = gestureRef.current;
     if (!gesture) return;
-    const { pxPerMs: livePx, playheadMs: livePlayhead, anchorClips: liveAnchors, sources: liveSources } =
+    const { pxPerMs: livePx, anchorClips: liveAnchors, sources: liveSources } =
       liveRef.current;
+    const livePlayhead = clock.getPlayheadMs();
     // Le calage image dépend de la cadence du rush travaillé, pas du projet :
     // deux rushs peuvent avoir des cadences différentes.
     const liveFps = liveSources[gesture.origin.sourceId]?.probe.fps || 30;
@@ -346,13 +605,30 @@ export function Timeline(props: Props) {
 
     const rawPx = gesture.pointerX - gesture.startClientX + scrollDelta;
     if (!gesture.engaged) {
+      // Le maintien d'abord : tant qu'il n'est pas acquis, l'appui reste une
+      // sélection, quelle que soit la distance parcourue.
+      if (!gesture.armed) {
+        if (performance.now() < gesture.holdUntilMs) {
+          gesture.raf = requestAnimationFrame(runGestureFrame);
+          return;
+        }
+        gesture.armed = true;
+        // PAS de rebase de l'origine ici : `startClientX` reste celle posée
+        // au clic. La reposer sur la position COURANTE du curseur avait beau
+        // vouloir éviter un saut au moment où le maintien s'acquiert, ça
+        // décalait le clip du curseur pour tout le reste du geste — le chemin
+        // parcouru pendant l'attente était perdu, jamais rattrapé, donc le
+        // clip ne suivait plus jamais le curseur 1:1. En gardant la même
+        // origine, franchir le seuil juste après (ci-dessous) applique la
+        // vraie distance parcourue depuis le clic — cohérent, pas un saut.
+        document.body.classList.add("moving");
+        setGrabbedClipId(gesture.clipId);
+      }
       if (Math.abs(rawPx) < MOVE_THRESHOLD_PX) {
         gesture.raf = requestAnimationFrame(runGestureFrame);
         return;
       }
       gesture.engaged = true;
-      // Le curseur ne bascule qu'une fois le déplacement réellement engagé.
-      document.body.classList.add("moving");
     }
     const deltaMs = (gesture.fine ? rawPx / FINE_FACTOR : rawPx) / livePx;
 
@@ -364,8 +640,24 @@ export function Timeline(props: Props) {
       anchors.push(other.timelineStartMs, clipEndMs(other));
     }
 
-    const snapEdge = (value: number): { value: number; snapped: boolean } => {
-      let best = quantizeToFrame(value, liveFps);
+    // `gridFps` par défaut : une maille en temps TIMELINE, à l'image source
+    // près, valable pour un déplacement — la vitesse n'y change rien puisqu'on
+    // ne convertit jamais vers le temps source.
+    //
+    // Le trim, lui, doit systématiquement retomber sur le temps SOURCE une
+    // fois `deltaMs` reconverti (voir `timelineTimeToSourceTime`), qui
+    // multiplie par la vitesse. Quantifier la valeur TIMELINE avec `liveFps`
+    // tel quel donnait donc, une fois reconvertie, une maille source de
+    // `frameMs(liveFps) * rate` : deux fois trop large à 2× (une image source
+    // sur deux devenait inaccessible), deux fois trop fine à 0,5× (le trim
+    // pouvait viser une demi-image). En quantifiant avec `liveFps * rate` ici,
+    // la maille TIMELINE se retrouve elle-même divisée par la vitesse, et la
+    // conversion en temps source la ramène exactement à une image source.
+    const snapEdge = (
+      value: number,
+      gridFps: number = liveFps,
+    ): { value: number; snapped: boolean } => {
+      let best = quantizeToFrame(value, gridFps);
       let snapped = false;
       let distance = tolerance;
       for (const anchor of [...anchors, Math.round(value / 1000) * 1000]) {
@@ -415,7 +707,7 @@ export function Timeline(props: Props) {
     } else {
       const side = gesture.kind === "trim-left" ? "left" : "right";
       const originEdge = side === "left" ? origin.timelineStartMs : clipEndMs(origin);
-      const result = snapEdge(originEdge + deltaMs);
+      const result = snapEdge(originEdge + deltaMs, liveFps * origin.playbackRate);
       value = result.value;
       snapped = result.snapped;
       // Retour en temps source par la conversion canonique : sans elle, un clip
@@ -441,7 +733,100 @@ export function Timeline(props: Props) {
     );
 
     gesture.raf = requestAnimationFrame(runGestureFrame);
-  }, [dispatch, onPreviewFrame, trackUnderPointer]);
+  }, [clock, dispatch, onPreviewFrame, trackUnderPointer]);
+
+  const openClipMenu = useCallback(
+    (event: React.MouseEvent, clip: Clip) => {
+      event.preventDefault();
+      event.stopPropagation();
+      // Un geste est en cours (clic gauche maintenu) : ouvrir un menu par-dessus
+      // laisserait le clip suivre le pointeur derrière lui, et le premier clic
+      // dans le menu conclurait le déplacement à un endroit non voulu.
+      if (gestureRef.current || textGestureRef.current || zoomGestureRef.current) return;
+      // Une piste verrouillée ne propose rien : c'est tout l'intérêt du verrou.
+      if (lockedTracks.has(clip.track)) return;
+      const el = scrollRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      const timelineMs =
+        (el.scrollLeft + event.clientX - rect.left) / liveRef.current.pxPerMs;
+      onSelect(clip.id);
+      setClipMenu({ clipId: clip.id, x: event.clientX, y: event.clientY, timelineMs });
+    },
+    [lockedTracks, onSelect],
+  );
+
+  // Le menu vise un clip précis : si ce clip disparaît (suppression, annulation,
+  // changement de projet), le menu n'a plus d'objet.
+  const menuClip = clipMenu ? clips.find((c) => c.id === clipMenu.clipId) ?? null : null;
+  useEffect(() => {
+    if (clipMenu && !menuClip) setClipMenu(null);
+  }, [clipMenu, menuClip]);
+
+  /**
+   * Tout ce qu'une coupe à `timelineMs` pourrait réellement produire : un clip
+   * par piste qui le recouvre (hors piste verrouillée), tout titre ou zoom qui
+   * le recouvre — chacun avec au moins la marge minimale requise de part et
+   * d'autre (mêmes seuils que `SPLIT_AT`/`SPLIT_MANY_AT`, pour ne jamais cocher
+   * une case que le réducteur refuserait en silence).
+   */
+  const buildSplitCandidates = useCallback(
+    (timelineMs: number): SplitCandidate[] => {
+      const list: SplitCandidate[] = [];
+      for (const clip of clips) {
+        if (lockedTracks.has(clip.track)) continue;
+        const offsetMs = timelineMs - clip.timelineStartMs;
+        if (offsetMs <= MIN_CLIP_MS || offsetMs >= clipDurationMs(clip) - MIN_CLIP_MS) continue;
+        const source = sources[clip.sourceId];
+        list.push({
+          kind: "clip",
+          id: clip.id,
+          label: `V${clip.track + 1} · ${source ? sourceLabel(source) : "Rush"}`,
+        });
+      }
+      for (const overlay of textOverlays) {
+        const offsetMs = timelineMs - overlay.timelineStartMs;
+        const durationMs = overlay.timelineEndMs - overlay.timelineStartMs;
+        if (offsetMs <= MIN_TEXT_DURATION_MS || offsetMs >= durationMs - MIN_TEXT_DURATION_MS) {
+          continue;
+        }
+        list.push({ kind: "text", id: overlay.id, label: overlay.text || "Titre vide" });
+      }
+      for (const zoom of zooms) {
+        const offsetMs = timelineMs - zoom.timelineStartMs;
+        const durationMs = zoom.timelineEndMs - zoom.timelineStartMs;
+        if (offsetMs <= MIN_ZOOM_DURATION_MS || offsetMs >= durationMs - MIN_ZOOM_DURATION_MS) {
+          continue;
+        }
+        list.push({ kind: "zoom", id: zoom.id, label: `Zoom ${zoom.scale.toFixed(1)}×` });
+      }
+      return list;
+    },
+    [clips, lockedTracks, sources, textOverlays, zooms],
+  );
+
+  const openSplitMenuFor = useCallback(
+    (x: number, y: number, timelineMs: number, primaryId: string | null) => {
+      setSplitMenu({ x, y, timelineMs, candidates: buildSplitCandidates(timelineMs), primaryId });
+    },
+    [buildSplitCandidates],
+  );
+
+  /**
+   * Clic droit sur un espace vide (règle, fond des bandes Titres/Zooms, piste
+   * sans clip, trou) : contrairement au clic droit sur un clip, qui ouvre son
+   * propre menu avec `stopPropagation`, celui-ci n'a jamais été intercepté en
+   * amont — un seul gestionnaire, posé sur `.timeline-content`, suffit donc
+   * pour « le clic droit marche partout ».
+   */
+  const openSplitMenuFromEvent = useCallback(
+    (event: React.MouseEvent) => {
+      event.preventDefault();
+      if (gestureRef.current || textGestureRef.current || zoomGestureRef.current) return;
+      openSplitMenuFor(event.clientX, event.clientY, resolveCrosshairMs(event.clientX), null);
+    },
+    [openSplitMenuFor, resolveCrosshairMs],
+  );
 
   const finishGesture = useCallback(
     (commit: boolean) => {
@@ -452,6 +837,7 @@ export function Timeline(props: Props) {
       gestureRef.current = null;
       document.body.classList.remove("trimming", "moving");
       setHud(null);
+      setGrabbedClipId(null);
       if (gesture.engaged) dispatch({ type: commit ? "GESTURE_COMMIT" : "GESTURE_CANCEL" });
     },
     [dispatch],
@@ -470,12 +856,10 @@ export function Timeline(props: Props) {
       onSelect(clip.id);
 
       // Outil lame : on coupe là où on clique, et aucun geste ne démarre.
+      // Même calcul que le réticule affiché juste avant le clic (accroché aux
+      // mêmes bords) : la coupe tombe exactement là où on la voyait.
       if (tool === "blade" && kind === "move") {
-        const el = scrollRef.current;
-        if (!el) return;
-        const rect = el.getBoundingClientRect();
-        const timelineMs = (el.scrollLeft + event.clientX - rect.left) / liveRef.current.pxPerMs;
-        dispatch({ type: "SPLIT_AT", timelineMs });
+        dispatch({ type: "SPLIT_AT", timelineMs: resolveCrosshairMs(event.clientX) });
         return;
       }
 
@@ -491,8 +875,10 @@ export function Timeline(props: Props) {
         pointerY: event.clientY,
         fine: event.shiftKey,
         appliedFine: event.shiftKey,
-        // Un trim est immédiat ; un déplacement attend le seuil.
+        // Un trim est immédiat ; un déplacement attend le maintien puis le seuil.
         engaged: kind !== "move",
+        holdUntilMs: performance.now() + MOVE_HOLD_MS,
+        armed: kind !== "move",
         lastValueMs: null,
         lastTrack: null,
         raf: null,
@@ -512,7 +898,14 @@ export function Timeline(props: Props) {
         },
         options,
       );
-      window.addEventListener("pointerup", () => finishGesture(true), options);
+      window.addEventListener(
+        "pointerup",
+        (up: PointerEvent) => {
+          if (up.button !== 0) return;
+          finishGesture(true);
+        },
+        options,
+      );
       window.addEventListener("pointercancel", () => finishGesture(false), options);
       window.addEventListener(
         "keydown",
@@ -527,13 +920,444 @@ export function Timeline(props: Props) {
 
       gesture.raf = requestAnimationFrame(runGestureFrame);
     },
-    [dispatch, finishGesture, lockedTracks, onPause, onSelect, runGestureFrame, tool],
+    [dispatch, finishGesture, lockedTracks, onPause, onSelect, resolveCrosshairMs, runGestureFrame, tool],
+  );
+
+  const runTextGestureFrame = useCallback(() => {
+    const gesture = textGestureRef.current;
+    if (!gesture) return;
+    const el = scrollRef.current;
+    const live = liveRef.current;
+
+    if (el && gesture.engaged) {
+      const rect = el.getBoundingClientRect();
+      const x = gesture.pointerX - rect.left;
+      if (x < EDGE_SCROLL_PX) el.scrollLeft = Math.max(0, el.scrollLeft - EDGE_SCROLL_SPEED);
+      else if (x > rect.width - EDGE_SCROLL_PX) el.scrollLeft += EDGE_SCROLL_SPEED;
+    }
+
+    const scrollDelta = el ? el.scrollLeft - gesture.startScrollLeft : 0;
+    if (gesture.fine !== gesture.appliedFine) {
+      const previousRawPx = gesture.pointerX - gesture.startClientX + scrollDelta;
+      gesture.startClientX =
+        gesture.pointerX +
+        scrollDelta -
+        previousRawPx * (gesture.fine ? FINE_FACTOR : 1 / FINE_FACTOR);
+      gesture.appliedFine = gesture.fine;
+    }
+    const rawPx = gesture.pointerX - gesture.startClientX + scrollDelta;
+    if (!gesture.engaged) {
+      // Le maintien d'abord : tant qu'il n'est pas acquis, l'appui reste une
+      // sélection, quelle que soit la distance parcourue.
+      if (!gesture.armed) {
+        if (performance.now() < gesture.holdUntilMs) {
+          gesture.raf = requestAnimationFrame(runTextGestureFrame);
+          return;
+        }
+        gesture.armed = true;
+        // PAS de rebase de l'origine ici : `startClientX` reste celle posée
+        // au clic. La reposer sur la position COURANTE du curseur avait beau
+        // vouloir éviter un saut au moment où le maintien s'acquiert, ça
+        // décalait le titre du curseur pour tout le reste du geste — le
+        // chemin parcouru pendant l'attente était perdu, jamais rattrapé.
+        // Franchir le seuil juste après (ci-dessous) applique la vraie
+        // distance parcourue depuis le clic — cohérent, pas un saut.
+        document.body.classList.add("moving");
+      }
+      if (Math.abs(rawPx) < MOVE_THRESHOLD_PX) {
+        gesture.raf = requestAnimationFrame(runTextGestureFrame);
+        return;
+      }
+      gesture.engaged = true;
+    }
+
+    const deltaMs = (gesture.fine ? rawPx / FINE_FACTOR : rawPx) / live.pxPerMs;
+    const toleranceMs = SNAP_PX / live.pxPerMs;
+    const anchors = [0, live.totalMs, clock.getPlayheadMs()];
+    for (const clip of live.anchorClips) {
+      anchors.push(clip.timelineStartMs, clipEndMs(clip));
+    }
+    for (const overlay of live.anchorTextOverlays) {
+      if (overlay.id !== gesture.overlayId) {
+        anchors.push(overlay.timelineStartMs, overlay.timelineEndMs);
+      }
+    }
+    const snap = (raw: number): { value: number; snapped: boolean } => {
+      let value = Math.round(raw / 10) * 10;
+      let distance = toleranceMs;
+      let snapped = false;
+      for (const anchor of [...anchors, Math.round(raw / 1000) * 1000]) {
+        const nextDistance = Math.abs(anchor - raw);
+        if (nextDistance < distance) {
+          value = anchor;
+          distance = nextDistance;
+          snapped = true;
+        }
+      }
+      return { value, snapped };
+    };
+
+    const durationMs = gesture.origin.timelineEndMs - gesture.origin.timelineStartMs;
+    let timelineStartMs = gesture.origin.timelineStartMs;
+    let timelineEndMs = gesture.origin.timelineEndMs;
+    let snapped = false;
+    let snapEdge: "start" | "end" = gesture.kind === "trim-right" ? "end" : "start";
+    if (gesture.kind === "move") {
+      const rawStart = gesture.origin.timelineStartMs + deltaMs;
+      const head = snap(rawStart);
+      const tail = snap(rawStart + durationMs);
+      if (
+        tail.snapped &&
+        (!head.snapped ||
+          Math.abs(tail.value - durationMs - rawStart) < Math.abs(head.value - rawStart))
+      ) {
+        timelineStartMs = tail.value - durationMs;
+        snapped = true;
+        snapEdge = "end";
+      } else {
+        timelineStartMs = head.value;
+        snapped = head.snapped;
+      }
+      timelineStartMs = Math.max(0, Math.min(live.totalMs - durationMs, timelineStartMs));
+      timelineEndMs = timelineStartMs + durationMs;
+    } else if (gesture.kind === "trim-left") {
+      const result = snap(gesture.origin.timelineStartMs + deltaMs);
+      timelineStartMs = Math.max(
+        0,
+        Math.min(gesture.origin.timelineEndMs - MIN_TEXT_DURATION_MS, result.value),
+      );
+      snapped = result.snapped;
+    } else {
+      const result = snap(gesture.origin.timelineEndMs + deltaMs);
+      timelineEndMs = Math.min(
+        live.totalMs,
+        Math.max(gesture.origin.timelineStartMs + MIN_TEXT_DURATION_MS, result.value),
+      );
+      snapped = result.snapped;
+      snapEdge = "end";
+    }
+
+    if (timelineStartMs !== gesture.lastStartMs || timelineEndMs !== gesture.lastEndMs) {
+      gesture.lastStartMs = timelineStartMs;
+      gesture.lastEndMs = timelineEndMs;
+      dispatch({
+        type: "TEXT_TRANSIENT",
+        textOverlayId: gesture.overlayId,
+        timelineStartMs,
+        timelineEndMs,
+      });
+    }
+    setTextHud((previous) =>
+      previous?.snapped === snapped && previous.edge === snapEdge
+        ? previous
+        : { overlayId: gesture.overlayId, kind: gesture.kind, snapped, edge: snapEdge },
+    );
+    gesture.raf = requestAnimationFrame(runTextGestureFrame);
+  }, [clock, dispatch]);
+
+  const finishTextGesture = useCallback(
+    (commit: boolean) => {
+      const gesture = textGestureRef.current;
+      if (!gesture) return;
+      if (gesture.raf !== null) cancelAnimationFrame(gesture.raf);
+      gesture.abort.abort();
+      textGestureRef.current = null;
+      document.body.classList.remove("trimming", "moving");
+      setTextHud(null);
+      if (gesture.engaged) {
+        dispatch({ type: commit ? "TEXT_GESTURE_COMMIT" : "TEXT_GESTURE_CANCEL" });
+      }
+    },
+    [dispatch],
+  );
+
+
+  // --- Gestes sur un zoom ------------------------------------------------------
+  // Meme moteur que les titres : boucle rAF unique, etat transitoire, aucune
+  // entree d'historique avant le relachement. La seule difference tient a la
+  // regle de non-chevauchement, appliquee par le reducteur : le zoom bute
+  // contre ses voisins au lieu de les repousser.
+  const runZoomGestureFrame = useCallback(() => {
+    const gesture = zoomGestureRef.current;
+    if (!gesture) return;
+    const el = scrollRef.current;
+    const live = liveRef.current;
+
+    if (el && gesture.engaged) {
+      const rect = el.getBoundingClientRect();
+      const x = gesture.pointerX - rect.left;
+      if (x < EDGE_SCROLL_PX) el.scrollLeft = Math.max(0, el.scrollLeft - EDGE_SCROLL_SPEED);
+      else if (x > rect.width - EDGE_SCROLL_PX) el.scrollLeft += EDGE_SCROLL_SPEED;
+    }
+
+    const scrollDelta = el ? el.scrollLeft - gesture.startScrollLeft : 0;
+    if (gesture.fine !== gesture.appliedFine) {
+      const previousRawPx = gesture.pointerX - gesture.startClientX + scrollDelta;
+      gesture.startClientX =
+        gesture.pointerX +
+        scrollDelta -
+        previousRawPx * (gesture.fine ? FINE_FACTOR : 1 / FINE_FACTOR);
+      gesture.appliedFine = gesture.fine;
+    }
+    const rawPx = gesture.pointerX - gesture.startClientX + scrollDelta;
+    if (!gesture.engaged) {
+      if (!gesture.armed) {
+        if (performance.now() < gesture.holdUntilMs) {
+          gesture.raf = requestAnimationFrame(runZoomGestureFrame);
+          return;
+        }
+        gesture.armed = true;
+        // Pas de rebase de l'origine : voir le même correctif sur le geste de
+        // clip, `beginGesture` plus haut — rebaser décalait la zone de zoom
+        // du curseur pour tout le reste du geste au lieu de simplement
+        // appliquer la vraie distance parcourue depuis le clic.
+        document.body.classList.add("moving");
+      }
+      if (Math.abs(rawPx) < MOVE_THRESHOLD_PX) {
+        gesture.raf = requestAnimationFrame(runZoomGestureFrame);
+        return;
+      }
+      gesture.engaged = true;
+    }
+
+    const deltaMs = (gesture.fine ? rawPx / FINE_FACTOR : rawPx) / live.pxPerMs;
+    const toleranceMs = SNAP_PX / live.pxPerMs;
+    // On s'aimante sur ce qui a un sens pour un mouvement de camera : les
+    // coupes, les bords du montage, le playhead, et les autres zooms.
+    const anchors = [0, live.totalMs, clock.getPlayheadMs()];
+    for (const clip of live.anchorClips) {
+      anchors.push(clip.timelineStartMs, clipEndMs(clip));
+    }
+    for (const other of live.anchorZooms) {
+      if (other.id !== gesture.zoomId) {
+        anchors.push(other.timelineStartMs, other.timelineEndMs);
+      }
+    }
+    const snap = (raw: number): { value: number; snapped: boolean } => {
+      let value = Math.round(raw / 10) * 10;
+      let distance = toleranceMs;
+      let snapped = false;
+      for (const anchor of [...anchors, Math.round(raw / 1000) * 1000]) {
+        const nextDistance = Math.abs(anchor - raw);
+        if (nextDistance < distance) {
+          value = anchor;
+          distance = nextDistance;
+          snapped = true;
+        }
+      }
+      return { value, snapped };
+    };
+
+    const durationMs = gesture.origin.timelineEndMs - gesture.origin.timelineStartMs;
+    let timelineStartMs = gesture.origin.timelineStartMs;
+    let timelineEndMs = gesture.origin.timelineEndMs;
+    let snapped = false;
+    let snapEdge: "start" | "end" = gesture.kind === "trim-right" ? "end" : "start";
+    if (gesture.kind === "move") {
+      const rawStart = gesture.origin.timelineStartMs + deltaMs;
+      const head = snap(rawStart);
+      const tail = snap(rawStart + durationMs);
+      if (
+        tail.snapped &&
+        (!head.snapped ||
+          Math.abs(tail.value - durationMs - rawStart) < Math.abs(head.value - rawStart))
+      ) {
+        timelineStartMs = tail.value - durationMs;
+        snapped = true;
+        snapEdge = "end";
+      } else {
+        timelineStartMs = head.value;
+        snapped = head.snapped;
+      }
+      timelineStartMs = Math.max(0, Math.min(live.totalMs - durationMs, timelineStartMs));
+      timelineEndMs = timelineStartMs + durationMs;
+    } else if (gesture.kind === "trim-left") {
+      const result = snap(gesture.origin.timelineStartMs + deltaMs);
+      timelineStartMs = Math.max(
+        0,
+        Math.min(gesture.origin.timelineEndMs - MIN_ZOOM_DURATION_MS, result.value),
+      );
+      snapped = result.snapped;
+    } else {
+      const result = snap(gesture.origin.timelineEndMs + deltaMs);
+      timelineEndMs = Math.min(
+        live.totalMs,
+        Math.max(gesture.origin.timelineStartMs + MIN_ZOOM_DURATION_MS, result.value),
+      );
+      snapped = result.snapped;
+      snapEdge = "end";
+    }
+
+    if (timelineStartMs !== gesture.lastStartMs || timelineEndMs !== gesture.lastEndMs) {
+      gesture.lastStartMs = timelineStartMs;
+      gesture.lastEndMs = timelineEndMs;
+      dispatch({
+        type: "ZOOM_TRANSIENT",
+        zoomId: gesture.zoomId,
+        timelineStartMs,
+        timelineEndMs,
+      });
+    }
+
+    setZoomHud((previous) =>
+      previous && previous.snapped === snapped && previous.edge === snapEdge
+        ? previous
+        : { overlayId: gesture.zoomId, kind: gesture.kind, snapped, edge: snapEdge },
+    );
+
+    gesture.raf = requestAnimationFrame(runZoomGestureFrame);
+  }, [clock, dispatch]);
+
+  const finishZoomGesture = useCallback(
+    (commit: boolean) => {
+      const gesture = zoomGestureRef.current;
+      if (!gesture) return;
+      if (gesture.raf !== null) cancelAnimationFrame(gesture.raf);
+      gesture.abort.abort();
+      zoomGestureRef.current = null;
+      document.body.classList.remove("trimming", "moving");
+      setZoomHud(null);
+      if (gesture.engaged) {
+        dispatch({ type: commit ? "ZOOM_GESTURE_COMMIT" : "ZOOM_GESTURE_CANCEL" });
+      }
+      // Une fois le geste terminé (déplacé, redimensionné, ou simple clic) :
+      // c'est ici, plus jamais pendant, qu'un effet de mise en page peut agir.
+      onZoomGestureEnd?.();
+    },
+    [dispatch, onZoomGestureEnd],
+  );
+
+  const beginZoomGesture = useCallback(
+    (event: React.PointerEvent, zoom: ZoomRegion, kind: TextGestureKind) => {
+      if (event.button !== 0) return;
+      event.stopPropagation();
+      event.preventDefault();
+      if (zoomGestureRef.current) finishZoomGesture(true);
+      onPause();
+      onSelectZoom(zoom.id);
+
+      const abort = new AbortController();
+      const gesture: ZoomGesture = {
+        kind,
+        zoomId: zoom.id,
+        origin: { ...zoom },
+        startClientX: event.clientX,
+        startScrollLeft: scrollRef.current?.scrollLeft ?? 0,
+        pointerX: event.clientX,
+        fine: event.shiftKey,
+        appliedFine: event.shiftKey,
+        engaged: kind !== "move",
+        holdUntilMs: performance.now() + MOVE_HOLD_MS,
+        armed: kind !== "move",
+        lastStartMs: null,
+        lastEndMs: null,
+        raf: null,
+        abort,
+      };
+      zoomGestureRef.current = gesture;
+      if (kind !== "move") document.body.classList.add("trimming");
+
+      const options = { signal: abort.signal } as const;
+      window.addEventListener(
+        "pointermove",
+        (moveEvent: PointerEvent) => {
+          gesture.pointerX = moveEvent.clientX;
+          gesture.fine = moveEvent.shiftKey;
+        },
+        options,
+      );
+      window.addEventListener(
+        "pointerup",
+        (up: PointerEvent) => {
+          if (up.button !== 0) return;
+          finishZoomGesture(true);
+        },
+        options,
+      );
+      window.addEventListener("pointercancel", () => finishZoomGesture(false), options);
+      window.addEventListener(
+        "keydown",
+        (keyEvent: KeyboardEvent) => {
+          if (keyEvent.key === "Escape") {
+            keyEvent.preventDefault();
+            finishZoomGesture(false);
+          }
+        },
+        options,
+      );
+
+      gesture.raf = requestAnimationFrame(runZoomGestureFrame);
+    },
+    [finishZoomGesture, onPause, onSelectZoom, runZoomGestureFrame],
+  );
+
+  const beginTextGesture = useCallback(
+    (event: React.PointerEvent, overlay: TextOverlay, kind: TextGestureKind) => {
+      if (event.button !== 0) return;
+      event.stopPropagation();
+      event.preventDefault();
+      if (textGestureRef.current) finishTextGesture(true);
+      onPause();
+      onSelectTextOverlay(overlay.id);
+
+      const abort = new AbortController();
+      const gesture: TextGesture = {
+        kind,
+        overlayId: overlay.id,
+        origin: { ...overlay },
+        startClientX: event.clientX,
+        startScrollLeft: scrollRef.current?.scrollLeft ?? 0,
+        pointerX: event.clientX,
+        fine: event.shiftKey,
+        appliedFine: event.shiftKey,
+        engaged: kind !== "move",
+        holdUntilMs: performance.now() + MOVE_HOLD_MS,
+        armed: kind !== "move",
+        lastStartMs: null,
+        lastEndMs: null,
+        raf: null,
+        abort,
+      };
+      textGestureRef.current = gesture;
+      if (kind !== "move") document.body.classList.add("trimming");
+      const options = { signal: abort.signal } as const;
+      window.addEventListener(
+        "pointermove",
+        (moveEvent: PointerEvent) => {
+          gesture.pointerX = moveEvent.clientX;
+          gesture.fine = moveEvent.shiftKey;
+        },
+        options,
+      );
+      window.addEventListener(
+        "pointerup",
+        (up: PointerEvent) => {
+          if (up.button !== 0) return;
+          finishTextGesture(true);
+        },
+        options,
+      );
+      window.addEventListener("pointercancel", () => finishTextGesture(false), options);
+      window.addEventListener(
+        "keydown",
+        (keyEvent: KeyboardEvent) => {
+          if (keyEvent.key === "Escape") {
+            keyEvent.preventDefault();
+            finishTextGesture(false);
+          }
+        },
+        options,
+      );
+      gesture.raf = requestAnimationFrame(runTextGestureFrame);
+    },
+    [finishTextGesture, onPause, onSelectTextOverlay, runTextGestureFrame],
   );
 
   // Filet de sécurité : jamais de geste orphelin au démontage.
   useEffect(() => {
     return () => {
       gestureRef.current?.abort.abort();
+      textGestureRef.current?.abort.abort();
       document.body.classList.remove("trimming", "moving");
     };
   }, []);
@@ -541,13 +1365,27 @@ export function Timeline(props: Props) {
   // --- Dépôt d'un média venu du panneau Médias --------------------------------
   // Le geste est démarré par le panneau, mais c'est la timeline qui connaît la
   // géométrie : c'est donc elle qui suit le pointeur et décide de la position.
-  const [dropTarget, setDropTarget] = useState<{ atMs: number; track: number } | null>(null);
+  //
+  // Le repère de dépôt est un unique nœud DOM (voir son rendu plus bas),
+  // repositionné directement depuis la boucle pointermove — jamais via un
+  // `setState`. Un survol dure aussi longtemps que le geste lui-même, souvent
+  // plusieurs secondes ; le passer par l'état React aurait redéclenché un
+  // rendu complet de la timeline (pistes, vignettes, règle) à chaque image,
+  // pour un simple rectangle qui suit le pointeur.
+  const dropGhostRef = useRef<HTMLDivElement | null>(null);
+  const dropGhostLabelRef = useRef<HTMLSpanElement | null>(null);
 
   useEffect(() => {
+    const ghost = dropGhostRef.current;
     if (!pendingSource) {
-      setDropTarget(null);
+      if (ghost) ghost.style.display = "none";
+      document.body.classList.remove("drop-invalid");
       return;
     }
+    // Rien sous le pointeur tant qu'il n'a pas encore atteint une piste
+    // valide : le repère qui suit le curseur (voir DragPreview) doit le dire
+    // dès la prise, pas seulement une fois entré dans la timeline.
+    document.body.classList.add("drop-invalid");
     const abort = new AbortController();
     const options = { signal: abort.signal } as const;
 
@@ -572,11 +1410,49 @@ export function Timeline(props: Props) {
       return lockedTracks.has(track) ? null : { atMs, track };
     };
 
-    window.addEventListener(
-      "pointermove",
-      (event: PointerEvent) => setDropTarget(resolve(event)),
-      options,
-    );
+    const paintGhost = (target: { atMs: number; track: number } | null) => {
+      if (!ghost) return;
+      const trackEl = target ? trackRowsRef.current.get(target.track) : undefined;
+      document.body.classList.toggle("drop-invalid", !target || !trackEl);
+      if (!target || !trackEl) {
+        ghost.style.display = "none";
+        return;
+      }
+      ghost.style.display = "flex";
+      ghost.style.top = `${trackEl.offsetTop}px`;
+      ghost.style.height = `${trackEl.offsetHeight}px`;
+      ghost.style.left = `${Math.round(target.atMs * liveRef.current.pxPerMs)}px`;
+      ghost.style.width = `${Math.max(
+        3,
+        Math.round(pendingSource.probe.durationMs * liveRef.current.pxPerMs),
+      )}px`;
+      if (dropGhostLabelRef.current) {
+        dropGhostLabelRef.current.textContent = formatTime(target.atMs);
+      }
+    };
+
+    // Peint à chaque événement, sans `requestAnimationFrame` : un rAF
+    // retarderait délibérément le repère d'au plus une image (voir plus haut,
+    // même correction sur le réticule) — inutile ici, `resolve`/`paintGhost`
+    // ne coûtent que quelques lectures/écritures bornées au nombre de pistes.
+    // `lastKey` évite de repeindre deux fois la même case.
+    let lastKey = "";
+    const onMove = (event: PointerEvent) => {
+      const target = resolve(event);
+      const key = target ? `${target.track}:${Math.round(target.atMs)}` : "";
+      if (key === lastKey) return;
+      lastKey = key;
+      paintGhost(target);
+    };
+    // `passive: true` : ni `resolve` ni `paintGhost` n'appellent jamais
+    // `preventDefault`, ce qui autorise le moteur à traiter ces événements à
+    // haute fréquence sans attendre la confirmation qu'ils ne seront pas
+    // annulés.
+    const moveOptions = { signal: abort.signal, passive: true } as const;
+    window.addEventListener("pointermove", onMove, moveOptions);
+    if ("onpointerrawupdate" in window) {
+      window.addEventListener("pointerrawupdate", onMove as EventListener, moveOptions);
+    }
     window.addEventListener(
       "pointerup",
       (event: PointerEvent) => {
@@ -593,8 +1469,90 @@ export function Timeline(props: Props) {
       },
       options,
     );
-    return () => abort.abort();
+    return () => {
+      abort.abort();
+      if (ghost) ghost.style.display = "none";
+      document.body.classList.remove("drop-invalid");
+    };
   }, [lockedTracks, onCancelDrop, onDropSource, pendingSource, trackUnderPointer]);
+
+  // --- Réticule global : le repère vertical utilisé plus bas et par la lame --
+  //
+  // Écrit en DOM à chaque événement pointeur, SANS passer par
+  // `requestAnimationFrame` : un rAF retarde délibérément l'écriture jusqu'à
+  // l'image suivante, jusqu'à près de deux images de retard dans le pire cas
+  // (l'événement arrive juste après que la boucle rAF de l'image courante a
+  // déjà tourné). Cette latence a un sens pour un dispatch qui redéclenche un
+  // rendu React complet (voir `runGestureFrame`) — elle n'en a aucun ici : le
+  // réticule ne touche que deux propriétés DOM (`transform`, `textContent`),
+  // rien qui justifie d'attendre.
+  useEffect(() => {
+    const el = scrollRef.current;
+    const line = crosshairRef.current;
+    if (!el || !line) return;
+
+    // Le réticule s'efface pendant un vrai geste — trim/déplacement de clip,
+    // de titre, de zoom, OU dépôt d'un média depuis le panneau — puisque
+    // chacun affiche déjà son propre repère (`.snap-line`, `.drop-ghost`).
+    // Sans ce dernier cas, le réticule restait actif PAR-DESSUS le repère de
+    // dépôt pendant tout le glisser d'un rush : deux repères qui se battent
+    // pour l'œil, et deux écouteurs qui repeignent à chaque échantillon pour
+    // une seule information utile.
+    const gestureInProgress = () =>
+      gestureRef.current !== null ||
+      textGestureRef.current !== null ||
+      zoomGestureRef.current !== null ||
+      pendingSource !== null;
+
+    // Position déjà peinte, en pixels ENTIERS : sauter l'écriture quand rien
+    // ne changerait à l'écran (souris à très haut taux de rapport, plusieurs
+    // échantillons par pixel) évite du travail inutile SANS ajouter de retard
+    // — contrairement au rAF ci-dessus, ceci ne fait sauter aucune image.
+    let lastPx: number | null = null;
+
+    const paint = (event: Event) => {
+      const pointerEvent = event as PointerEvent;
+      if (gestureInProgress()) {
+        line.style.display = "none";
+        lastPx = null;
+        return;
+      }
+      const ms = resolveCrosshairMs(pointerEvent.clientX);
+      const px = Math.round(ms * liveRef.current.pxPerMs);
+      line.style.display = "block";
+      if (px !== lastPx) {
+        lastPx = px;
+        line.style.transform = `translate3d(${px}px, 0, 0)`;
+        if (crosshairLabelRef.current) crosshairLabelRef.current.textContent = formatTime(ms);
+      }
+    };
+    const onLeave = () => {
+      lastPx = null;
+      line.style.display = "none";
+    };
+
+    // `pointermove` reste branché dans tous les cas : c'est la seule garantie
+    // que le réticule bouge, quel que soit le moteur. `pointerrawupdate`
+    // (Chromium/WebView2 — donc cette appli Tauri) s'ajoute par-dessus quand
+    // disponible : il livre CHAQUE échantillon matériel de la souris, sans le
+    // grouper au rythme d'affichage. `paint` ignore les positions déjà
+    // peintes (voir `lastPx`), donc les deux événements peuvent coexister
+    // sans jamais dessiner deux fois la même image.
+    //
+    // `passive: true` : ni `paint` ni `onLeave` n'appellent jamais
+    // `preventDefault`, ce qui autorise le moteur à traiter ces événements à
+    // haute fréquence sans attendre, à chaque fois, la confirmation qu'ils ne
+    // seront pas annulés.
+    const passive = { passive: true } as const;
+    el.addEventListener("pointermove", paint, passive);
+    if ("onpointerrawupdate" in window) el.addEventListener("pointerrawupdate", paint, passive);
+    el.addEventListener("pointerleave", onLeave, passive);
+    return () => {
+      el.removeEventListener("pointermove", paint);
+      el.removeEventListener("pointerrawupdate", paint);
+      el.removeEventListener("pointerleave", onLeave);
+    };
+  }, [pendingSource, resolveCrosshairMs]);
 
   // --- Hauteur de la zone timeline ---------------------------------------------
   const beginResize = useCallback(
@@ -660,6 +1618,8 @@ export function Timeline(props: Props) {
           "--audio-h": `${AUDIO_LANE_PX}px`,
           "--track-gap": `${TRACK_GAP_PX}px`,
           "--drop-h": `${DROP_TRACK_PX}px`,
+          "--title-h": `${TITLE_LANE_PX}px`,
+          "--zoom-h": `${ZOOM_LANE_PX}px`,
           // La zone de pistes grandit avec leur nombre, jusqu'à un plafond
           // au-delà duquel elle défile verticalement.
           height: `${height}px`,
@@ -680,11 +1640,19 @@ export function Timeline(props: Props) {
         <div className="track-headers">
           <div className="headers-inner" ref={headersRef}>
             <div className="headers-spacer" />
+            <div className="title-lane-head">
+              <Icon name="text" size={14} />
+              <span>Titres</span>
+            </div>
+            <div className="zoom-lane-head">
+              <Icon name="search" size={13} />
+              <span>Zooms</span>
+            </div>
             {trackOrder.map((track) => {
               if (track >= occupied) {
                 return <div key={`head-drop-${track}`} className="track-head track-head-drop" />;
               }
-              const onTrack = clipsOnTrack(clips, track);
+              const onTrack = clipsByTrack.get(track) ?? EMPTY_TRACK_CLIPS;
               const audible = onTrack.some((clip) => clip.audioEnabled);
               const hidden = hiddenTracks.has(track);
               const locked = lockedTracks.has(track);
@@ -742,7 +1710,18 @@ export function Timeline(props: Props) {
         </div>
 
         <div className="timeline-scroll" ref={scrollRef} onScroll={syncViewport}>
-        <div className="timeline-content" style={{ width: contentWidth }}>
+        <div
+          className="timeline-content"
+          style={{ width: contentWidth }}
+          onContextMenu={openSplitMenuFromEvent}
+        >
+          {/* Repère de dépôt : un seul nœud pour toute la timeline, positionné
+              en JS (voir l'effet plus haut) plutôt que par piste — il n'y a
+              donc rien à recalculer ici pendant le survol. */}
+          <div className="drop-ghost" ref={dropGhostRef} style={{ display: "none" }}>
+            <span ref={dropGhostLabelRef} />
+          </div>
+
           <div className="ruler" onPointerDown={handleScrubDown} onPointerMove={handleScrubMove}>
             {ticks.map((tick) => (
               <div
@@ -753,6 +1732,129 @@ export function Timeline(props: Props) {
                 {tick.label && <span>{tick.label}</span>}
               </div>
             ))}
+          </div>
+
+          {/* Posé ici, avant les pistes : la ligne peint sous les clips (ordre
+              DOM = ordre de peinture pour des éléments en z-index auto), elle
+              ne coupe donc plus les rectangles du montage. Le fanion reste
+              visible au-dessus de la règle, seule zone où rien d'autre ne se
+              pose à cette hauteur. */}
+          <div className="playhead" ref={playheadElementRef} style={{ left: 0 }} />
+
+          <div
+            className="title-lane"
+            onPointerDown={(event) => {
+              if (event.target === event.currentTarget) {
+                onSelectTextOverlay(null);
+                onSelect(null);
+                handleScrubDown(event);
+              }
+            }}
+            onPointerMove={(event) => {
+              if (event.target === event.currentTarget) handleScrubMove(event);
+            }}
+          >
+            {textOverlays.map((overlay) => {
+              const leftPx = Math.round(overlay.timelineStartMs * pxPerMs);
+              const widthPx = Math.max(
+                12,
+                Math.round(overlay.timelineEndMs * pxPerMs) - leftPx,
+              );
+              if (leftPx + widthPx < visibleFromPx || leftPx > visibleToPx) return null;
+              return (
+                <TextOverlayView
+                  key={overlay.id}
+                  overlay={overlay}
+                  leftPx={leftPx}
+                  widthPx={widthPx}
+                  selected={overlay.id === selectedTextOverlayId}
+                  active={overlay.id === textHud?.overlayId}
+                  onBeginGesture={beginTextGesture}
+                />
+              );
+            })}
+            {textHud?.snapped && (
+              <div
+                className="snap-line title-snap-line"
+                style={{
+                  left: Math.round(
+                    ((textHud.edge === "end"
+                      ? textOverlays.find((overlay) => overlay.id === textHud.overlayId)
+                          ?.timelineEndMs
+                      : textOverlays.find((overlay) => overlay.id === textHud.overlayId)
+                          ?.timelineStartMs) ?? 0) * pxPerMs,
+                  ),
+                }}
+              />
+            )}
+          </div>
+
+          {/* Bande des zooms. Un zoom n'appartient à aucune piste : il agit sur
+              l'image de SORTIE, donc il vit sur sa propre ligne, sous les
+              titres et au-dessus des pistes. */}
+          <div
+            className="zoom-lane"
+            onPointerDown={(event) => {
+              if (event.target !== event.currentTarget) return;
+              onSelectZoom(null);
+              handleScrubDown(event);
+            }}
+            onPointerMove={(event) => {
+              if (event.target === event.currentTarget) handleScrubMove(event);
+            }}
+          >
+            {zooms.map((zoom) => {
+              const leftPx = zoom.timelineStartMs * pxPerMs;
+              const widthPx = Math.max(6, (zoom.timelineEndMs - zoom.timelineStartMs) * pxPerMs);
+              return (
+                <div
+                  key={zoom.id}
+                  className={
+                    "zoom-clip" +
+                    (zoom.id === selectedZoomId ? " selected" : "") +
+                    (zoom.id === zoomHud?.overlayId ? " grabbed" : "") +
+                    (zoom.direction === "out" ? " zoom-out" : "")
+                  }
+                  style={{ left: leftPx, width: widthPx }}
+                  onPointerDown={(event) => beginZoomGesture(event, zoom, "move")}
+                  title={
+                    `Zoom ${zoom.scale.toFixed(2)}× · ${zoom.direction === "out" ? "éloignement" : "rapprochement"}` +
+                    (zoom.easing === "ease" ? " · progressif" : "") +
+                    ` · ${formatTime(zoom.timelineStartMs)} - ${formatTime(zoom.timelineEndMs)}`
+                  }
+                >
+                  {/* Sens du mouvement : la seule chose qui ne se lit pas déjà
+                      dans le chiffre d'agrandissement. Masqué sous 40px : un
+                      zoom très court n'a déjà presque plus de place pour le
+                      chiffre seul, l'ajout de la flèche le ferait disparaître
+                      en entier plutôt que de simplement perdre la flèche. */}
+                  <span>
+                    {widthPx >= 40 && (zoom.direction === "out" ? "↘ " : "↗ ")}
+                    {zoom.scale.toFixed(1)}×
+                  </span>
+                  {/* Poignées de rognage : elles rétrécissent sur un zoom court pour
+                      rester saisissables sans manger tout le corps du bloc. */}
+                  <i
+                    className="zoom-handle zoom-handle-l"
+                    style={{ width: Math.max(4, Math.min(10, widthPx / 3)) }}
+                    onPointerDown={(event) => beginZoomGesture(event, zoom, "trim-left")}
+                  />
+                  <i
+                    className="zoom-handle zoom-handle-r"
+                    style={{ width: Math.max(4, Math.min(10, widthPx / 3)) }}
+                    onPointerDown={(event) => beginZoomGesture(event, zoom, "trim-right")}
+                  />
+                  {zoom.id === zoomHud?.overlayId && zoomHud.snapped && (
+                    <i
+                      className={
+                        "zoom-snap" + (zoomHud.edge === "end" ? " zoom-snap-end" : "")
+                      }
+                      aria-hidden="true"
+                    />
+                  )}
+                </div>
+              );
+            })}
           </div>
 
           {/* Pistes empilées, la plus haute en premier : sa priorité visuelle se
@@ -778,20 +1880,6 @@ export function Timeline(props: Props) {
               if (e.target === e.currentTarget) handleScrubMove(e);
             }}
           >
-            {/* Repère de dépôt : la durée réelle du média, à l'endroit exact où
-                il tombera si on relâche maintenant. */}
-            {dropTarget && pendingSource && dropTarget.track === track && (
-              <div
-                className="drop-ghost"
-                style={{
-                  left: Math.round(dropTarget.atMs * pxPerMs),
-                  width: Math.max(3, Math.round(pendingSource.probe.durationMs * pxPerMs)),
-                }}
-              >
-                <span>{formatTime(dropTarget.atMs)}</span>
-              </div>
-            )}
-
             {track === 0 &&
               gaps.map((gap) => (
                 <div
@@ -805,7 +1893,7 @@ export function Timeline(props: Props) {
                 />
               ))}
 
-            {clipsOnTrack(sorted, track).map((clip) => {
+            {(clipsByTrack.get(track) ?? EMPTY_TRACK_CLIPS).map((clip) => {
               // Positions entières : un <img> posé sur un pixel fractionnaire est
               // rééchantillonné par le compositeur, donc flou même à l'échelle 1.
               // Arrondir les deux bords garantit aussi que deux clips jointifs
@@ -828,7 +1916,9 @@ export function Timeline(props: Props) {
                   selected={clip.id === selectedClipId}
                   active={clip.id === hud?.clipId}
                   multiSource={sourceCount > 1}
+                  grabbed={clip.id === grabbedClipId}
                   onBeginGesture={beginGesture}
+                  onContextMenu={openClipMenu}
                 />
               );
             })}
@@ -877,7 +1967,12 @@ export function Timeline(props: Props) {
           </div>
           ))}
 
-          <div className="playhead" style={{ left: Math.round(playheadMs * pxPerMs) }} />
+          {/* Réticule global : positionné/affiché en JS (voir l'effet plus
+              haut), jamais en état React — il suit le pointeur à chaque
+              image tant qu'aucun geste n'est en cours. */}
+          <div className="crosshair" ref={crosshairRef} style={{ left: 0, display: "none" }}>
+            <span className="crosshair-label" ref={crosshairLabelRef} />
+          </div>
         </div>
         </div>
       </div>
@@ -916,6 +2011,15 @@ export function Timeline(props: Props) {
         </div>
 
         <div className="timeline-bar-group">
+          <button
+            type="button"
+            className="ghost small"
+            onClick={() => dispatch({ type: "ADD_ZOOM", atMs: clock.getPlayheadMs() })}
+            title="Poser un zoom au playhead"
+          >
+            <Icon name="search" size={15} />
+            Zoom
+          </button>
           <span className="muted timeline-stat">
             {clips.length} clip{clips.length > 1 ? "s" : ""} · {formatTime(totalMs)}
           </span>
@@ -928,9 +2032,42 @@ export function Timeline(props: Props) {
         </div>
 
         <span className="muted timeline-tip">
-          Poignées = durée · corps = position · Maj = précis
+          Clic = sélection · maintien = déplacement · clic droit = menu · Maj = précis
         </span>
       </div>
+
+      {clipMenu && menuClip && (
+        <ClipMenu
+          target={clipMenu}
+          clip={menuClip}
+          // Diviser n'a de sens qu'à l'intérieur du clip, et à distance des
+          // bords d'au moins MIN_CLIP_MS : le réducteur refuse toute coupe qui
+          // laisserait une moitié plus courte que ça (voir SPLIT_AT).
+          canSplit={
+            clipMenu.timelineMs > menuClip.timelineStartMs + MIN_CLIP_MS &&
+            clipMenu.timelineMs < clipEndMs(menuClip) - MIN_CLIP_MS
+          }
+          canPaste={canPasteClip}
+          // Le réducteur garde toujours au moins un clip : sur le dernier,
+          // l'entrée ne ferait rien du tout. On ne l'affiche donc pas.
+          canDelete={clips.length > 1}
+          // Une piste verrouillée refuse silencieusement toute action qui
+          // modifierait ce clip (voir clipIsLocked dans editor.ts) : sans ce
+          // garde, le menu affichait « Supprimer », « Couper ici » et
+          // consorts, actifs en apparence, inertes au clic.
+          locked={lockedTracks.has(menuClip.track)}
+          onClose={() => setClipMenu(null)}
+          dispatch={dispatch}
+          onExtendSplit={() => {
+            openSplitMenuFor(clipMenu.x, clipMenu.y, clipMenu.timelineMs, menuClip.id);
+            setClipMenu(null);
+          }}
+        />
+      )}
+
+      {splitMenu && (
+        <SplitMenu target={splitMenu} onClose={() => setSplitMenu(null)} dispatch={dispatch} />
+      )}
     </div>
   );
 }
@@ -949,6 +2086,66 @@ function sourceLabel(source: SourceInfo): string {
   return name.replace(/\.[^.]+$/, "");
 }
 
+const TextOverlayView = memo(function TextOverlayView(props: {
+  overlay: TextOverlay;
+  leftPx: number;
+  widthPx: number;
+  selected: boolean;
+  active: boolean;
+  onBeginGesture: (
+    event: React.PointerEvent,
+    overlay: TextOverlay,
+    kind: TextGestureKind,
+  ) => void;
+}) {
+  const { overlay, leftPx, widthPx, selected, active, onBeginGesture } = props;
+  const handlePx = Math.max(4, Math.min(9, widthPx / 3));
+  const durationMs = overlay.timelineEndMs - overlay.timelineStartMs;
+  const fadeInWidth = durationMs > 0 ? (overlay.fadeInMs / durationMs) * widthPx : 0;
+  const fadeOutWidth = durationMs > 0 ? (overlay.fadeOutMs / durationMs) * widthPx : 0;
+  return (
+    <div
+      className={
+        `title-clip title-${overlay.style}` +
+        (selected ? " selected" : "") +
+        (active ? " active" : "")
+      }
+      style={{ left: leftPx, width: widthPx }}
+      onPointerDown={(event) => onBeginGesture(event, overlay, "move")}
+      title={`${overlay.text || "Titre vide"} · ${formatTime(overlay.timelineStartMs)} - ${formatTime(overlay.timelineEndMs)}`}
+    >
+      {overlay.fadeInMs > 0 && (
+        <i
+          className="title-fade title-fade-in"
+          style={{ width: Math.max(2, fadeInWidth) }}
+          aria-hidden="true"
+        />
+      )}
+      {overlay.fadeOutMs > 0 && (
+        <i
+          className="title-fade title-fade-out"
+          style={{ width: Math.max(2, fadeOutWidth) }}
+          aria-hidden="true"
+        />
+      )}
+      <Icon name="text" size={12} />
+      <span>{overlay.text || "Titre vide"}</span>
+      <div
+        className="title-handle title-handle-l"
+        style={{ width: handlePx }}
+        onPointerDown={(event) => onBeginGesture(event, overlay, "trim-left")}
+        title="Ajuster le début du titre"
+      />
+      <div
+        className="title-handle title-handle-r"
+        style={{ width: handlePx }}
+        onPointerDown={(event) => onBeginGesture(event, overlay, "trim-right")}
+        title="Ajuster la fin du titre"
+      />
+    </div>
+  );
+});
+
 // Un clip. Mémoïsé : pendant un geste, les clips inchangés ne re-rendent pas.
 const ClipView = memo(function ClipView(props: {
   clip: Clip;
@@ -962,11 +2159,14 @@ const ClipView = memo(function ClipView(props: {
   active: boolean;
   /** Plusieurs rushs dans le projet : on affiche de quel rush vient le clip. */
   multiSource: boolean;
+  /** Maintien acquis : ce clip est prêt à suivre le pointeur. */
+  grabbed: boolean;
   onBeginGesture: (event: React.PointerEvent, clip: Clip, kind: GestureKind) => void;
+  onContextMenu: (event: React.MouseEvent, clip: Clip) => void;
 }) {
   const {
     clip, source, leftPx, widthPx, pxPerMs, windowFromPx, windowToPx,
-    selected, active, multiSource, onBeginGesture,
+    selected, active, multiSource, grabbed, onBeginGesture, onContextMenu,
   } = props;
 
   // Le créneau a exactement le format du rush de CE clip : sans ça,
@@ -980,9 +2180,15 @@ const ClipView = memo(function ClipView(props: {
 
   return (
     <div
-      className={"clip" + (selected ? " selected" : "") + (active ? " active" : "")}
+      className={
+        "clip" +
+        (selected ? " selected" : "") +
+        (active ? " active" : "") +
+        (grabbed ? " grabbed" : "")
+      }
       style={{ left: leftPx, width: Math.max(widthPx, 8) }}
       onPointerDown={(event) => onBeginGesture(event, clip, "move")}
+      onContextMenu={(event) => onContextMenu(event, clip)}
     >
       <ClipThumbs
         clip={clip}
@@ -1001,6 +2207,41 @@ const ClipView = memo(function ClipView(props: {
             backgroundSize: `${source.probe.durationMs * pxPerSourceMs}px 100%`,
             backgroundPosition: `-${clip.srcInMs * pxPerSourceMs}px 0`,
           }}
+        />
+      )}
+      {clip.audioFadeInMs > 0 && (
+        <span
+          className="clip-audio-fade fade-in"
+          style={{ width: Math.max(2, clip.audioFadeInMs * pxPerMs) }}
+          aria-hidden="true"
+        />
+      )}
+      {clip.audioFadeOutMs > 0 && (
+        <span
+          className="clip-audio-fade fade-out"
+          style={{ width: Math.max(2, clip.audioFadeOutMs * pxPerMs) }}
+          aria-hidden="true"
+        />
+      )}
+      {clip.videoFadeInMs > 0 && (
+        <span
+          className="clip-video-fade fade-in"
+          style={{ width: Math.max(2, clip.videoFadeInMs * pxPerMs) }}
+          aria-hidden="true"
+        />
+      )}
+      {clip.videoFadeOutMs > 0 && (
+        <span
+          className="clip-video-fade fade-out"
+          style={{ width: Math.max(2, clip.videoFadeOutMs * pxPerMs) }}
+          aria-hidden="true"
+        />
+      )}
+      {clip.transitionInMs > 0 && (
+        <span
+          className="clip-transition-in"
+          style={{ width: Math.max(3, (clip.transitionInMs / 2) * pxPerMs) }}
+          title={`Fondu enchaîné ${(clip.transitionInMs / 1000).toFixed(2)} s`}
         />
       )}
       <span className="clip-duration">{formatTime(clipDurationMs(clip))}</span>
