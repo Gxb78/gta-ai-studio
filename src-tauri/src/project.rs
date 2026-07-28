@@ -14,9 +14,19 @@
 
 use serde_json::Value;
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::AppHandle;
 
 use crate::media::data_root;
+
+/// Unique par appel, pas seulement par process : deux sauvegardes concurrentes
+/// du même projet (autosave et sauvegarde explicite qui se chevauchent) ne
+/// doivent jamais écrire dans le même fichier temporaire, sous peine que l'une
+/// écrase l'écriture en cours de l'autre juste avant son renommage.
+fn next_save_token() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Fiche courte d'un projet, pour la liste « Projets récents ». Objet dérivé,
 /// pas une copie du document : sa perte de détail n'a aucune conséquence.
@@ -28,41 +38,17 @@ pub struct ProjectSummary {
     pub updated_at: String,
     pub clip_count: usize,
     pub thumb_path: Option<String>,
+    /// Faux si le fichier existe mais n'a pas pu être lu (JSON corrompu, le
+    /// plus souvent). Un tel projet reste quand même dans la liste : le
+    /// cacher silencieusement le ferait disparaître sans un mot, comme si le
+    /// montage n'avait jamais existé — même principe déjà appliqué aux
+    /// projets dont les fichiers dérivés ont été nettoyés (voir le
+    /// commentaire en tête de ProjectsDialog.tsx).
+    pub readable: bool,
 }
 
 fn is_safe_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-}
-
-/// Chemins de proxy de tous les rushs du projet, formats 1 à 4 confondus.
-fn proxy_paths(project: &Value) -> Vec<&str> {
-    let mut paths: Vec<&str> = Vec::new();
-    if let Some(path) = project
-        .get("source")
-        .and_then(|s| s.get("proxyPath"))
-        .and_then(Value::as_str)
-    {
-        paths.push(path);
-    }
-    if let Some(sources) = project.get("sources").and_then(Value::as_object) {
-        paths.extend(
-            sources
-                .values()
-                .filter_map(|s| s.get("proxyPath"))
-                .filter_map(Value::as_str),
-        );
-    }
-    paths
-}
-
-/// Vrai si tous les proxys du projet sont encore sur le disque.
-///
-/// Sans proxy, il n'y a rien à lire ni à scrubber : le projet n'est pas
-/// ouvrable tel quel. Le rush d'origine, lui, peut manquer sans empêcher le
-/// montage — c'est l'interface qui propose alors de le relocaliser.
-fn proxies_present(project: &Value) -> bool {
-    let paths = proxy_paths(project);
-    !paths.is_empty() && paths.iter().all(|p| std::path::Path::new(p).is_file())
 }
 
 fn read_project(dir: &std::path::Path, id: &str) -> Option<Value> {
@@ -105,9 +91,12 @@ pub fn save_project(app: AppHandle, project: Value) -> Result<(), String> {
     let payload =
         serde_json::to_vec_pretty(&project).map_err(|e| format!("Sérialisation : {e}"))?;
     let target = dir.join(format!("{id}.json"));
-    let temp = dir.join(format!("{id}.json.tmp"));
+    let temp = dir.join(format!("{id}.json.{}.tmp", next_save_token()));
     fs::write(&temp, payload).map_err(|e| format!("Écriture du projet impossible : {e}"))?;
-    fs::rename(&temp, &target).map_err(|e| format!("Finalisation du projet impossible : {e}"))?;
+    fs::rename(&temp, &target).map_err(|e| {
+        let _ = fs::remove_file(&temp);
+        format!("Finalisation du projet impossible : {e}")
+    })?;
 
     fs::write(dir.join("_last"), id.as_bytes())
         .map_err(|e| format!("Mémorisation du dernier projet impossible : {e}"))?;
@@ -125,15 +114,21 @@ pub fn load_last_project(app: AppHandle) -> Result<Option<Value>, String> {
     if !is_safe_id(&id) {
         return Ok(None);
     }
-    let Some(project) = read_project(&dir, &id) else {
-        return Ok(None);
-    };
-    // Si le cache (proxy) a été nettoyé entre-temps, on repart de l'import.
-    Ok(if proxies_present(&project) {
-        Some(project)
-    } else {
-        None
-    })
+    // Le document est rendu tel quel, proxys présents ou non.
+    //
+    // Bug réel corrigé : cette fonction refusait de rendre le projet dès qu'UN
+    // SEUL proxy manquait — y compris celui d'une source jamais posée sur la
+    // timeline, qui n'a pourtant aucun besoin d'être lisible pour que le
+    // montage s'ouvre. Le `None` renvoyé était alors indiscernable de « aucun
+    // projet n'a jamais été enregistré » : au démarrage, le projet disparaissait
+    // purement et simplement, sans message, sans proposer de le réparer.
+    //
+    // Un proxy manquant n'empêche plus d'ouvrir : l'interface détecte les
+    // proxys absents après coup (comme elle le fait déjà pour un rush
+    // d'origine déplacé) et les régénère depuis le rush d'origine, exactement
+    // comme elle régénère déjà un fichier dérivé simplement périmé. Ce fichier
+    // relaie le document, il ne décide plus s'il mérite d'être ouvert.
+    Ok(read_project(&dir, &id))
 }
 
 /// Ouvre un projet désigné et le note comme dernier projet ouvert.
@@ -146,11 +141,8 @@ pub fn load_project(app: AppHandle, id: String) -> Result<Option<Value>, String>
     let Some(project) = read_project(&dir, &id) else {
         return Err("Projet illisible ou introuvable.".into());
     };
-    if !proxies_present(&project) {
-        return Err(
-            "Les fichiers de montage de ce projet ont été nettoyés : réimporte le rush.".into(),
-        );
-    }
+    // Même correctif que `load_last_project` : un proxy manquant se répare
+    // après ouverture, il ne doit plus jamais empêcher l'ouverture elle-même.
     let _ = fs::write(dir.join("_last"), id.as_bytes());
     Ok(Some(project))
 }
@@ -176,6 +168,20 @@ pub fn list_projects(app: AppHandle) -> Result<Vec<ProjectSummary>, String> {
             continue;
         }
         let Some(project) = read_project(&dir, id) else {
+            // JSON illisible (corrompu, le plus souvent) : gardé visible avec
+            // une fiche minimale plutôt que purement et simplement retiré de
+            // la liste — `read_project` a déjà écrit le détail sur stderr.
+            // Sans `updatedAt` à lire dans un contenu qu'on n'a pas pu
+            // parser, une chaîne vide trie ce projet en dernier (le tri plus
+            // bas est lexicographique) plutôt que de deviner une date.
+            summaries.push(ProjectSummary {
+                id: id.to_string(),
+                name: "Projet illisible".to_string(),
+                updated_at: String::new(),
+                clip_count: 0,
+                thumb_path: None,
+                readable: false,
+            });
             continue;
         };
         // Vignette du premier rush : une liste de projets sans image ne dit rien.
@@ -197,6 +203,7 @@ pub fn list_projects(app: AppHandle) -> Result<Vec<ProjectSummary>, String> {
                 .and_then(Value::as_array)
                 .map_or(0, Vec::len),
             thumb_path,
+            readable: true,
         });
     }
     // Tri sur la date ISO 8601 : l'ordre lexicographique est l'ordre chronologique.
@@ -289,18 +296,49 @@ mod tests {
         assert!(project_id(&serde_json::json!({ "id": "projet-1" })).is_ok());
     }
 
+    /// Bug réel corrigé : ce fichier refusait autrefois de rendre un projet dès
+    /// qu'UN SEUL proxy manquait — y compris celui d'une source jamais posée
+    /// sur la timeline. `load_last_project` rendait alors `None`, indiscernable
+    /// de « aucun projet n'a jamais été enregistré » : le projet disparaissait
+    /// purement et simplement au démarrage, sans message, sans réparation
+    /// possible.
+    ///
+    /// `load_last_project`/`load_project` exigent un `AppHandle` réel et ne
+    /// sont donc pas testables isolément ; `read_project`, elle, ne dépend que
+    /// du disque et porte toute la décision qui restait à vérifier : un
+    /// document dont AUCUN proxy n'existe (le pire cas, pas seulement une
+    /// source inutilisée) doit tout de même ressortir intact, prêt à être
+    /// ouvert en mode dégradé pendant que l'interface régénère les proxys
+    /// manquants — jamais avalé en silence.
     #[test]
-    fn les_proxys_sont_lus_dans_les_deux_formats() {
-        let mono = serde_json::json!({ "source": { "proxyPath": "/tmp/inexistant.mp4" } });
-        assert!(
-            !proxies_present(&mono),
-            "un chemin qui n'existe pas ne doit jamais passer"
+    fn un_projet_sans_aucun_proxy_reste_lisible() {
+        let dir = std::env::temp_dir().join(format!(
+            "gta-studio-test-proxy-manquant-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let id = "projet-sans-proxy";
+        let brut = serde_json::json!({
+            "version": 9,
+            "id": id,
+            "name": "montage",
+            "sources": {
+                "utilisee": { "proxyPath": "/chemin/inexistant/a.mp4" },
+                "inutilisee": { "proxyPath": "/chemin/inexistant/b.mp4" }
+            },
+            "clips": [{ "id": "c1", "sourceId": "utilisee" }],
+            "createdAt": "a",
+            "updatedAt": "b"
+        });
+        fs::write(dir.join(format!("{id}.json")), brut.to_string()).unwrap();
+
+        let relu = read_project(&dir, id);
+        assert_eq!(
+            relu.as_ref(),
+            Some(&brut),
+            "aucun proxy sur le disque ne doit empêcher le document de ressortir intact"
         );
 
-        let multi = serde_json::json!({ "sources": {} });
-        assert!(
-            !proxies_present(&multi),
-            "aucun rush référencé : rien à ouvrir"
-        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

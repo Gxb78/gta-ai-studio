@@ -265,9 +265,10 @@ input:focus { border-color: var(--accent); }
   overflow-x: hidden;
   background: var(--surface);
 }
-/* Colonne de gauche en deux volets : bibliothèque en haut, inspecteur en bas.
-   Les deux panneaux ne se distinguent plus par un bord vertical — ils sont dans
-   la même colonne — mais par le filet horizontal de la poignée. */
+/* Colonne de gauche : UN SEUL panneau à la fois (Médias, Titres ou
+   Inspecteur), qui en occupe toute la hauteur. Passer de l'un à l'autre ne
+   redimensionne donc jamais rien autour de lui, et il n'y a plus de poignée
+   à tenir à jour entre deux volets qui ne coexistent plus. */
 .side-column {
   flex: none;
   width: 296px;
@@ -277,27 +278,7 @@ input:focus { border-color: var(--accent); }
   border-right: 1px solid var(--border);
   background: var(--surface);
 }
-.side-column .panel { width: auto; flex: 1; }
-/* Volet du bas : hauteur imposée quand il partage la colonne, sinon il la
-   remplit. `flex: none` l'empêche de se faire écraser par le volet du haut. */
-.side-pane-bottom {
-  flex: none;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-.side-pane-bottom:only-child { flex: 1; }
-.side-pane-bottom .panel { height: 100%; }
-
-/* Poignée : une bande de préhension, comme celle de la timeline. */
-.side-grip {
-  flex: none;
-  height: 7px;
-  cursor: ns-resize;
-  touch-action: none;
-  border-top: 1px solid var(--border);
-}
-.side-grip:hover { background: var(--accent-soft); }
+.side-column .panel { width: auto; flex: 1; height: 100%; }
 
 .panel-inspector { width: auto; }
 .panel-head { display: flex; align-items: center; justify-content: space-between; }
@@ -579,6 +560,19 @@ input:focus { border-color: var(--accent); }
   text-align: right;
   color: var(--text);
 }
+.slider-number {
+  width: 58px;
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* Réglages rapides du zoom : taille (ligne) et position (grille 3×3, mêmes
+   proportions que le cadre qu'ils positionnent). */
+.zoom-presets { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.zoom-presets-grid { display: grid; grid-template-columns: repeat(3, 1fr); }
+.zoom-effect-row { display: flex; gap: 5px; margin-top: 6px; }
+.zoom-effect-row button { flex: 1; }
 
 /* Curseurs : une piste fine, un pouce net, aucun relief. */
 input[type="range"] {
@@ -746,6 +740,68 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
   border-radius: 0 0 5px 5px;
   height: 31px;
 }
+/* Menu de coupe étendue : même ancrage « fenêtre » que .clip-menu (voir
+   ci-dessus pour le pourquoi du `right: auto`), une liste à cocher au lieu
+   d'actions à un clic. */
+.split-menu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: auto;
+  min-width: 220px;
+  max-width: 280px;
+  padding: 8px;
+  gap: 6px;
+  border-radius: 9px;
+  z-index: 60;
+}
+.split-menu-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 2px 6px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--accent-hi);
+}
+.split-menu-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.split-menu-empty { padding: 6px 4px; }
+.split-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 6px;
+  border-radius: 5px;
+  font-size: 12.5px;
+  cursor: pointer;
+  user-select: none;
+}
+.split-menu-item:hover { background: var(--surface-3); }
+.split-menu-item input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  flex: none;
+}
+.split-menu-item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.split-menu-confirm {
+  margin-top: 4px;
+  height: 32px;
+  border-radius: 6px;
+}
+
 /* Raccourci : une mention discrète alignée à droite, pas une touche dessinée —
    la puce `kbd` doublerait la hauteur de la ligne pour rien. */
 .menu-key {
@@ -873,23 +929,34 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
   cursor: move;
   user-select: none;
   touch-action: none;
+  /* UNE seule police, sans repli : FFmpeg dessine avec ce fichier précis et
+     aucun autre (voir drawtext_filter). Un repli navigateur (police emoji du
+     système, p. ex.) ferait apparaître ici des glyphes que l'export ne sait
+     pas produire — Segoe UI n'a pas d'emoji couleur et libfreetype ne fait
+     pas de repli de police. */
+  font-family: "Segoe UI";
 }
 .preview-text.text-impact {
-  font-family: "Segoe UI", Arial, sans-serif;
-  font-weight: 800;
-  -webkit-text-stroke: 0.08em #000;
+  /* Seul "impact" reçoit segoeuib.ttf à l'export ; les deux autres styles
+     restent en regular (voir bold_font/regular_font). 700 = le poids réel du
+     fichier gras, pas un gras synthétique de navigateur. */
+  font-weight: 700;
+  /* borderw=8, en pixels de SORTIE constants — jamais relatifs à la taille du
+     texte, contrairement à un em. 8 / 1080 × 100. */
+  -webkit-text-stroke: 0.7407cqw #000;
   paint-order: stroke fill;
 }
 .preview-text.text-caption {
-  font-family: "Segoe UI", Arial, sans-serif;
-  font-weight: 650;
-  padding: 0.18em 0.28em;
+  font-weight: 400;
+  /* boxborderw=20, uniforme sur les 4 côtés à l'export — pas de valeur séparée
+     par axe. 20 / 1080 × 100. */
+  padding: 1.8519cqw;
   background: rgba(0, 0, 0, 0.72);
 }
 .preview-text.text-minimal {
-  font-family: "Segoe UI", Arial, sans-serif;
-  font-weight: 500;
-  text-shadow: 0.04em 0.04em 0.05em rgba(0, 0, 0, 0.9);
+  font-weight: 400;
+  /* shadowx=3:shadowy=3 à l'export : un décalage net, sans flou. 3 / 1080 × 100. */
+  text-shadow: 0.2778cqw 0.2778cqw 0 rgba(0, 0, 0, 0.9);
 }
 .preview-text.selected { outline: 1px dashed rgba(255, 184, 81, 0.9); outline-offset: 5px; }
 
@@ -904,54 +971,85 @@ input[type="range"]:hover:not(:disabled)::-webkit-slider-thumb { background: var
   object-fit: cover;
 }
 
+/* Cadre de SORTIE. Il porte tout ce qui se repère en fraction de l'image
+   écrite par l'export : titres, point visé, zones de sécurité. Il est son
+   propre conteneur de requête, si bien qu'un `cqw` y désigne toujours la
+   largeur de sortie — la taille d'un titre ne change donc pas d'une vue à
+   l'autre. Sans remplissage : le bloc de contenu d'un conteneur positionné est
+   le bloc englobant de ses enfants absolus, un remplissage décalerait chaque
+   coordonnée. Il ne capte pas le pointeur, ses enfants le reprennent. */
+.output-box {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  container-type: inline-size;
+  pointer-events: none;
+}
+.output-box > .preview-text,
+.output-box > .zoom-box { pointer-events: auto; }
+
 /* Viseur 9:16 du mode « rush entier » : il se place là où le cadrage regarde. */
 /* La translation horizontale est posée par PreviewStage, en fonction du
    cadrage : elle vaut −P % de la largeur du viseur quand `left` vaut P %. Une
    valeur fixe ici la contredirait. */
-.guide-916 {
-  position: absolute;
-  top: 0;
-  bottom: 0;
+.output-box.guide-916 {
+  inset: 0 auto;
   aspect-ratio: 9 / 16;
   height: 100%;
   border: 1px solid rgba(255, 184, 81, 0.65);
   box-shadow: 0 0 0 4000px rgba(6, 8, 12, 0.55);
-  pointer-events: none;
-  display: flex;
-  align-items: flex-end;
-  justify-content: center;
-  padding: 10px;
-}
-.guide-916 span {
-  color: rgba(236, 238, 245, 0.9);
-  font-size: 10px;
-  letter-spacing: 1.4px;
-  background: rgba(8, 11, 16, 0.7);
-  border-radius: 999px;
-  padding: 3px 10px;
+  /* Ce qui déborde du viseur ne sera pas écrit : le cadre entier le coupe déjà
+     en vue « sortie », le viseur doit le couper de la même façon ici. */
+  overflow: hidden;
 }
 
-/* Point visé par le zoom. Dessiné HORS de la couche zoomée : il désigne un
-   endroit du cadre de sortie, il ne grossit donc pas avec l'image. */
-.zoom-target {
+/* Zone de zoom : dessinée HORS de la couche zoomée — c'est la fenêtre que
+   `zoompan` recadre à l'export, pas l'image déjà agrandie. Le corps se tire
+   pour déplacer le point visé, les coins pour agrandir/rétrécir la zone. */
+.zoom-box {
   position: absolute;
-  width: 34px;
-  height: 34px;
-  margin: -17px 0 0 -17px;
-  border-radius: 50%;
   border: 2px solid var(--accent-hi);
-  background: rgba(245, 160, 46, 0.14);
+  background: rgba(245, 160, 46, 0.12);
+  box-shadow: 0 0 0 4000px rgba(6, 8, 12, 0.35);
   cursor: grab;
-  display: grid;
-  place-items: center;
   z-index: 6;
 }
-.zoom-target:active { cursor: grabbing; }
-.zoom-target span {
-  width: 4px;
-  height: 4px;
+.zoom-box:active { cursor: grabbing; }
+.zoom-box:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
+.zoom-box-handle {
+  position: absolute;
+  width: 13px;
+  height: 13px;
   border-radius: 50%;
+  border: 2px solid var(--accent-hi);
+  background: #0b0d12;
+}
+.zoom-box-handle-tl { top: -7px; left: -7px; cursor: nwse-resize; }
+.zoom-box-handle-tr { top: -7px; right: -7px; cursor: nesw-resize; }
+.zoom-box-handle-bl { bottom: -7px; left: -7px; cursor: nesw-resize; }
+.zoom-box-handle-br { bottom: -7px; right: -7px; cursor: nwse-resize; }
+.zoom-box-handle:hover, .zoom-box-handle:active {
+  transform: scale(1.25);
   background: var(--accent-hi);
+}
+
+/* Valeur exacte affichée pendant le tirage d'un coin — même idée que le HUD
+   de recadrage sur la timeline : le chiffre suit le geste au lieu d'obliger à
+   lâcher pour savoir où on en est. */
+.zoom-box-scale {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  background: rgba(8, 10, 15, 0.82);
+  border-radius: 6px;
+  padding: 3px 8px;
+  pointer-events: none;
+  white-space: nowrap;
 }
 
 /* Zones de sécurité TikTok : ce qui sort de ce cadre sera mangé par l'interface
@@ -1274,6 +1372,7 @@ body.resizing-v, body.resizing-v * { cursor: ns-resize !important; }
 /* Pendant un geste, le curseur ne doit jamais changer sous la souris. */
 body.trimming, body.trimming * { cursor: ew-resize !important; }
 body.moving, body.moving * { cursor: grabbing !important; }
+body.dragging-media, body.dragging-media * { cursor: grabbing !important; }
 
 .ruler {
   position: relative;
@@ -1347,6 +1446,23 @@ body.moving, body.moving * { cursor: grabbing !important; }
   background: rgba(245, 160, 46, 0.34);
   border-color: var(--accent-hi);
   box-shadow: inset 0 0 0 1px var(--accent-hi);
+}
+/* Éloignement : « l'accent seul porte la couleur » (voir le commentaire de
+   :root) — donc une texture, pas une teinte différente, pour rester dans la
+   même famille ambre que tout le reste. Même motif que `.track-locked`. */
+.zoom-clip.zoom-out {
+  background: repeating-linear-gradient(
+    -45deg,
+    rgba(245, 160, 46, 0.22) 0 5px,
+    rgba(245, 160, 46, 0.34) 5px 10px
+  );
+}
+.zoom-clip.zoom-out.selected {
+  background: repeating-linear-gradient(
+    -45deg,
+    rgba(245, 160, 46, 0.34) 0 5px,
+    rgba(245, 160, 46, 0.46) 5px 10px
+  );
 }
 /* Maintien acquis : même signal que sur un clip, un filet blanc franc. */
 .zoom-clip.grabbed {
@@ -1485,14 +1601,17 @@ body.moving, body.moving * { cursor: grabbing !important; }
 }
 .track-locked .clip { cursor: default; }
 
-/* Repère de dépôt d'un média tiré depuis le panneau Médias. */
+/* Repère de dépôt d'un média tiré depuis le panneau Médias.
+   Un seul nœud pour toute la timeline, posé en DOM depuis la boucle
+   pointermove (position, largeur, piste) sans jamais passer par l'état React :
+   pendant tout le survol, c'est la seule façon de suivre le pointeur sans
+   redéclencher un rendu complet de la timeline à chaque image. */
 .drop-ghost {
   position: absolute;
-  top: 0;
-  height: 100%;
-  border: 1px solid var(--accent-hi);
+  border: 1.5px dashed var(--accent-hi);
   border-radius: var(--radius);
   background: var(--accent-soft);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25), 0 0 20px rgba(245, 160, 46, 0.22);
   pointer-events: none;
   z-index: 5;
   display: flex;
@@ -1504,9 +1623,126 @@ body.moving, body.moving * { cursor: grabbing !important; }
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   color: var(--accent-hi);
-  background: rgba(8, 10, 15, 0.72);
-  border-radius: 4px;
-  padding: 2px 6px;
+  background: rgba(8, 10, 15, 0.82);
+  backdrop-filter: blur(6px);
+  border-radius: 5px;
+  padding: 2px 7px;
+}
+
+/* Repère qui suit le pointeur pendant tout le glisser d'un rush, y compris
+   hors de la timeline (au-dessus du panneau, de l'aperçu…). Posé en `top:0;
+   left:0` puis déplacé par un `transform` écrit en JS à chaque image : jamais
+   par `left`/`top`, qui forceraient un recalcul de mise en page à chaque
+   pointermove. Le nœud lui-même suit le pointeur AU PIXEL PRÈS — c'est le
+   point que `.drag-preview-dot` marque ; la carte est décalée par sa propre
+   marge, jamais par le `transform` qui porte la position. */
+.drag-preview {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 60;
+  pointer-events: none;
+  will-change: transform;
+  /* Lissage court sur la position elle-même : le rAF qui écrit `transform`
+     (voir DragPreview.tsx) ne pousse qu'une valeur par image, sans lui la
+     carte saute d'un pas discret à l'autre. 90 ms d'amorti lui donne un poids
+     — elle glisse derrière le pointeur au lieu de le suivre au pixel près —
+     sans jamais accumuler de retard perceptible. */
+  transition: transform 90ms var(--ease);
+}
+/* Repère au point exact du pointeur : sans lui, la carte flotte à côté sans
+   qu'on voie clairement à quoi elle est accrochée. Sa couleur porte le
+   verdict de dépôt (voir body.drop-invalid) : c'est ce qu'on regarde en
+   premier, avant même la carte. */
+.drag-preview-dot {
+  position: absolute;
+  top: -3px;
+  left: -3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-hi);
+  box-shadow: 0 0 0 4px rgba(255, 184, 81, 0.25);
+  transition: background-color 120ms var(--ease), box-shadow 120ms var(--ease);
+}
+body.drop-invalid .drag-preview-dot {
+  background: var(--danger);
+  box-shadow: 0 0 0 4px rgba(255, 107, 125, 0.25);
+}
+/* Carte flottante : verre dépoli, léger relief, une pointe de bascule pour
+   qu'elle se lise comme un objet qu'on tient plutôt qu'une étiquette posée à
+   plat. `animation` (pas `transition`) : elle rejoue à chaque nouveau glisser,
+   puisque le composant démonte et remonte avec `pendingSource`. */
+.drag-preview-card {
+  position: absolute;
+  top: 14px;
+  left: 18px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  max-width: 240px;
+  padding: 7px 12px 7px 7px;
+  border: 1px solid rgba(255, 184, 81, 0.55);
+  border-radius: 11px;
+  background: rgba(20, 24, 33, 0.82);
+  backdrop-filter: blur(14px) saturate(160%);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+  box-shadow:
+    var(--shadow-float),
+    0 0 0 1px rgba(0, 0, 0, 0.3),
+    0 0 24px rgba(245, 160, 46, 0.16);
+  transform-origin: 4px 4px;
+  animation: drag-preview-in 180ms var(--ease) both;
+  /* La bascule (couleur, lueur) suit le verdict de dépôt sans redémarrer
+     l'animation d'entrée : deux propriétés distinctes, une seule qui rejoue. */
+  transition: border-color 150ms var(--ease), box-shadow 150ms var(--ease);
+}
+@keyframes drag-preview-in {
+  from { opacity: 0; transform: scale(0.82) rotate(0deg); }
+  to { opacity: 1; transform: scale(1) rotate(-2deg); }
+}
+/* Hors d'une piste valide (pas encore dans la timeline, ou piste verrouillée) :
+   la carte le dit tout de suite, dans la même teinte « danger » que le reste
+   de l'application, plutôt que de laisser croire qu'un dépôt fonctionnerait
+   n'importe où. */
+body.drop-invalid .drag-preview-card {
+  border-color: rgba(255, 107, 125, 0.5);
+  box-shadow:
+    var(--shadow-float),
+    0 0 0 1px rgba(0, 0, 0, 0.3),
+    0 0 24px rgba(255, 107, 125, 0.16);
+}
+body.drop-invalid .drag-preview-duration { color: var(--danger); }
+.drag-preview-thumb {
+  flex: none;
+  width: 44px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #000;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+.drag-preview-empty { background: var(--surface-3); }
+.drag-preview-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.drag-preview-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--text);
+}
+.drag-preview-duration {
+  flex: none;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-hi);
 }
 
 .clip {
@@ -1757,7 +1993,9 @@ body.moving, body.moving * { cursor: grabbing !important; }
   bottom: 0;
   width: 1px;
   background: var(--playhead);
-  z-index: 6;
+  /* Pas de z-index explicite : peint dans l'ordre du DOM (voir Timeline.tsx),
+     donc sous les pistes/clips qui sont ajoutés après elle — seul le fanion,
+     posé au niveau de la règle, reste au-dessus. */
   pointer-events: none;
 }
 .playhead::before {
@@ -1770,6 +2008,40 @@ body.moving, body.moving * { cursor: grabbing !important; }
   background: var(--playhead);
   border-radius: 3px 3px 0 0;
   clip-path: polygon(0 0, 100% 0, 100% 55%, 50% 100%, 0 55%);
+}
+
+/* Réticule global : un seul repère, sur toute la hauteur (règle, titres,
+   zooms, pistes), qui répond à « si je clique ici, où est-ce que ça tombe
+   vraiment ? » partout de la même façon — voir Timeline.tsx. Distinct du
+   playhead (rouge, ce qui joue) et du repère de collage d'un geste (ambre,
+   ce qu'on déplace) : blanc bleuté, fin, pour ne jamais se confondre avec eux
+   quand les trois se retrouvent proches. */
+.crosshair {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(238, 241, 247, 0.55);
+  z-index: 7;
+  pointer-events: none;
+  /* Promotion sur sa propre couche de composition, posée une fois pour
+     toutes : sans elle, la première image d'un survol paierait le coût de
+     cette promotion au moment précis où la latence compte le plus. */
+  will-change: transform;
+}
+.crosshair-label {
+  position: absolute;
+  top: 2px;
+  left: 5px;
+  font-size: 10px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  background: rgba(8, 10, 15, 0.82);
+  backdrop-filter: blur(6px);
+  border-radius: 5px;
+  padding: 2px 6px;
+  white-space: nowrap;
 }
 
 /* --- Modales -------------------------------------------------------------------- */
@@ -1817,6 +2089,10 @@ body.moving, body.moving * { cursor: grabbing !important; }
   text-align: left;
 }
 .project-card.current { border-color: var(--accent); }
+/* Fichier JSON corrompu : reste listé (voir ProjectsDialog.tsx), mais ne
+   doit pas se lire comme un projet normal. */
+.project-card.unreadable { opacity: 0.6; }
+.project-card.unreadable .project-name { color: var(--warn); }
 .project-card img, .project-thumb-empty {
   flex: none;
   width: 62px;
@@ -1834,6 +2110,10 @@ body.moving, body.moving * { cursor: grabbing !important; }
   background: var(--accent-soft);
   border-radius: 999px;
   padding: 2px 9px;
+}
+.badge.badge-warn {
+  color: var(--warn);
+  background: rgba(255, 196, 107, 0.14);
 }
 .modal-wide { width: 620px; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }

@@ -1,5 +1,6 @@
 import { Icon } from "./Icon";
 import { InspectorSection } from "./InspectorSection";
+import { useDebouncedSlider } from "../hooks/useDebouncedSlider";
 import type { TextOverlay, TextStyle } from "../types";
 import {
   MAX_TEXT_FADE_MS,
@@ -30,6 +31,28 @@ export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onColla
   );
   const fadeLabel = (fadeMs: number): string =>
     fadeMs === 0 ? "Aucun" : `${(fadeMs / 1000).toFixed(fadeMs % 1000 === 0 ? 0 : 2)} s`;
+
+  // Un curseur par réglage, chacun ne committant qu'une fois relâché ou
+  // resté silencieux (voir useDebouncedSlider) : sans ça, tirer la taille ou
+  // un fondu empile une entrée d'historique par tick de la souris.
+  const fontSizeSlider = useDebouncedSlider(
+    overlay.fontSizePx,
+    (value) => onUpdate({ fontSizePx: value }),
+    overlay.id,
+  );
+  const xSlider = useDebouncedSlider(overlay.x, (value) => onUpdate({ x: value }), overlay.id);
+  const ySlider = useDebouncedSlider(overlay.y, (value) => onUpdate({ y: value }), overlay.id);
+  const fadeInSlider = useDebouncedSlider(
+    overlay.fadeInMs,
+    (value) => onUpdate({ fadeInMs: value }),
+    overlay.id,
+  );
+  const fadeOutSlider = useDebouncedSlider(
+    overlay.fadeOutMs,
+    (value) => onUpdate({ fadeOutMs: value }),
+    overlay.id,
+  );
+
   const updateStart = (seconds: number) => {
     const start = Math.max(0, Math.min(durationMs - 100, seconds * 1000));
     onUpdate({
@@ -80,28 +103,37 @@ export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onColla
             min={MIN_TEXT_SIZE_PX}
             max={MAX_TEXT_SIZE_PX}
             step={2}
-            value={overlay.fontSizePx}
-            onChange={(event) => onUpdate({ fontSizePx: Number(event.target.value) })}
+            value={fontSizeSlider.value}
+            onChange={(event) => fontSizeSlider.onChange(Number(event.target.value))}
+            onPointerUp={fontSizeSlider.commitNow}
+            onBlur={fontSizeSlider.commitNow}
           />
-          <span className="slider-value">{Math.round(overlay.fontSizePx)} px</span>
+          <span className="slider-value">{Math.round(fontSizeSlider.value)} px</span>
         </label>
       </InspectorSection>
       <InspectorSection
         title="Position"
-        summary={`${Math.round(overlay.x * 100)} % · ${Math.round(overlay.y * 100)} %`}
+        summary={`${Math.round(xSlider.value * 100)} % · ${Math.round(ySlider.value * 100)} %`}
       >
-        {(["x", "y"] as const).map((axis) => (
+        {(
+          [
+            { axis: "X", slider: xSlider },
+            { axis: "Y", slider: ySlider },
+          ] as const
+        ).map(({ axis, slider }) => (
           <label className="slider-row" key={axis}>
-            <span className="fade-label">{axis.toUpperCase()}</span>
+            <span className="fade-label">{axis}</span>
             <input
               type="range"
               min={0}
               max={1}
               step={0.01}
-              value={overlay[axis]}
-              onChange={(event) => onUpdate({ [axis]: Number(event.target.value) })}
+              value={slider.value}
+              onChange={(event) => slider.onChange(Number(event.target.value))}
+              onPointerUp={slider.commitNow}
+              onBlur={slider.commitNow}
             />
-            <span className="slider-value">{Math.round(overlay[axis] * 100)} %</span>
+            <span className="slider-value">{Math.round(slider.value * 100)} %</span>
           </label>
         ))}
       </InspectorSection>
@@ -142,9 +174,9 @@ export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onColla
       <InspectorSection
         title="Animation"
         summary={
-          overlay.fadeInMs === 0 && overlay.fadeOutMs === 0
+          fadeInSlider.value === 0 && fadeOutSlider.value === 0
             ? "Aucune"
-            : `${fadeLabel(overlay.fadeInMs)} / ${fadeLabel(overlay.fadeOutMs)}`
+            : `${fadeLabel(fadeInSlider.value)} / ${fadeLabel(fadeOutSlider.value)}`
         }
       >
         <div className="fade-control">
@@ -155,11 +187,13 @@ export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onColla
               min={0}
               max={maxFadeMs}
               step={50}
-              value={overlay.fadeInMs}
-              onChange={(event) => onUpdate({ fadeInMs: Number(event.target.value) })}
+              value={fadeInSlider.value}
+              onChange={(event) => fadeInSlider.onChange(Number(event.target.value))}
+              onPointerUp={fadeInSlider.commitNow}
+              onBlur={fadeInSlider.commitNow}
               aria-label="Fondu d'entrée du titre"
             />
-            <span className="slider-value">{fadeLabel(overlay.fadeInMs)}</span>
+            <span className="slider-value">{fadeLabel(fadeInSlider.value)}</span>
           </label>
           <label className="slider-row">
             <span className="fade-label">Sortie</span>
@@ -168,18 +202,24 @@ export function TextInspector({ overlay, durationMs, onUpdate, onDelete, onColla
               min={0}
               max={maxFadeMs}
               step={50}
-              value={overlay.fadeOutMs}
-              onChange={(event) => onUpdate({ fadeOutMs: Number(event.target.value) })}
+              value={fadeOutSlider.value}
+              onChange={(event) => fadeOutSlider.onChange(Number(event.target.value))}
+              onPointerUp={fadeOutSlider.commitNow}
+              onBlur={fadeOutSlider.commitNow}
               aria-label="Fondu de sortie du titre"
             />
-            <span className="slider-value">{fadeLabel(overlay.fadeOutMs)}</span>
+            <span className="slider-value">{fadeLabel(fadeOutSlider.value)}</span>
           </label>
         </div>
         {(overlay.fadeInMs > 0 || overlay.fadeOutMs > 0) && (
           <button
             type="button"
             className="ghost small"
-            onClick={() => onUpdate({ fadeInMs: 0, fadeOutMs: 0 })}
+            onClick={() => {
+              fadeInSlider.cancel();
+              fadeOutSlider.cancel();
+              onUpdate({ fadeInMs: 0, fadeOutMs: 0 });
+            }}
           >
             Retirer les fondus
           </button>

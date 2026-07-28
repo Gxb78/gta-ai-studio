@@ -32,6 +32,15 @@ interface Props {
   onAddToTimeline: (source: SourceInfo) => void;
   /** Début d'un dépôt à la souris : la timeline prend la suite du geste. */
   onBeginDrag: (source: SourceInfo) => void;
+  /**
+   * Rush actuellement tiré vers la timeline, une fois le seuil de glisser
+   * franchi. Distinct de `pressedId` : celui-ci ne couvre que l'attente
+   * d'avant seuil, alors que la carte doit rester marquée pendant tout le
+   * geste — sans quoi elle reprend son apparence normale à l'instant précis
+   * où le déplacement commence vraiment, alors que rien n'indique plus
+   * ensuite ce qu'on est en train de poser.
+   */
+  draggingId: string | null;
   onRelocate: (source: SourceInfo) => void;
   onCollapse: () => void;
 }
@@ -113,7 +122,8 @@ export function MediaPanel(props: Props) {
       );
       window.addEventListener(
         "pointerup",
-        () => {
+        (up: PointerEvent) => {
+          if (up.button !== 0) return;
           setPressedId(null);
           abort.abort();
           onAddToTimeline(source);
@@ -238,7 +248,7 @@ export function MediaPanel(props: Props) {
                 (view === "grid" ? "media-card" : "media-item") +
                 (missing ? " media-missing" : "") +
                 (used === 0 ? " media-unused" : "") +
-                (pressedId === source.id ? " is-pressed" : "")
+                (pressedId === source.id || props.draggingId === source.id ? " is-pressed" : "")
               }
               onPointerDown={(event) => beginPress(source, event)}
               title={`${sourceName(source)}\nClic : poser au playhead · Glisser : choisir la position\n${source.originalPath}`}

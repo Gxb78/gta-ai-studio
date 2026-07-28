@@ -2,6 +2,7 @@
 // aplatissement déterministe, et parité entre ce que consomment le lecteur et
 // l'export.
 import {
+  ASSET_VERSION,
   audioFadeGainAt,
   clampAudioFadeMs,
   clampCropX,
@@ -16,11 +17,17 @@ import {
   zoomOffset,
   zoomScaleAt,
   cropXPercent,
+  CURRENT_PROJECT_VERSION,
+  isProjectVersionSupported,
+  isUnwantedKeyRepeat,
   migrateProject,
+  sourcesNeedingRegeneration,
+  UnsupportedProjectVersionError,
   clipEndMs,
   clipSourceDurationMs,
   firstFreeTrack,
   flattenTracks,
+  MAX_TRANSITION_MS,
   resolveAudioPlan,
   resolveVideoPlan,
   timelineGaps,
@@ -39,6 +46,7 @@ import {
 import {
   compileTimeline,
   findSegmentIndex,
+  rawTransitionCapacityMs,
 } from "../src/timeline/compileTimeline";
 import {
   audioTransitionGains,
@@ -81,6 +89,22 @@ function check(label: string, actual: unknown, expected: unknown): void {
   } else {
     failures += 1;
     console.log(`  ÉCHEC ${label}\n        attendu ${e}\n        obtenu  ${a}`);
+  }
+}
+
+/** Vérifie qu'un appel lève, et laisse examiner l'erreur obtenue. */
+function checkThrows(label: string, fn: () => unknown, verify: (error: unknown) => boolean): void {
+  try {
+    fn();
+    failures += 1;
+    console.log(`  ÉCHEC ${label}\n        attendu une levée, rien n'a été levé`);
+  } catch (error) {
+    if (verify(error)) {
+      console.log(`  ok    ${label}`);
+    } else {
+      failures += 1;
+      console.log(`  ÉCHEC ${label}\n        levée inattendue : ${String(error)}`);
+    }
   }
 }
 
@@ -371,6 +395,49 @@ check(
 );
 check("avec sélection, la surcouche reste entière", cutSelected.clips.filter((c) => c.track === 1).length, 1);
 
+console.log("Une découpe fraîche : refusion voulue, mais identité et transition récupérables");
+// Bug réel : juste après une découpe (SPLIT_AT), les deux moitiés sont
+// réglées à l'identique, donc `flattenTracks` les refusionne en UN segment —
+// c'est un choix voulu (voir le commentaire sur `videoEnvelopeCanMerge`, et
+// les tests d'indépendance des plans plus haut). Le vrai bug était en aval :
+// `sourceClipFor` exigeait qu'UN SEUL clip committé couvre le segment fusionné
+// EN ENTIER, ce que ni la gauche ni la droite ne fait seule — `match` valait
+// `undefined`, et le repli sur un id synthétique cassait `visibleClip` côté
+// App.tsx (cadrage réinitialisé à 0) et la frontière de la découpe devenait
+// introuvable pour l'inspecteur de transition.
+const unSeulClip = [clip("unique", 0, 0, 0, 10000)];
+const decoupe = editorReducer(stateWith(unSeulClip, "unique"), { type: "SPLIT_AT", timelineMs: 4000 });
+const [gauche, droite] = decoupe.clips.slice().sort((a, b) => a.timelineStartMs - b.timelineStartMs);
+const compileApresDecoupe = compileTimeline(decoupe.clips, new Set(), {
+  S0: source("S0"),
+});
+check(
+  "les deux moitiés restent fusionnées en un seul segment (comportement voulu)",
+  compileApresDecoupe.video.segments.length,
+  1,
+);
+check(
+  // sourceClipFor ne couvre plus que le DÉBUT du segment, donc c'est la
+  // moitié GAUCHE (celle qui commence avec le segment) qui est retrouvée.
+  "le segment fusionné retrouve un clip COMMITTÉ réel, pas un id synthétique",
+  compileApresDecoupe.video.segments[0]?.sourceClipId,
+  gauche.id,
+);
+check(
+  "ce clip réel existe bel et bien dans le montage",
+  decoupe.clips.some((c) => c.id === compileApresDecoupe.video.segments[0]?.sourceClipId),
+  true,
+);
+check(
+  // La frontière n'est plus visible dans les segments, mais elle reste
+  // calculable directement depuis les deux clips committés bruts — c'est ce
+  // secours que l'inspecteur utilise désormais quand la recherche par segment
+  // échoue (voir App.tsx, `precedingClip`).
+  "la capacité de transition reste calculable depuis les clips bruts",
+  rawTransitionCapacityMs(gauche, droite, { S0: source("S0") }),
+  MAX_TRANSITION_MS,
+);
+
 console.log("Enveloppe d'un zoom");
 const zoomTest = {
   id: "z1",
@@ -381,6 +448,8 @@ const zoomTest = {
   y: 0.25,
   rampInMs: 500,
   rampOutMs: 500,
+  direction: "in" as const,
+  easing: "linear" as const,
 };
 // Hors des bornes, la valeur est EXACTEMENT 1 : c'est ce qui garantit qu'on
 // retrouve la vue d'avant, au pixel près, et pas « à peu près ».
@@ -428,6 +497,9 @@ const chevauchants = editorReducer(
 check("le second est repoussé derrière le premier", chevauchants.zooms[1]?.timelineStartMs, 5000);
 check("aucun instant n'est couvert deux fois", zoomAt(chevauchants.zooms, 4999)?.id, "a");
 check("et le suivant prend le relais", zoomAt(chevauchants.zooms, 5000)?.id, "b");
+// Repoussé, mais avec SA PROPRE durée conservée (4000ms, sa demande d'origine)
+// — pas tronqué à ce qu'il reste avant la fin du montage.
+check("le second garde sa durée demandée, juste décalé", chevauchants.zooms[1]?.timelineEndMs, 9000);
 
 console.log("Geste sur un zoom : deplacement et rognage");
 const baseZooms = stateWith([clip("bas", 0, 0, 0, 20000)], null);
@@ -492,6 +564,114 @@ const tropCourt = editorReducer(deuxZooms, {
 });
 check("un rognage sous la duree minimale est refuse", tropCourt.transientZooms, null);
 
+console.log("Le moteur de collision des zooms ne détruit plus le montage");
+// Quatre bugs réels, reproduits en exécutant le réducteur directement, comme
+// demandé. L'ancien `resolveZoomOverlaps` triait TOUS les zooms par position
+// et cascadait aveuglément de gauche à droite, sans savoir lequel venait
+// d'être touché : celui qui commençait le plus tôt gagnait toujours, entier,
+// quel qu'il soit. Le nouveau protège explicitement le zoom qu'une action
+// vient de manipuler (`priorityId`, voir `resolveZoomOverlaps`) ; c'est lui
+// qui garde exactement ce qui a été demandé, jamais un autre.
+
+// 1) Ajouter (ou ici, étendre) un zoom AVANT un zoom existant ne le supprime
+// plus : l'ancien est repoussé derrière, pas effacé.
+const avantExistant = editorReducer(
+  {
+    ...stateWith([clip("bas", 0, 0, 0, 20000)], null),
+    zooms: [
+      { ...zoomTest, id: "new", timelineStartMs: 0, timelineEndMs: 500 },
+      { ...zoomTest, id: "old", timelineStartMs: 1000, timelineEndMs: 1500 },
+    ],
+  },
+  { type: "UPDATE_ZOOM", zoomId: "new", patch: { timelineEndMs: 2000 } },
+);
+check(
+  "le zoom qui vient d'être étendu garde exactement sa nouvelle étendue",
+  [avantExistant.zooms.find((z) => z.id === "new")?.timelineStartMs, avantExistant.zooms.find((z) => z.id === "new")?.timelineEndMs],
+  [0, 2000],
+);
+check(
+  "l'ancien zoom SURVIT, repoussé juste après — plus jamais supprimé en silence",
+  avantExistant.zooms.some((z) => z.id === "old"),
+  true,
+);
+check(
+  "et garde sa propre durée (500ms), simplement décalé",
+  [avantExistant.zooms.find((z) => z.id === "old")?.timelineStartMs, avantExistant.zooms.find((z) => z.id === "old")?.timelineEndMs],
+  [2000, 2500],
+);
+
+// 2) Modifier un zoom contre son voisin ne le raccourcit plus : le voisin
+// garde sa durée, juste repoussé.
+const contreVoisinUpdate = editorReducer(
+  {
+    ...stateWith([clip("bas", 0, 0, 0, 20000)], null),
+    zooms: [
+      { ...zoomTest, id: "a", timelineStartMs: 0, timelineEndMs: 2000 },
+      { ...zoomTest, id: "b", timelineStartMs: 3000, timelineEndMs: 5000 },
+    ],
+  },
+  { type: "UPDATE_ZOOM", zoomId: "a", patch: { timelineEndMs: 4000 } },
+);
+check(
+  "le zoom modifié garde exactement l'étendue demandée",
+  contreVoisinUpdate.zooms.find((z) => z.id === "a")?.timelineEndMs,
+  4000,
+);
+check(
+  "le voisin n'est plus raccourci : il garde ses 2000ms, juste décalé",
+  [contreVoisinUpdate.zooms.find((z) => z.id === "b")?.timelineStartMs, contreVoisinUpdate.zooms.find((z) => z.id === "b")?.timelineEndMs],
+  [4000, 6000],
+);
+
+// 3) Déplacer un zoom en arrière, par-dessus ce qui le précédait, ne le
+// tronque plus à son bord de tête : c'est ce qui précédait qui cède la place.
+const deplacementEnArriere = editorReducer(
+  {
+    ...stateWith([clip("bas", 0, 0, 0, 20000)], null),
+    zooms: [
+      { ...zoomTest, id: "z", timelineStartMs: 0, timelineEndMs: 1000 },
+      { ...zoomTest, id: "a", timelineStartMs: 3000, timelineEndMs: 5000 },
+    ],
+  },
+  // "a" (2000ms) déplacé de [3000,5000] à [500,2500] : même durée, juste plus tôt.
+  { type: "UPDATE_ZOOM", zoomId: "a", patch: { timelineStartMs: 500, timelineEndMs: 2500 } },
+);
+check(
+  "le déplacement est honoré en entier — plus jamais transformé en rognage",
+  [deplacementEnArriere.zooms.find((z) => z.id === "a")?.timelineStartMs, deplacementEnArriere.zooms.find((z) => z.id === "a")?.timelineEndMs],
+  [500, 2500],
+);
+check(
+  "ce qui le précédait cède la place à son tour, sans perdre sa durée",
+  [deplacementEnArriere.zooms.find((z) => z.id === "z")?.timelineStartMs, deplacementEnArriere.zooms.find((z) => z.id === "z")?.timelineEndMs],
+  [2500, 3500],
+);
+
+// 4) Un zoom qui disparaît FAUTE DE PLACE (cas légitime, pas un bug) ne laisse
+// plus la sélection pointer sur un id fantôme.
+const dureeSerree = editorReducer(
+  {
+    ...stateWith([clip("bas", 0, 0, 0, 2100)], null),
+    zooms: [
+      { ...zoomTest, id: "new", timelineStartMs: 0, timelineEndMs: 2000 },
+      { ...zoomTest, id: "old", timelineStartMs: 1000, timelineEndMs: 1950 },
+    ],
+    selectedZoomId: "old",
+  },
+  { type: "UPDATE_ZOOM", zoomId: "new", patch: {} },
+);
+check(
+  "faute de place, l'ancien zoom disparaît bel et bien",
+  dureeSerree.zooms.some((z) => z.id === "old"),
+  false,
+);
+check(
+  "mais la sélection ne reste plus accrochée à son id disparu",
+  dureeSerree.selectedZoomId,
+  null,
+);
+
 console.log("La sélection ne survit pas à la disparition de sa cible");
 // Bug réel : annuler une duplication laissait `selectedClipId` sur le clip
 // disparu. L'inspecteur affichait « aucun clip sélectionné », la timeline ne
@@ -515,6 +695,46 @@ const supprPuisAnnule = editorReducer(
   { type: "UNDO" },
 );
 check("une sélection encore présente est conservée", supprPuisAnnule.selectedClipId, "haut");
+
+console.log("Les trois sélections (clip, titre, zoom) sont mutuellement exclusives");
+// Bug réel : SELECT_ZOOM ne vidait pas selectedClipId. Sélectionner un zoom
+// laissait donc le clip précédemment sélectionné « actif » en silence :
+// l'inspecteur affichait le zoom, mais Suppr (et M, Ctrl+D, les curseurs de
+// cadrage/vitesse/volume…) continuaient d'agir sur le clip caché derrière —
+// exécuté directement contre le réducteur, comme demandé.
+const zoomPourSelection = {
+  id: "zA",
+  timelineStartMs: 0,
+  timelineEndMs: 2000,
+  scale: 1.6,
+  x: 0.5,
+  y: 0.5,
+  rampInMs: 0,
+  rampOutMs: 0,
+  direction: "in" as const,
+  easing: "linear" as const,
+};
+const baseSelection = {
+  ...stateWith([clip("bas", 0, 0, 0, 20000)], "bas"),
+  zooms: [zoomPourSelection],
+  textOverlays: [
+    { id: "t1", text: "x", timelineStartMs: 0, timelineEndMs: 1000, x: 0.5, y: 0.5, fontSizePx: 80, style: "impact" as const, fadeInMs: 0, fadeOutMs: 0 },
+  ],
+};
+const clipPuisZoom = editorReducer(baseSelection, { type: "SELECT_ZOOM", zoomId: "zA" });
+check("sélectionner un zoom vide la sélection de clip", clipPuisZoom.selectedClipId, null);
+check("sélectionner un zoom vide la sélection de titre", clipPuisZoom.selectedTextOverlayId, null);
+check("le zoom devient la sélection", clipPuisZoom.selectedZoomId, "zA");
+
+const zoomPuisClip = editorReducer(clipPuisZoom, { type: "SELECT", clipId: "bas" });
+check("sélectionner un clip vide la sélection de zoom", zoomPuisClip.selectedZoomId, null);
+check("sélectionner un clip vide la sélection de titre", zoomPuisClip.selectedTextOverlayId, null);
+check("le clip redevient la sélection", zoomPuisClip.selectedClipId, "bas");
+
+const clipPuisTitre = editorReducer(baseSelection, { type: "SELECT_TEXT", textOverlayId: "t1" });
+check("sélectionner un titre vide la sélection de clip", clipPuisTitre.selectedClipId, null);
+check("sélectionner un titre vide la sélection de zoom", clipPuisTitre.selectedZoomId, null);
+check("le titre devient la sélection", clipPuisTitre.selectedTextOverlayId, "t1");
 
 console.log("Duplication, copie et collage");
 // Une copie doit être un AUTRE clip : deux clips de même identifiant se
@@ -907,7 +1127,7 @@ const migre = migrateProject({
   createdAt: "",
   updatedAt: "",
 });
-check("le projet est ramené au format courant", migre.version, 9);
+check("le projet est ramené au format courant", migre.version, CURRENT_PROJECT_VERSION);
 // Un projet d'avant les zooms n'en gagne aucun : on n'ajoute pas de mouvement
 // à un montage que l'utilisateur avait validé sans.
 check("aucun zoom n'est inventé", migre.zooms, []);
@@ -946,6 +1166,267 @@ check(
   "un ancien titre migre sans fondu inventé",
   [ancienTitre.textOverlays[0].fadeInMs, ancienTitre.textOverlays[0].fadeOutMs],
   [0, 0],
+);
+
+console.log("Un projet d'une version future est refusé, jamais rétrogradé");
+// P0 : sans ce refus, un format inconnu (10, 11…) était migré en aveugle vers
+// CURRENT_PROJECT_VERSION, perdant tout champ que cette version ne connaît
+// pas, puis l'autosave réécrivait aussitôt le fichier appauvri sur le disque
+// — une perte de données irréversible et silencieuse.
+check(
+  "le format courant est accepté",
+  isProjectVersionSupported(CURRENT_PROJECT_VERSION),
+  true,
+);
+check(
+  "un format antérieur est accepté (les vieux formats s'infèrent par leurs champs)",
+  isProjectVersionSupported(1),
+  true,
+);
+check(
+  "un format futur est refusé",
+  isProjectVersionSupported(CURRENT_PROJECT_VERSION + 1),
+  false,
+);
+check(
+  "une version absente ou non numérique ne bloque rien (formats 1-8 sans plancher fiable)",
+  [isProjectVersionSupported(undefined), isProjectVersionSupported("9")],
+  [true, true],
+);
+
+const projetFutur = {
+  version: CURRENT_PROJECT_VERSION + 1,
+  id: "p-futur",
+  name: "p-futur",
+  sources: { S0: source("S0") },
+  clips: [{ id: "a", sourceId: "S0", srcInMs: 0, srcOutMs: 1000, playbackRate: 1 }],
+  createdAt: "",
+  updatedAt: "",
+};
+checkThrows(
+  "migrateProject refuse un format plus récent que ce qu'il connaît",
+  () => migrateProject(projetFutur),
+  (error) =>
+    error instanceof UnsupportedProjectVersionError &&
+    error.version === CURRENT_PROJECT_VERSION + 1,
+);
+// Le format courant, lui, continue de migrer sans encombre : le refus vise
+// STRICTEMENT ce qui dépasse CURRENT_PROJECT_VERSION, rien de plus.
+check(
+  "le format courant ne déclenche jamais ce refus",
+  migrateProject({ ...projetFutur, version: CURRENT_PROJECT_VERSION }).version,
+  CURRENT_PROJECT_VERSION,
+);
+
+console.log("Un proxy manquant se répare, il n'efface plus le projet");
+// Bug réel : le backend refusait d'ouvrir le moindre projet dont UN SEUL
+// proxy manquait — y compris celui d'une source jamais posée sur la timeline
+// — et rendait `null`, indiscernable de « aucun projet n'a jamais existé ».
+// Le backend ouvre désormais tout document lisible ; c'est cette fonction,
+// exécutée après coup, qui décide quelles sources régénérer.
+const utiliseeEtAJour = source("utilisee");
+const inutiliseeEtAJour = { ...source("inutilisee"), id: "inutilisee" };
+const perimee = { ...source("perimee"), assetVersion: ASSET_VERSION - 1 };
+check(
+  "une source à jour avec son proxy présent n'a rien à régénérer",
+  sourcesNeedingRegeneration([utiliseeEtAJour], new Set(["utilisee"])),
+  [],
+);
+check(
+  // Le cas précis du bug : une source jamais posée sur la timeline (le champ
+  // "utilisée" n'existe même pas dans cette fonction, purement côté données —
+  // c'est le proxy manquant, pas l'usage, qui doit déclencher la régénération).
+  "un proxy absent déclenche la régénération, à jour ou non",
+  sourcesNeedingRegeneration([inutiliseeEtAJour], new Set()),
+  [inutiliseeEtAJour],
+);
+check(
+  "une source périmée se régénère même si son proxy est présent",
+  sourcesNeedingRegeneration([perimee], new Set(["perimee"])),
+  [perimee],
+);
+check(
+  "à jour et proxy présent : aucune des deux causes ne s'applique",
+  sourcesNeedingRegeneration(
+    [utiliseeEtAJour, inutiliseeEtAJour, perimee],
+    new Set(["utilisee"]),
+  ),
+  [inutiliseeEtAJour, perimee],
+);
+
+console.log("Une touche maintenue ne répète pas les raccourcis, sauf les flèches");
+// Bug réel : le gestionnaire clavier global ne filtrait `event.repeat` nulle
+// part. Maintenir Suppr supprimait clip après clip sans borne, et Ctrl+V
+// empilait des copies à la cadence de répétition du clavier — le temps de
+// relâcher, bien plus qu'un seul clip pouvait disparaître ou s'empiler.
+check("une première frappe (repeat=false) n'est jamais ignorée", isUnwantedKeyRepeat(false, "Delete"), false);
+check("Suppr maintenu (repeat=true) est ignoré", isUnwantedKeyRepeat(true, "Delete"), true);
+check("Ctrl+V maintenu (repeat=true) est ignoré", isUnwantedKeyRepeat(true, "v"), true);
+check("Ctrl+D maintenu (repeat=true) est ignoré", isUnwantedKeyRepeat(true, "d"), true);
+check(
+  // Seule exemption : défiler ou ajuster un bord EN MAINTENANT la flèche est
+  // le comportement voulu, comme dans n'importe quel éditeur.
+  "flèche gauche maintenue reste autorisée",
+  isUnwantedKeyRepeat(true, "ArrowLeft"),
+  false,
+);
+check("flèche droite maintenue reste autorisée", isUnwantedKeyRepeat(true, "ArrowRight"), false);
+check(
+  "une flèche non répétée n'est de toute façon jamais ignorée",
+  isUnwantedKeyRepeat(false, "ArrowLeft"),
+  false,
+);
+
+console.log("Le verrou de piste protège un clip déjà sélectionné, pas seulement à la souris");
+// Bug réel : le verrou n'était vérifié qu'à la souris, dans Timeline.tsx,
+// avant même de dispatcher un geste. Suppr, Split, M, I/O, le changement de
+// vitesse et chaque curseur de l'inspecteur ciblaient un clip par id sans
+// jamais consulter `lockedTracks` — donc continuaient d'agir sur un clip déjà
+// sélectionné avant que sa piste soit verrouillée. Exécuté directement contre
+// le réducteur : "haut" vit sur la piste 1, verrouillée ; "bas" sur la piste
+// 0, libre — même appel, deux issues différentes, ce qui prouve que le verrou
+// cible précisément la piste concernée, pas tout le montage.
+const verrouille = { ...stateWith(covered, "haut"), lockedTracks: [1] };
+
+check(
+  "SET_CLIP_CROP_X refusé sur un clip verrouillé",
+  editorReducer(verrouille, { type: "SET_CLIP_CROP_X", clipId: "haut", cropX: 0.5 }).clips.find(
+    (c) => c.id === "haut",
+  )?.cropX,
+  0,
+);
+check(
+  "SET_CLIP_VOLUME refusé sur un clip verrouillé",
+  editorReducer(verrouille, { type: "SET_CLIP_VOLUME", clipId: "haut", volume: 0.2 }).clips.find(
+    (c) => c.id === "haut",
+  )?.volume,
+  1,
+);
+check(
+  "SET_CLIP_AUDIO_FADE refusé sur un clip verrouillé",
+  editorReducer(verrouille, {
+    type: "SET_CLIP_AUDIO_FADE",
+    clipId: "haut",
+    side: "in",
+    fadeMs: 1000,
+  }).clips.find((c) => c.id === "haut")?.audioFadeInMs,
+  0,
+);
+check(
+  "SET_CLIP_VIDEO_FADE refusé sur un clip verrouillé",
+  editorReducer(verrouille, {
+    type: "SET_CLIP_VIDEO_FADE",
+    clipId: "haut",
+    side: "in",
+    fadeMs: 1000,
+  }).clips.find((c) => c.id === "haut")?.videoFadeInMs,
+  0,
+);
+check(
+  "SET_CLIP_TRANSITION_IN refusé sur un clip verrouillé",
+  editorReducer(verrouille, {
+    type: "SET_CLIP_TRANSITION_IN",
+    clipId: "haut",
+    durationMs: 500,
+  }).clips.find((c) => c.id === "haut")?.transitionInMs,
+  0,
+);
+check(
+  "TOGGLE_CLIP_AUDIO (M) refusé sur un clip verrouillé",
+  editorReducer(verrouille, { type: "TOGGLE_CLIP_AUDIO", clipId: "haut" }).clips.find(
+    (c) => c.id === "haut",
+  )?.audioEnabled,
+  covered.find((c) => c.id === "haut")?.audioEnabled,
+);
+check(
+  "SET_CLIP_RATE refusé sur un clip verrouillé",
+  editorReducer(verrouille, { type: "SET_CLIP_RATE", clipId: "haut", rate: 2 }).clips.find(
+    (c) => c.id === "haut",
+  )?.playbackRate,
+  1,
+);
+check(
+  "TRIM_EDGE (I/O) refusé sur un clip verrouillé",
+  editorReducer(verrouille, {
+    type: "TRIM_EDGE",
+    clipId: "haut",
+    side: "left",
+    edgeSrcMs: 2000,
+  }).clips.find((c) => c.id === "haut")?.srcInMs,
+  0,
+);
+check(
+  "DELETE_CLIP (Suppr) refusé sur un clip verrouillé",
+  editorReducer(verrouille, { type: "DELETE_CLIP", clipId: "haut" }).clips.length,
+  2,
+);
+check(
+  "SPLIT_AT refusé quand le clip visé au playhead est verrouillé",
+  editorReducer(verrouille, { type: "SPLIT_AT", timelineMs: 8000 }).clips.length,
+  2,
+);
+check(
+  "CLIP_TO_NEW_TRACK refusé sur un clip verrouillé",
+  editorReducer(verrouille, { type: "CLIP_TO_NEW_TRACK", clipId: "haut" }).clips.find(
+    (c) => c.id === "haut",
+  )?.track,
+  1,
+);
+check(
+  "MOVE_TRANSIENT refusé : le clip verrouillé reste sur place",
+  editorReducer(verrouille, {
+    type: "MOVE_TRANSIENT",
+    clipId: "haut",
+    timelineStartMs: 9000,
+    track: 1,
+  }).transientClips,
+  null,
+);
+check(
+  "TRIM_TRANSIENT refusé sur un clip verrouillé",
+  editorReducer(verrouille, {
+    type: "TRIM_TRANSIENT",
+    clipId: "haut",
+    side: "left",
+    edgeSrcMs: 2000,
+  }).transientClips,
+  null,
+);
+
+// Le même appel, sur le clip NON verrouillé du même montage, doit réussir :
+// preuve que le verrou cible la piste concernée, pas tout le réducteur.
+check(
+  "le même appel réussit sur un clip d'une piste NON verrouillée",
+  editorReducer(verrouille, { type: "SET_CLIP_VOLUME", clipId: "bas", volume: 0.2 }).clips.find(
+    (c) => c.id === "bas",
+  )?.volume,
+  0.2,
+);
+
+// Déverrouiller rend la main : ce n'est pas le clip qui est marqué, seulement
+// la piste — TOGGLE_TRACK_LOCKED suffit à tout débloquer.
+const deverrouille = editorReducer(verrouille, { type: "TOGGLE_TRACK_LOCKED", track: 1 });
+check(
+  "déverrouiller la piste rend le clip à nouveau modifiable",
+  editorReducer(deverrouille, {
+    type: "SET_CLIP_VOLUME",
+    clipId: "haut",
+    volume: 0.2,
+  }).clips.find((c) => c.id === "haut")?.volume,
+  0.2,
+);
+
+// Copier et dupliquer restent permis : ils ne modifient jamais le clip visé,
+// seulement une copie indépendante ou le presse-papiers — rien à protéger.
+check(
+  "copier un clip verrouillé reste permis (lecture seule)",
+  editorReducer(verrouille, { type: "COPY_CLIP", clipId: "haut" }).clipboard?.id,
+  "haut",
+);
+check(
+  "dupliquer un clip verrouillé reste permis (l'original n'est pas modifié)",
+  editorReducer(verrouille, { type: "DUPLICATE_CLIP", clipId: "haut" }).clips.length,
+  3,
 );
 
 console.log("Volume par clip");

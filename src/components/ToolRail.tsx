@@ -12,15 +12,14 @@ import { Icon, type IconName } from "./Icon";
 
 export type Tool = "select" | "blade";
 
+/** Panneau affiché dans la colonne de gauche. Un seul à la fois, jamais deux. */
+export type SidePanel = "media" | "text" | "inspector";
+
 interface Props {
   tool: Tool;
   onToolChange: (tool: Tool) => void;
-  mediaOpen: boolean;
-  onToggleMedia: () => void;
-  textOpen: boolean;
-  onToggleText: () => void;
-  inspectorOpen: boolean;
-  onToggleInspector: () => void;
+  sidePanel: SidePanel | null;
+  onSelectPanel: (panel: SidePanel | null) => void;
 }
 
 interface Entry {
@@ -47,27 +46,34 @@ function RailButton({ entry }: { entry: Entry }) {
 }
 
 export function ToolRail(props: Props) {
+  // Cliquer sur le panneau déjà ouvert le referme (bascule) ; cliquer sur un
+  // autre panneau bascule dessus directement, sans étape intermédiaire de
+  // fermeture — un seul est jamais affiché, ce n'est donc pas une action à
+  // deux temps.
+  const select = (panel: SidePanel) => () =>
+    props.onSelectPanel(props.sidePanel === panel ? null : panel);
+
   const panels: Entry[] = [
     {
       icon: "folder",
       label: "Médias",
       title: "Panneau Médias",
-      active: props.mediaOpen,
-      onClick: props.onToggleMedia,
+      active: props.sidePanel === "media",
+      onClick: select("media"),
     },
     {
       icon: "text",
       label: "Titres",
       title: "Panneau Titres",
-      active: props.textOpen,
-      onClick: props.onToggleText,
+      active: props.sidePanel === "text",
+      onClick: select("text"),
     },
     {
       icon: "sliders",
       label: "Inspecteur",
       title: "Inspecteur",
-      active: props.inspectorOpen,
-      onClick: props.onToggleInspector,
+      active: props.sidePanel === "inspector",
+      onClick: select("inspector"),
     },
   ];
 

@@ -43,6 +43,51 @@ export interface SourceInfo {
  */
 export const ASSET_VERSION = 4;
 
+/**
+ * Sources dont un fichier dérivé doit être régénéré au prochain démarrage :
+ * version périmée (`assetVersion`), OU proxy absent du disque.
+ *
+ * Le second cas est un correctif : le backend refusait auparavant d'ouvrir le
+ * moindre projet dont UN SEUL proxy manquait — y compris celui d'une source
+ * jamais posée sur la timeline — et rendait `null`, indiscernable de « aucun
+ * projet n'a jamais existé ». Le projet disparaissait donc purement et
+ * simplement au démarrage. Le backend ouvre désormais le document tel quel ;
+ * c'est ici, une fois affiché, que les proxys manquants sont repérés et
+ * régénérés depuis le rush d'origine — exactement comme un fichier dérivé
+ * simplement périmé, sans jamais bloquer l'ouverture elle-même.
+ *
+ * `proxyExists` est le résultat d'une vérification déjà faite (coûteuse en
+ * aller-retour IPC) : cette fonction ne fait que la décision, pure et
+ * testable sans disque ni Tauri.
+ */
+export function sourcesNeedingRegeneration(
+  sources: readonly SourceInfo[],
+  proxyExists: ReadonlySet<string>,
+): SourceInfo[] {
+  return sources.filter(
+    (source) => source.assetVersion < ASSET_VERSION || !proxyExists.has(source.id),
+  );
+}
+
+/**
+ * Vrai si cette répétition d'un `keydown` (touche maintenue) doit être
+ * ignorée par les raccourcis clavier globaux.
+ *
+ * Bug réel corrigé : le gestionnaire ne filtrait `event.repeat` nulle part.
+ * Maintenir Suppr supprimait clip après clip sans borne — le temps de
+ * relâcher, le montage pouvait être vidé — et Ctrl+V empilait des copies au
+ * playhead à la cadence de répétition du clavier. Chaque raccourci de la
+ * liste est une action PONCTUELLE, sauf les flèches : défiler ou ajuster un
+ * bord en MAINTENANT la flèche est le seul cas où répéter est voulu, comme
+ * dans n'importe quel éditeur — elles restent donc seules exemptées.
+ *
+ * Extraite pour être testable sans DOM ni React : `App.tsx` ne fait que lui
+ * transmettre `event.repeat`/`event.key`.
+ */
+export function isUnwantedKeyRepeat(repeat: boolean, key: string): boolean {
+  return repeat && key !== "ArrowLeft" && key !== "ArrowRight";
+}
+
 /** Ratio largeur/hauteur du rush, borné contre des métadonnées aberrantes. */
 export const sourceAspect = (probe: ProbeInfo): number => {
   const ratio = probe.height > 0 ? probe.width / probe.height : 16 / 9;
@@ -256,6 +301,23 @@ export function flattenTracks(
 
     // Deux tronçons consécutifs du même rush qui se suivent aussi dans le temps
     // source ne forment qu'un seul segment : inutile de couper pour rien.
+    //
+    // Cette fusion est délibérément PAR PLAN et PAR CHAMP, pas par identité de
+    // clip : deux clips COMMITTÉS DISTINCTS qui ne diffèrent que par une
+    // propriété étrangère au plan compilé (le volume pour la vidéo, le cadrage
+    // pour l'audio) fusionnent quand même dans ce plan-là — le contraire romprait
+    // un plan pour une différence qu'il ne rend même pas (voir les tests
+    // « le volume ne découpe pas le plan vidéo » et symétriques). Une tentative
+    // de resserrer cette fusion à « même clip committé uniquement » a été
+    // essayée et abandonnée : elle casse ces trois tests d'indépendance des
+    // plans, qui sont un choix voulu, pas un oubli.
+    //
+    // Conséquence acceptée : un segment issu de cette fusion ne correspond plus
+    // forcément à UN SEUL clip committé (c'est le cas, entre autres, juste après
+    // une découpe — SPLIT_AT — tant qu'aucune des deux moitiés n'a été
+    // retouchée). C'est `sourceClipFor`, dans compileTimeline.ts, qui porte la
+    // responsabilité de retrouver malgré tout un clip réel pour ce segment — pas
+    // ici. Ne pas réintroduire de vérification d'identité dans cette fonction.
     const previous = flat[flat.length - 1];
     const audioEnvelopeCanMerge =
       previous &&
@@ -338,6 +400,13 @@ export interface ZoomRegion {
   /** Durées des rampes, exprimées dans le temps de la timeline. */
   rampInMs: number;
   rampOutMs: number;
+  /**
+   * "in" : part du cadre normal, s'approche jusqu'au pic, puis revient.
+   * "out" : part déjà au pic, s'éloigne jusqu'au cadre normal, puis y revient.
+   */
+  direction: "in" | "out";
+  /** "linear" : rampes à vitesse constante. "ease" : départ/arrivée adoucis. */
+  easing: "linear" | "ease";
 }
 
 export const MIN_ZOOM_DURATION_MS = 200;
@@ -370,6 +439,14 @@ export const clampZoomRampMs = (rampMs: number, durationMs: number): number => {
  * Rampe linéaire à l'aller comme au retour. Hors des bornes du zoom, la valeur
  * est exactement 1 : la vue d'avant est retrouvée à l'identique.
  */
+/**
+ * Adoucit un gain linéaire 0→1 en courbe d'accélération/décélération
+ * (smoothstep). Même formule côté FFmpeg — voir `zoompan_filter` en Rust.
+ */
+export function easeGain(gain: number): number {
+  return gain * gain * (3 - 2 * gain);
+}
+
 export function zoomScaleAt(zoom: ZoomRegion, timelineMs: number): number {
   if (timelineMs <= zoom.timelineStartMs || timelineMs >= zoom.timelineEndMs) return 1;
   const peak = clampZoomScale(zoom.scale);
@@ -377,7 +454,11 @@ export function zoomScaleAt(zoom: ZoomRegion, timelineMs: number): number {
   const remainingMs = zoom.timelineEndMs - timelineMs;
   const inGain = zoom.rampInMs > 0 ? Math.min(1, elapsedMs / zoom.rampInMs) : 1;
   const outGain = zoom.rampOutMs > 0 ? Math.min(1, remainingMs / zoom.rampOutMs) : 1;
-  return 1 + (peak - 1) * Math.max(0, Math.min(inGain, outGain));
+  const rawGain = Math.max(0, Math.min(inGain, outGain));
+  const gain = zoom.easing === "ease" ? easeGain(rawGain) : rawGain;
+  // "out" : symétrique de "in" — on part du pic (gain=0) pour revenir au
+  // cadre normal au palier (gain=1), puis on rezoome à la fin.
+  return zoom.direction === "out" ? peak + (1 - peak) * gain : 1 + (peak - 1) * gain;
 }
 
 /**
@@ -423,6 +504,8 @@ export function normalizeZoomRegion(zoom: ZoomRegion, durationMs: number): ZoomR
     y: Math.min(1, Math.max(0, finiteOr(zoom.y, 0.5))),
     rampInMs: clampZoomRampMs(zoom.rampInMs, zoomDurationMs),
     rampOutMs: clampZoomRampMs(zoom.rampOutMs, zoomDurationMs),
+    direction: zoom.direction === "out" ? "out" : "in",
+    easing: zoom.easing === "ease" ? "ease" : "linear",
   };
 }
 
@@ -474,8 +557,19 @@ export function normalizeTextOverlay(
   };
 }
 
+/**
+ * Format de projet produit par CETTE version de l'application.
+ *
+ * Source unique de vérité : `Project.version` en dérive son type, et
+ * `migrateProject` s'en sert pour refuser un fichier plus récent que ce que ce
+ * build sait lire — sans ce refus, un format futur inconnu serait rétrogradé
+ * silencieusement à ce numéro, perdant ses champs inconnus, puis l'autosave
+ * réécrirait le fichier ainsi appauvri sur le disque.
+ */
+export const CURRENT_PROJECT_VERSION = 9;
+
 export interface Project {
-  version: 9;
+  version: typeof CURRENT_PROJECT_VERSION;
   id: string;
   name: string;
   /** Rushs du projet, indexés par leur empreinte. */
@@ -498,6 +592,12 @@ export interface ProjectSummary {
   clipCount: number;
   /** Vignette du premier rush, si elle est encore sur le disque. */
   thumbPath: string | null;
+  /**
+   * Faux si le fichier existe mais n'a pas pu être lu (JSON corrompu, le plus
+   * souvent) : le projet reste quand même dans la liste plutôt que d'en
+   * disparaître sans un mot.
+   */
+  readable: boolean;
 }
 
 /** Rush d'un clip. Ne doit jamais manquer : la migration garantit la cohérence. */
@@ -586,6 +686,21 @@ export const MIN_CLIP_MS = 66;
 export const GAP_EPSILON_MS = 1;
 
 /**
+ * Tolérance de contiguïté pour qu'une transition soit posable entre deux
+ * segments — DOIT rester égale au `0.001` codé en dur dans
+ * `validate_segments`, côté src-tauri/src/media.rs (`gap_before_ms > 0.001`).
+ *
+ * `GAP_EPSILON_MS` (1 ms) sert à décider si un intervalle est un trou VISIBLE
+ * dans la timeline — bien plus tolérant, à raison. L'utiliser aussi ici
+ * laissait l'aperçu proposer/accepter une transition sur un intervalle de,
+ * disons, 0,5 ms — invisible à l'œil, donc pas un trou — que Rust refusait
+ * ensuite à l'export avec « Une transition doit relier deux segments
+ * contigus » : deux définitions différentes de « contigu » pour la même
+ * décision. Un seul des deux nombres doit trancher ; c'est celui-ci.
+ */
+export const TRANSITION_CONTIGUITY_EPSILON_MS = 0.001;
+
+/**
  * Durée occupée sur la TIMELINE. C'est le sens attendu partout : positions,
  * chevauchements, trous, largeur à l'écran. Avec une vitesse de 2, un clip de
  * 10 s de rush n'occupe que 5 s de montage.
@@ -659,13 +774,24 @@ export function trackIsFree(clips: Clip[], track: number, startMs: number, endMs
 /**
  * Première piste pouvant accueillir l'intervalle, en partant de `fromTrack` et
  * en montant. Évite d'empiler une piste neuve par rush importé.
+ *
+ * Une piste verrouillée n'est jamais candidate, même libre à cet horodatage :
+ * sinon un import ou un collage y atterrirait silencieusement.
  */
-export function firstFreeTrack(clips: Clip[], startMs: number, endMs: number, fromTrack = 0): number {
+export function firstFreeTrack(
+  clips: Clip[],
+  startMs: number,
+  endMs: number,
+  fromTrack = 0,
+  lockedTracks: readonly number[] = [],
+): number {
   const ceiling = trackCount(clips);
-  for (let track = Math.max(0, fromTrack); track <= ceiling; track++) {
+  const limit = ceiling + lockedTracks.length + 1;
+  for (let track = Math.max(0, fromTrack); track <= limit; track++) {
+    if (lockedTracks.includes(track)) continue;
     if (trackIsFree(clips, track, startMs, endMs)) return track;
   }
-  return ceiling;
+  return limit;
 }
 
 /**
@@ -686,11 +812,56 @@ export function firstFreeTrack(clips: Clip[], startMs: number, endMs: number, fr
  * qui a corrigé l'incident : un geste ne doit jamais redéfinir ses propres
  * limites pendant qu'il est en cours.
  */
-export function compactTrackIndices(clips: Clip[]): Clip[] {
+/**
+ * Ancien indice de piste → nouvel indice, une fois l'écart comblé. Null si
+ * déjà compact. Unique source de vérité : `compactTrackIndices` et le recalage
+ * des masquages/verrous doivent voir exactement le même décalage.
+ */
+function trackIndexMapping(clips: Clip[]): Map<number, number> | null {
   const usedTracks = [...new Set(clips.map((clip) => clip.track))].sort((a, b) => a - b);
-  if (usedTracks.every((track, index) => track === index)) return clips; // déjà compact
-  const mapping = new Map(usedTracks.map((track, index) => [track, index]));
+  if (usedTracks.every((track, index) => track === index)) return null; // déjà compact
+  return new Map(usedTracks.map((track, index) => [track, index]));
+}
+
+export function compactTrackIndices(clips: Clip[]): Clip[] {
+  const mapping = trackIndexMapping(clips);
+  if (!mapping) return clips;
   return clips.map((clip) => ({ ...clip, track: mapping.get(clip.track) ?? 0 }));
+}
+
+/**
+ * Recale une liste d'indices de piste (masquages, verrous) sur le même
+ * décalage que `compactTrackIndices` appliquerait à `clips` : sans ça, un
+ * masquage ou un verrou reste sur l'ancien numéro pendant que les clips, eux,
+ * ont glissé — une piste masquée peut réapparaître, un verrou changer de piste.
+ * Un indice dont la piste a disparu (plus aucun clip dessus) est retiré : il
+ * n'y a plus rien à masquer ou verrouiller.
+ */
+export function remapTrackIndices(tracks: number[], clips: Clip[]): number[] {
+  const mapping = trackIndexMapping(clips);
+  if (!mapping) return tracks;
+  return tracks
+    .map((track) => mapping.get(track))
+    .filter((track): track is number => track !== undefined);
+}
+
+/**
+ * Même recalage que `remapTrackIndices`, mais pour une table indexée par
+ * numéro de piste (ex. la mémoire de coupe son par piste) plutôt qu'une
+ * simple liste. Même sort pour une piste disparue : l'entrée est retirée.
+ */
+export function remapTrackKeyedRecord<T>(
+  record: Record<number, T>,
+  clips: Clip[],
+): Record<number, T> {
+  const mapping = trackIndexMapping(clips);
+  if (!mapping) return record;
+  const next: Record<number, T> = {};
+  for (const [track, value] of Object.entries(record)) {
+    const mapped = mapping.get(Number(track));
+    if (mapped !== undefined) next[mapped] = value;
+  }
+  return next;
 }
 
 /** Clip visible à cet instant : celui de la piste la plus haute qui le couvre. */
@@ -787,10 +958,16 @@ export function applyTrim(clip: Clip, side: "left" | "right", edgeSrcMs: number,
  * borne, quitte à raccourcir la portion de rush utilisée.
  */
 export function applyRate(clip: Clip, rate: number, limits: { maxEndMs: number }): Clip {
-  const playbackRate = clampRate(rate);
+  const sourceDurationMs = clipSourceDurationMs(clip);
+  // Sans ce plafond, accélérer un clip déjà proche du minimum passait sa durée
+  // TIMELINE sous MIN_CLIP_MS (un clip source de 66 ms à 4× ferait 16,5 ms) :
+  // la vitesse ne doit jamais faire passer la durée occupée sous le plancher
+  // de 2 images, celui que `applyTrim` garantit déjà à la découpe.
+  const maxRateForFloor = sourceDurationMs / MIN_CLIP_MS;
+  const playbackRate = Math.min(clampRate(rate), maxRateForFloor);
   const maxTimelineDuration = limits.maxEndMs - clip.timelineStartMs;
   let srcOutMs = clip.srcOutMs;
-  if (clipSourceDurationMs(clip) / playbackRate > maxTimelineDuration) {
+  if (sourceDurationMs / playbackRate > maxTimelineDuration) {
     srcOutMs = clip.srcInMs + maxTimelineDuration * playbackRate;
   }
   return { ...clip, playbackRate, srcOutMs };
@@ -824,17 +1001,110 @@ export function resolveOverlaps(clips: Clip[], priorityId: string): Clip[] {
 }
 
 /**
- * Recolle la PISTE PRINCIPALE bout à bout depuis zéro.
+ * Range UN clip après un déplacement qui l'a laissé chevaucher un voisin — en
+ * ne bougeant QUE lui, jamais le voisin ni personne d'autre.
  *
- * Les surcouches ne bougent pas : les décaler aussi les désynchroniserait de
- * l'image qu'elles sont censées recouvrir.
+ * Contrairement à `resolveOverlaps` (dupliquer/coller, où il n'y a aucun
+ * contrôle manuel sur la position d'arrivée, donc où pousser les voisins reste
+ * le service rendu), un déplacement à la souris a déjà un pointeur qui vise
+ * précisément un endroit : voir ce voisin sauter au moment où on l'effleure
+ * n'informe de rien, ça surprend. Le clip déplacé se pose donc juste avant ou
+ * juste après le bloc de voisins qu'il chevauche — le côté le plus proche de
+ * l'endroit visé — et personne d'autre ne bouge.
+ *
+ * Boucle bornée : recoller le clip peut, dans de rares montages très serrés,
+ * le faire chevaucher un voisin suivant ; on recalcule alors depuis sa
+ * nouvelle position, jusqu'à stabilité ou jusqu'à épuisement des voisins.
  */
-export function closeGaps(clips: Clip[]): Clip[] {
+export function resolveSelfOverlap(clips: Clip[], movedId: string): Clip[] {
+  let current = clips;
+  const maxIterations = current.filter((clip) => clip.id !== movedId).length + 1;
+  for (let i = 0; i < maxIterations; i++) {
+    const moved = current.find((clip) => clip.id === movedId);
+    if (!moved) return current;
+    const movedStart = moved.timelineStartMs;
+    const movedEnd = clipEndMs(moved);
+    const overlapping = current.filter(
+      (clip) =>
+        clip.id !== movedId &&
+        clip.track === moved.track &&
+        clip.timelineStartMs < movedEnd &&
+        clipEndMs(clip) > movedStart,
+    );
+    if (overlapping.length === 0) return current;
+    const duration = clipDurationMs(moved);
+    const earliestStart = Math.min(...overlapping.map((clip) => clip.timelineStartMs));
+    const latestEnd = Math.max(...overlapping.map((clip) => clipEndMs(clip)));
+    const before = earliestStart - duration;
+    const after = latestEnd;
+    const candidate =
+      before >= 0 && Math.abs(before - movedStart) <= Math.abs(after - movedStart) ? before : after;
+    current = current.map((clip) =>
+      clip.id === movedId ? { ...clip, timelineStartMs: candidate } : clip,
+    );
+  }
+  return current;
+}
+
+/** Union d'intervalles [timelineStartMs, clipEndMs), fusionnés dès qu'ils se touchent. */
+function mergedIntervals(clips: Clip[]): Gap[] {
+  const sorted = sortClips(clips);
+  const merged: Gap[] = [];
+  for (const clip of sorted) {
+    const startMs = clip.timelineStartMs;
+    const endMs = clipEndMs(clip);
+    const last = merged[merged.length - 1];
+    // Épsilon comme partout ailleurs (timelineGaps, transitions) : une
+    // vitesse non entière laisse parfois une fraction de milliseconde entre
+    // deux clips censés être bout à bout, que l'égalité stricte traitait
+    // comme un trou — `closeGaps` en déduisait alors, à tort, que la piste
+    // du dessous n'était pas entièrement couverte et déplaçait son clip.
+    if (last && startMs <= last.endMs + GAP_EPSILON_MS) {
+      last.endMs = Math.max(last.endMs, endMs);
+    } else {
+      merged.push({ startMs, endMs });
+    }
+  }
+  return merged;
+}
+
+/** Vrai si [startMs, endMs) est entièrement contenu dans un seul des intervalles. */
+function isFullyCovered(startMs: number, endMs: number, intervals: Gap[]): boolean {
+  return intervals.some(
+    (interval) =>
+      interval.startMs <= startMs + GAP_EPSILON_MS && interval.endMs >= endMs - GAP_EPSILON_MS,
+  );
+}
+
+/**
+ * Recolle la PISTE PRINCIPALE bout à bout — mais seulement là où le plan
+ * APLATI montre vraiment un trou.
+ *
+ * Le compteur affiché (« Fermer N trous ») se lit sur ce même plan aplati
+ * (voir `compiledTimeline.gaps`, calculé sur `resolveVideoPlan`) : un trou de
+ * la piste principale déjà recouvert par une surcouche VISIBLE n'y apparaît
+ * pas, puisque rien n'y est noir à l'écran. Le recoller quand même — ce que
+ * faisait cette fonction avant ce correctif, aveugle aux autres pistes —
+ * décale le contenu principal sous une surcouche qui le recouvrait exprès,
+ * pour un trou que ni l'aperçu ni l'export ne montraient : la mesure et
+ * l'action portaient sur deux choses différentes.
+ *
+ * Les surcouches ne bougent JAMAIS : les décaler désynchroniserait l'image
+ * qu'elles sont censées recouvrir.
+ */
+export function closeGaps(clips: Clip[], hiddenTracks: ReadonlySet<number> = new Set()): Clip[] {
+  const overlayCoverage = mergedIntervals(
+    clips.filter((clip) => clip.track !== 0 && !hiddenTracks.has(clip.track)),
+  );
+
   let cursor = 0;
   const placed = new Map<string, number>();
   for (const clip of sortClips(clipsOnTrack(clips, 0))) {
-    placed.set(clip.id, cursor);
-    cursor += clipDurationMs(clip);
+    const startMs = isFullyCovered(cursor, clip.timelineStartMs, overlayCoverage)
+      ? clip.timelineStartMs
+      : cursor;
+    placed.set(clip.id, startMs);
+    cursor = startMs + clipDurationMs(clip);
   }
   return clips.map((clip) =>
     placed.has(clip.id) ? { ...clip, timelineStartMs: placed.get(clip.id)! } : clip,
@@ -906,7 +1176,54 @@ export type StoredZoomRegion = Partial<ZoomRegion> & { id?: unknown };
  * Les clips orphelins (rush absent) sont écartés plutôt que de faire planter
  * la lecture sur une source introuvable.
  */
+/**
+ * Vrai si CE build sait interpréter le format d'un projet lu du disque.
+ *
+ * Les formats 1 à 8 s'infèrent par la PRÉSENCE de champs (`source` contre
+ * `sources`, `framing`, `zooms`) : `migrateProject` ne lit `stored.version`
+ * nulle part pour son propre compte, il n'a jamais eu besoin d'un plancher.
+ * Il a besoin d'un PLAFOND : un numéro supérieur à `CURRENT_PROJECT_VERSION`
+ * vient d'une version plus récente de l'application. Ses champs inconnus
+ * seraient silencieusement perdus par une migration en aveugle, puis
+ * l'autosave réécrirait le fichier appauvri sur le disque — une régression
+ * irréversible que rien ne signale à l'utilisateur.
+ */
+export function isProjectVersionSupported(version: unknown): boolean {
+  return !(
+    typeof version === "number" &&
+    Number.isFinite(version) &&
+    version > CURRENT_PROJECT_VERSION
+  );
+}
+
+/**
+ * Levée par `migrateProject` quand `isProjectVersionSupported` refuse le
+ * fichier. Un type dédié, distinct d'une erreur générique, pour que l'appelant
+ * puisse choisir un message qui dit clairement « mets l'application à jour »
+ * plutôt que « fichier corrompu ».
+ */
+export class UnsupportedProjectVersionError extends Error {
+  // Champ déclaré et assigné explicitement, plutôt qu'en propriété de
+  // paramètre du constructeur : le lanceur de tests exécute le TypeScript par
+  // simple retrait des annotations de type (`node --experimental-strip-types`),
+  // qui ne sait pas transformer ce raccourci en assignation réelle.
+  readonly version: number;
+
+  constructor(version: number) {
+    super(
+      `Ce projet a été enregistré par une version plus récente de l'application ` +
+        `(format ${version}, celle-ci lit jusqu'au format ${CURRENT_PROJECT_VERSION}). ` +
+        `Mets à jour GTA Studio avant de l'ouvrir : l'ouvrir ici perdrait ses données.`,
+    );
+    this.name = "UnsupportedProjectVersionError";
+    this.version = version;
+  }
+}
+
 export function migrateProject(stored: StoredProject): Project {
+  if (!isProjectVersionSupported(stored.version)) {
+    throw new UnsupportedProjectVersionError(stored.version);
+  }
   const sources: Record<string, SourceInfo> = { ...(stored.sources ?? {}) };
   if (stored.source) sources[stored.source.id] = stored.source;
   const fallbackId = stored.source?.id ?? Object.keys(sources)[0] ?? "";
@@ -992,6 +1309,8 @@ export function migrateProject(stored: StoredProject): Project {
           y: zoom.y ?? 0.5,
           rampInMs: zoom.rampInMs ?? 400,
           rampOutMs: zoom.rampOutMs ?? 400,
+          direction: zoom.direction === "out" ? "out" : "in",
+          easing: zoom.easing === "ease" ? "ease" : "linear",
         },
         durationMs,
       ),
@@ -999,7 +1318,7 @@ export function migrateProject(stored: StoredProject): Project {
     .filter((zoom) => zoom.timelineEndMs > zoom.timelineStartMs);
 
   return {
-    version: 9,
+    version: CURRENT_PROJECT_VERSION,
     id: stored.id,
     name: stored.name,
     sources,

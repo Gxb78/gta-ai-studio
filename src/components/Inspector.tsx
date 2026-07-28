@@ -9,6 +9,7 @@ import { EmptyState } from "./EmptyState";
 import { Icon } from "./Icon";
 import { InspectorSection } from "./InspectorSection";
 import { sourceName } from "./MediaPanel";
+import { useDebouncedSlider } from "../hooks/useDebouncedSlider";
 import type { Clip, FramingMode, SourceInfo } from "../types";
 import {
   MAX_RATE,
@@ -54,6 +55,40 @@ export function Inspector(props: Props) {
     : MAX_VIDEO_FADE_MS;
   const fadeLabel = (fadeMs: number): string =>
     fadeMs === 0 ? "Aucun" : `${(fadeMs / 1000).toFixed(fadeMs % 1000 === 0 ? 0 : 2)} s`;
+
+  // Un curseur par réglage, chacun ne committant qu'une fois relâché ou
+  // resté silencieux (voir useDebouncedSlider) : sans ça, resserrer un fondu
+  // empile une entrée d'historique par tick de la souris. Appelés
+  // inconditionnellement (hooks), avec 0 comme repli hors sélection — les
+  // callbacks de commit sont déjà gardées côté App si `clip` est null.
+  const resetKey = clip?.id ?? "none";
+  const cropXSlider = useDebouncedSlider(clip?.cropX ?? 0, props.onSetCropX, resetKey);
+  const videoFadeInSlider = useDebouncedSlider(
+    clip?.videoFadeInMs ?? 0,
+    (value) => props.onSetVideoFade("in", value),
+    resetKey,
+  );
+  const videoFadeOutSlider = useDebouncedSlider(
+    clip?.videoFadeOutMs ?? 0,
+    (value) => props.onSetVideoFade("out", value),
+    resetKey,
+  );
+  const transitionInSlider = useDebouncedSlider(
+    props.effectiveTransitionMs,
+    props.onSetTransitionIn,
+    resetKey,
+  );
+  const volumeSlider = useDebouncedSlider(clip?.volume ?? 1, props.onSetVolume, resetKey);
+  const audioFadeInSlider = useDebouncedSlider(
+    clip?.audioFadeInMs ?? 0,
+    (value) => props.onSetAudioFade("in", value),
+    resetKey,
+  );
+  const audioFadeOutSlider = useDebouncedSlider(
+    clip?.audioFadeOutMs ?? 0,
+    (value) => props.onSetAudioFade("out", value),
+    resetKey,
+  );
 
   return (
     <aside className="panel panel-inspector">
@@ -128,7 +163,7 @@ export function Inspector(props: Props) {
           <InspectorSection
             title="Cadrage du clip"
             note={framing === "blur" ? "sans effet en fond flou" : undefined}
-            summary={clip.cropX === 0 ? "centré" : `${Math.round(clip.cropX * 100)} %`}
+            summary={cropXSlider.value === 0 ? "centré" : `${Math.round(cropXSlider.value * 100)} %`}
           >
             <div className="slider-row">
               <Icon name="crop" size={15} />
@@ -137,17 +172,26 @@ export function Inspector(props: Props) {
                 min={-1}
                 max={1}
                 step={0.01}
-                value={clip.cropX}
+                value={cropXSlider.value}
                 disabled={framing === "blur"}
-                onChange={(event) => props.onSetCropX(Number(event.target.value))}
+                onChange={(event) => cropXSlider.onChange(Number(event.target.value))}
+                onPointerUp={cropXSlider.commitNow}
+                onBlur={cropXSlider.commitNow}
                 aria-label="Décalage horizontal du cadrage"
               />
               <span className="slider-value">
-                {clip.cropX === 0 ? "centré" : `${Math.round(clip.cropX * 100)} %`}
+                {cropXSlider.value === 0 ? "centré" : `${Math.round(cropXSlider.value * 100)} %`}
               </span>
             </div>
             {clip.cropX !== 0 && framing === "crop" && (
-              <button type="button" className="ghost small" onClick={() => props.onSetCropX(0)}>
+              <button
+                type="button"
+                className="ghost small"
+                onClick={() => {
+                  cropXSlider.cancel();
+                  props.onSetCropX(0);
+                }}
+              >
                 Recentrer
               </button>
             )}
@@ -174,9 +218,9 @@ export function Inspector(props: Props) {
           <InspectorSection
             title="Fondu vidéo"
             summary={
-              clip.videoFadeInMs === 0 && clip.videoFadeOutMs === 0
+              videoFadeInSlider.value === 0 && videoFadeOutSlider.value === 0
                 ? "Aucun"
-                : `${fadeLabel(clip.videoFadeInMs)} / ${fadeLabel(clip.videoFadeOutMs)}`
+                : `${fadeLabel(videoFadeInSlider.value)} / ${fadeLabel(videoFadeOutSlider.value)}`
             }
           >
             <div className="fade-control">
@@ -187,11 +231,13 @@ export function Inspector(props: Props) {
                   min={0}
                   max={maxVideoFadeMs}
                   step={50}
-                  value={clip.videoFadeInMs}
-                  onChange={(event) => props.onSetVideoFade("in", Number(event.target.value))}
+                  value={videoFadeInSlider.value}
+                  onChange={(event) => videoFadeInSlider.onChange(Number(event.target.value))}
+                  onPointerUp={videoFadeInSlider.commitNow}
+                  onBlur={videoFadeInSlider.commitNow}
                   aria-label="Fondu vidéo d'entrée"
                 />
-                <span className="slider-value">{fadeLabel(clip.videoFadeInMs)}</span>
+                <span className="slider-value">{fadeLabel(videoFadeInSlider.value)}</span>
               </label>
               <label className="slider-row">
                 <span className="fade-label">Sortie</span>
@@ -200,18 +246,24 @@ export function Inspector(props: Props) {
                   min={0}
                   max={maxVideoFadeMs}
                   step={50}
-                  value={clip.videoFadeOutMs}
-                  onChange={(event) => props.onSetVideoFade("out", Number(event.target.value))}
+                  value={videoFadeOutSlider.value}
+                  onChange={(event) => videoFadeOutSlider.onChange(Number(event.target.value))}
+                  onPointerUp={videoFadeOutSlider.commitNow}
+                  onBlur={videoFadeOutSlider.commitNow}
                   aria-label="Fondu vidéo de sortie"
                 />
-                <span className="slider-value">{fadeLabel(clip.videoFadeOutMs)}</span>
+                <span className="slider-value">{fadeLabel(videoFadeOutSlider.value)}</span>
               </label>
             </div>
             {(clip.videoFadeInMs > 0 || clip.videoFadeOutMs > 0) && (
               <button
                 type="button"
                 className="ghost small"
-                onClick={() => props.onSetVideoFade("both", 0)}
+                onClick={() => {
+                  videoFadeInSlider.cancel();
+                  videoFadeOutSlider.cancel();
+                  props.onSetVideoFade("both", 0);
+                }}
               >
                 Retirer les fondus
               </button>
@@ -220,7 +272,7 @@ export function Inspector(props: Props) {
 
           <InspectorSection
             title="Transition"
-            summary={fadeLabel(props.effectiveTransitionMs)}
+            summary={fadeLabel(transitionInSlider.value)}
           >
             <label className="slider-row">
               <span className="fade-label">Enchaîné</span>
@@ -229,12 +281,14 @@ export function Inspector(props: Props) {
                 min={0}
                 max={Math.max(50, props.transitionMaxMs)}
                 step={50}
-                value={props.effectiveTransitionMs}
+                value={transitionInSlider.value}
                 disabled={props.transitionMaxMs <= 0}
-                onChange={(event) => props.onSetTransitionIn(Number(event.target.value))}
+                onChange={(event) => transitionInSlider.onChange(Number(event.target.value))}
+                onPointerUp={transitionInSlider.commitNow}
+                onBlur={transitionInSlider.commitNow}
                 aria-label="Durée du fondu enchaîné"
               />
-              <span className="slider-value">{fadeLabel(props.effectiveTransitionMs)}</span>
+              <span className="slider-value">{fadeLabel(transitionInSlider.value)}</span>
             </label>
             {props.transitionMaxMs <= 0 && (
               <p className="muted small-text">Coupe incompatible ou poignées insuffisantes.</p>
@@ -243,7 +297,10 @@ export function Inspector(props: Props) {
               <button
                 type="button"
                 className="ghost small"
-                onClick={() => props.onSetTransitionIn(0)}
+                onClick={() => {
+                  transitionInSlider.cancel();
+                  props.onSetTransitionIn(0);
+                }}
               >
                 Retirer la transition
               </button>
@@ -253,7 +310,7 @@ export function Inspector(props: Props) {
           <InspectorSection
             title="Son"
             summary={
-              clip.audioEnabled ? `${Math.round(clip.volume * 100)} %` : "Coupé"
+              clip.audioEnabled ? `${Math.round(volumeSlider.value * 100)} %` : "Coupé"
             }
           >
             <button
@@ -266,21 +323,30 @@ export function Inspector(props: Props) {
               {clip.audioEnabled ? "Son actif" : "Son coupé"}
             </button>
             <div className="slider-row">
-              <Icon name={clip.volume === 0 ? "soundOff" : "volume"} size={15} />
+              <Icon name={volumeSlider.value === 0 ? "soundOff" : "volume"} size={15} />
               <input
                 type="range"
                 min={MIN_VOLUME}
                 max={MAX_VOLUME}
                 step={0.01}
-                value={clip.volume}
+                value={volumeSlider.value}
                 disabled={!clip.audioEnabled}
-                onChange={(event) => props.onSetVolume(Number(event.target.value))}
+                onChange={(event) => volumeSlider.onChange(Number(event.target.value))}
+                onPointerUp={volumeSlider.commitNow}
+                onBlur={volumeSlider.commitNow}
                 aria-label="Volume du clip"
               />
-              <span className="slider-value">{Math.round(clip.volume * 100)} %</span>
+              <span className="slider-value">{Math.round(volumeSlider.value * 100)} %</span>
             </div>
             {clip.volume !== 1 && clip.audioEnabled && (
-              <button type="button" className="ghost small" onClick={() => props.onSetVolume(1)}>
+              <button
+                type="button"
+                className="ghost small"
+                onClick={() => {
+                  volumeSlider.cancel();
+                  props.onSetVolume(1);
+                }}
+              >
                 Rétablir 100 %
               </button>
             )}
@@ -292,12 +358,14 @@ export function Inspector(props: Props) {
                   min={0}
                   max={maxFadeMs}
                   step={50}
-                  value={clip.audioFadeInMs}
+                  value={audioFadeInSlider.value}
                   disabled={!clip.audioEnabled}
-                  onChange={(event) => props.onSetAudioFade("in", Number(event.target.value))}
+                  onChange={(event) => audioFadeInSlider.onChange(Number(event.target.value))}
+                  onPointerUp={audioFadeInSlider.commitNow}
+                  onBlur={audioFadeInSlider.commitNow}
                   aria-label="Fondu audio d'entrée"
                 />
-                <span className="slider-value">{fadeLabel(clip.audioFadeInMs)}</span>
+                <span className="slider-value">{fadeLabel(audioFadeInSlider.value)}</span>
               </label>
               <label className="slider-row">
                 <span className="fade-label">Sortie</span>
@@ -306,19 +374,25 @@ export function Inspector(props: Props) {
                   min={0}
                   max={maxFadeMs}
                   step={50}
-                  value={clip.audioFadeOutMs}
+                  value={audioFadeOutSlider.value}
                   disabled={!clip.audioEnabled}
-                  onChange={(event) => props.onSetAudioFade("out", Number(event.target.value))}
+                  onChange={(event) => audioFadeOutSlider.onChange(Number(event.target.value))}
+                  onPointerUp={audioFadeOutSlider.commitNow}
+                  onBlur={audioFadeOutSlider.commitNow}
                   aria-label="Fondu audio de sortie"
                 />
-                <span className="slider-value">{fadeLabel(clip.audioFadeOutMs)}</span>
+                <span className="slider-value">{fadeLabel(audioFadeOutSlider.value)}</span>
               </label>
             </div>
             {(clip.audioFadeInMs > 0 || clip.audioFadeOutMs > 0) && clip.audioEnabled && (
               <button
                 type="button"
                 className="ghost small"
-                onClick={() => props.onSetAudioFade("both", 0)}
+                onClick={() => {
+                  audioFadeInSlider.cancel();
+                  audioFadeOutSlider.cancel();
+                  props.onSetAudioFade("both", 0);
+                }}
               >
                 Retirer les fondus
               </button>

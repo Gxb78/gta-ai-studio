@@ -307,16 +307,29 @@ export function usePlayback(
     }
   }, []);
 
-  const pause = useCallback(() => {
-    videoA.current?.pause();
-    videoB.current?.pause();
-    audioA.current?.pause();
-    audioB.current?.pause();
+  /**
+   * Efface toute coupe ou tout fondu en attente/en cours, et rend aux balises
+   * leur opacité normale.
+   *
+   * Partagé par `seek`, `pause` et le recalage après montage : ces trois refs
+   * portent un chrono (`startedAt`) et des index de segment qui ne veulent
+   * plus rien dire dès qu'on quitte le déroulé qui les a armés — les laisser
+   * traîner fait repartir la boucle sur un temps d'attente déjà écoulé ou des
+   * index qu'un montage a décalés.
+   */
+  const clearInFlightTransitions = useCallback(() => {
     pendingCutRef.current = null;
-    stopLoop();
-    playingRef.current = false;
-    setPlaying(false);
-  }, [audioA, audioB, stopLoop, videoA, videoB]);
+    transitionWaitRef.current = null;
+    const activeTransition = activeTransitionRef.current;
+    if (activeTransition) {
+      activeTransition.outgoing.pause();
+      activeTransition.incoming.pause();
+      activeTransition.outgoing.style.removeProperty("opacity");
+      activeTransition.incoming.style.removeProperty("opacity");
+    }
+    activeTransitionRef.current = null;
+    setTransitionVideoClipId(null);
+  }, []);
 
   /** Prépare la balise inactive sur le clip qui suit, sans la jouer. */
   const ensurePrimed = useCallback(
@@ -389,6 +402,11 @@ export function usePlayback(
           setTransitionVideoClipId(to.sourceClipId);
           setInGap(false);
           setActiveVideoClipId(from.sourceClipId);
+          // Un seek qui atterrit en plein fondu doit armer l'attente de la
+          // boucle, sinon celle-ci ne reconnaît jamais la transition en cours
+          // (activeTransitionRef reste vide) et retombe sur le calcul d'index
+          // générique — avec la mauvaise balise pour lire le temps source.
+          transitionWaitRef.current = { transition, startedAt: performance.now() };
           return transition.fromIndex;
         }
       }
@@ -605,17 +623,7 @@ export function usePlayback(
 
   const seek = useCallback(
     (timelineMs: number) => {
-      pendingCutRef.current = null;
-      transitionWaitRef.current = null;
-      const activeTransition = activeTransitionRef.current;
-      if (activeTransition) {
-        activeTransition.outgoing.pause();
-        activeTransition.incoming.pause();
-        activeTransition.outgoing.style.removeProperty("opacity");
-        activeTransition.incoming.style.removeProperty("opacity");
-      }
-      activeTransitionRef.current = null;
-      setTransitionVideoClipId(null);
+      clearInFlightTransitions();
       videoA.current?.style.removeProperty("opacity");
       videoB.current?.style.removeProperty("opacity");
       skippedTransitionsRef.current.clear();
@@ -627,8 +635,33 @@ export function usePlayback(
       syncAudio(clamped, false, true);
       publishPlayhead(clamped);
     },
-    [applyPosition, publishPlayhead, syncAudio],
+    [applyPosition, clearInFlightTransitions, publishPlayhead, syncAudio],
   );
+
+  const pause = useCallback(() => {
+    // Un fondu armé ou en cours a un chrono et des index qui n'ont de sens que
+    // pendant qu'on joue : les laisser en l'état pendant la pause puis
+    // reprendre dessus tel quel désynchronise le fondu (le temps d'attente
+    // écoulé continue de courir hors lecture, et lecture/pause seule ne
+    // touche jamais aux balises l'une par rapport à l'autre). On repositionne
+    // donc proprement sur le même instant, comme le ferait un seek immobile.
+    const hadInFlightTransition =
+      pendingCutRef.current !== null ||
+      transitionWaitRef.current !== null ||
+      activeTransitionRef.current !== null;
+    videoA.current?.pause();
+    videoB.current?.pause();
+    audioA.current?.pause();
+    audioB.current?.pause();
+    stopLoop();
+    playingRef.current = false;
+    setPlaying(false);
+    if (hadInFlightTransition) {
+      seek(playheadRef.current);
+    } else {
+      pendingCutRef.current = null;
+    }
+  }, [audioA, audioB, seek, stopLoop, videoA, videoB]);
 
   /** Bascule sur la balise préchargée : c'est l'opération qui rend la jonction invisible. */
   const swap = useCallback(() => {
@@ -982,11 +1015,33 @@ export function usePlayback(
   // un seek parasite à la fin de chaque geste.
   useEffect(() => {
     const total = compiledTimeline.video.durationMs;
+    // Un LOAD remplace le projet entier : clips, sources, playhead n'ont plus
+    // aucun rapport avec ce qui était chargé. Si la balise active pointe vers
+    // une source absente de ce nouveau montage, la lecture ne peut pas
+    // continuer sur cet acquis — en cours ou non, on l'arrête et on repart de
+    // zéro, plutôt que de laisser la boucle lire l'ancien média avec les
+    // segments du nouveau (`playing` seul ne suffit pas à distinguer un
+    // simple montage, où l'on ne veut surtout pas interrompre la lecture,
+    // d'un changement de projet complet).
+    const active = getActive();
+    const activeSourceId = active?.dataset.sourceId;
+    if (activeSourceId && !(activeSourceId in sources)) {
+      pause();
+      seek(0);
+      return;
+    }
     if (playheadRef.current > total) {
       seek(total);
       return;
     }
     if (playing) return;
+    // Un montage ordinaire (découpe, réordonnancement, undo…) sur pause ne
+    // remplace pas le projet — la branche ci-dessus ne s'en charge donc pas —
+    // mais peut décaler ou faire disparaître les segments qu'une coupe ou un
+    // fondu encore armé visait par index. Laissés en l'état, ces refs
+    // pointeraient la boucle vers un `toIndex`/`fromIndex` qui ne correspond
+    // plus au même morceau du montage une fois la lecture reprise.
+    clearInFlightTransitions();
     const segments = compiledTimeline.video.segments;
     const index = findSegmentIndex(segments, playheadRef.current);
     currentVideoIndexRef.current = index;
@@ -1000,7 +1055,6 @@ export function usePlayback(
     const clip = segment.clip;
     setActiveVideoClipId(segment.sourceClipId);
     const source = sources[clip.sourceId];
-    const active = getActive();
     if (!active || !source) return;
     const targetMs = timelineTimeToSourceTime(clip, playheadRef.current);
     const sameSource = active.dataset.sourceId === source.id;
@@ -1008,7 +1062,7 @@ export function usePlayback(
       assign(active, source, targetMs);
     }
     ensurePrimed(segments[index + 1]);
-  }, [compiledTimeline, ensurePrimed, getActive, playing, seek, sources]);
+  }, [clearInFlightTransitions, compiledTimeline, ensurePrimed, getActive, pause, playing, seek, sources]);
 
   useEffect(() => stopLoop, [stopLoop]);
 

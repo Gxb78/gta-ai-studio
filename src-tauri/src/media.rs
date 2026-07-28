@@ -5,10 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 
@@ -35,14 +38,87 @@ const MAX_THUMBS: f64 = 1800.0;
 const ASSET_VERSION: u32 = 4;
 /// Versions par famille de fichiers : seules celles qui changent réellement
 /// provoquent un recalcul, les autres restent en cache.
+///
+/// Le proxy en a besoin comme les deux autres : sans elle, changer
+/// `PROXY_HEIGHT`/`PROXY_GOP`/l'encodeur ne régénérait JAMAIS le proxy déjà en
+/// cache (clé purement par empreinte de contenu) — seuls thumbs/waveform se
+/// refaisaient, et l'import réécrivait quand même `asset_version:
+/// ASSET_VERSION` dans le projet, faisant croire à l'interface que le proxy
+/// était à jour alors qu'il datait des anciens paramètres.
+const PROXY_VERSION: u32 = 1;
 const THUMB_VERSION: u32 = 3;
 const WAVEFORM_VERSION: u32 = 1;
 const MAX_SEGMENTS: usize = 500;
 const MAX_TEXT_OVERLAYS: usize = 64;
 const MAX_TEXT_LENGTH: usize = 200;
+/// Contrairement aux segments et aux titres, `zoompan_filter` imbrique un
+/// `if(...)` de plus par zoom dans la MÊME expression `z`/`x`/`y` — la taille
+/// et la profondeur d'imbrication croissent avec le nombre de zooms, sans
+/// borne jusqu'ici. Un montage à plusieurs milliers de zooms produirait une
+/// expression pathologique, coûteuse à parser et à évaluer image par image.
+const MAX_ZOOMS: usize = 300;
 /// Un rush = une entrée FFmpeg ouverte simultanément. Au-delà, on sature les
 /// descripteurs de fichiers et la mémoire du décodeur.
 const MAX_SOURCES: usize = 32;
+
+/// Message d'erreur distinct de tout message FFmpeg réel : l'interface le
+/// reconnaît pour ne jamais l'afficher comme un échec, juste comme une
+/// annulation demandée par l'utilisateur.
+pub const CANCELLED: &str = "__cancelled__";
+
+/// Un seul import, et un seul export, actifs à la fois depuis l'interface :
+/// un drapeau global par nature de tâche suffit, pas besoin d'identifiant de
+/// tâche. Remis à zéro au début de chaque nouvel import/export (voir
+/// `import_source_blocking`/`export_timeline_blocking`), pour qu'une
+/// annulation ne reste pas collée à la tâche suivante.
+fn import_cancel_flag() -> &'static AtomicBool {
+    static FLAG: OnceLock<AtomicBool> = OnceLock::new();
+    FLAG.get_or_init(|| AtomicBool::new(false))
+}
+
+fn export_cancel_flag() -> &'static AtomicBool {
+    static FLAG: OnceLock<AtomicBool> = OnceLock::new();
+    FLAG.get_or_init(|| AtomicBool::new(false))
+}
+
+/// Vrai le temps qu'un export tourne.
+///
+/// Le commentaire au-dessus de `import_cancel_flag` suppose qu'un seul export
+/// est actif à la fois côté interface, mais rien côté backend ne l'imposait :
+/// deux appels qui se chevauchent (double clic avant que le bouton se
+/// désactive, appel direct de la commande) partageraient le même drapeau
+/// d'annulation — l'un remettrait à zéro l'annulation demandée pour l'autre —
+/// et les mêmes fichiers temporaires (`.partial-{pid}.mp4`,
+/// `.filtergraph-{pid}.txt`), qui ne distinguent pas deux exports du MÊME
+/// processus. Ce verrou fait échouer proprement le second appel au lieu de
+/// laisser les deux se marcher dessus.
+fn export_in_progress() -> &'static AtomicBool {
+    static FLAG: OnceLock<AtomicBool> = OnceLock::new();
+    FLAG.get_or_init(|| AtomicBool::new(false))
+}
+
+/// Libère `export_in_progress` quel que soit le chemin de sortie de
+/// `export_timeline_blocking` (succès, erreur via `?`, panique).
+struct ExportInProgressGuard;
+
+impl Drop for ExportInProgressGuard {
+    fn drop(&mut self) {
+        export_in_progress().store(false, Ordering::SeqCst);
+    }
+}
+
+/// Demande l'arrêt de l'import en cours : FFmpeg est tué au prochain point de
+/// contrôle, pas seulement abandonné pendant qu'il continue en arrière-plan.
+#[tauri::command]
+pub fn cancel_import() {
+    import_cancel_flag().store(true, Ordering::SeqCst);
+}
+
+/// Même chose pour l'export en cours.
+#[tauri::command]
+pub fn cancel_export() {
+    export_cancel_flag().store(true, Ordering::SeqCst);
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -257,6 +333,16 @@ fn validate_text_overlays(overlays: &[ExportTextOverlay], duration_ms: f64) -> R
     Ok(())
 }
 
+/// Contrôle du même ordre que `validate_segments`/`validate_text_overlays` :
+/// `request.zooms` alimente directement `zoompan_filter`, qui n'imposait
+/// jusqu'ici aucune limite de son côté (voir `MAX_ZOOMS`).
+fn validate_zooms(zooms: &[ExportZoom]) -> Result<(), String> {
+    if zooms.len() > MAX_ZOOMS {
+        return Err(format!("Trop de zooms ({MAX_ZOOMS} maximum)."));
+    }
+    Ok(())
+}
+
 fn escape_filter_path(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "/")
@@ -281,9 +367,16 @@ fn escape_filter_path(path: &Path) -> String {
 /// naturellement, puisque `x` est la position du COIN de la fenêtre et qu'on la
 /// contraint entre 0 et `iw - iw/zoom`.
 fn zoompan_filter(zooms: &[ExportZoom], fps: f64) -> String {
-    let mut z_expr = String::from("1");
-    let mut x_expr = String::from("0");
-    let mut y_expr = String::from("0");
+    // Chaque zoom s'exprime en `if(condition,valeur,`, laissé OUVERT : la
+    // fermeture (une parenthèse par zoom) n'est ajoutée qu'une fois, à la fin,
+    // sur le résultat déjà assemblé. La version précédente enveloppait
+    // `format!("if(...,{z_expr})")` à chaque tour, ce qui recopiait
+    // l'intégralité de l'expression déjà construite à chaque zoom — un coût
+    // en O(n²) sur des exports à plusieurs centaines de zooms (MAX_ZOOMS).
+    let mut z_open = String::new();
+    let mut x_open = String::new();
+    let mut y_open = String::new();
+    let mut count: usize = 0;
 
     for zoom in zooms {
         let start = zoom.timeline_start_ms / 1000.0;
@@ -310,21 +403,50 @@ fn zoompan_filter(zooms: &[ExportZoom], fps: f64) -> String {
         } else {
             "1".to_string()
         };
-        let gain = format!("max(0,min({gain_in},{gain_out}))");
-        let inside = format!("between(it,{start:.6},{end:.6})");
-        z_expr = format!("if({inside},1+{delta:.6}*{gain},{z_expr})", delta = peak - 1.0);
+        let raw_gain = format!("max(0,min({gain_in},{gain_out}))");
+        // "ease" : même smoothstep que `easeGain` côté TypeScript. Inlinée
+        // trois fois plutôt que via une variable — `zoompan` n'en offre pas.
+        let gain = if zoom.easing == "ease" {
+            format!("(({raw_gain})*({raw_gain})*(3-2*({raw_gain})))")
+        } else {
+            raw_gain
+        };
+        // Bornes ouvertes des deux côtés, comme `zoomScaleAt` : à `it == start`
+        // ou `it == end` exactement, le zoom vaut 1. `between` est inclusif aux
+        // deux bornes ; sans rampe (gain constant à 1), ça collait le pic de
+        // zoom pile sur l'image de bord au lieu de l'image suivante, un
+        // décalage d'une frame invisible avec une rampe mais flagrant sans.
+        let inside = format!("gt(it,{start:.6})*lt(it,{end:.6})");
+        // "in" : part du cadre normal (1), gagne vers le pic. "out" : symétrique,
+        // part du pic, revient vers le cadre normal — même formule `base + delta*gain`.
+        let (base, delta) = if zoom.direction == "out" {
+            (peak, 1.0 - peak)
+        } else {
+            (1.0, peak - 1.0)
+        };
+        count += 1;
+        z_open.push_str(&format!("if({inside},{base:.6}+{delta:.6}*{gain},"));
 
         // Le point visé, en fraction du cadre, ramené au coin de la fenêtre.
         // `zoom` est la valeur courante calculée par le filtre lui-même.
-        x_expr = format!(
-            "if({inside},max(0,min(iw-iw/zoom,iw*{x:.6}-(iw/zoom)/2)),{x_expr})",
+        x_open.push_str(&format!(
+            "if({inside},max(0,min(iw-iw/zoom,iw*{x:.6}-(iw/zoom)/2)),",
             x = zoom.x.clamp(0.0, 1.0)
-        );
-        y_expr = format!(
-            "if({inside},max(0,min(ih-ih/zoom,ih*{y:.6}-(ih/zoom)/2)),{y_expr})",
+        ));
+        y_open.push_str(&format!(
+            "if({inside},max(0,min(ih-ih/zoom,ih*{y:.6}-(ih/zoom)/2)),",
             y = zoom.y.clamp(0.0, 1.0)
-        );
+        ));
     }
+
+    // Les zooms ne se chevauchent jamais (invariant posé côté TypeScript) :
+    // au plus une condition est vraie à la fois, donc l'ordre d'imbrication
+    // n'affecte pas le résultat, seulement lequel des `if` équivalents et
+    // mutuellement exclusifs est évalué en premier.
+    let closing: String = std::iter::repeat(')').take(count).collect();
+    let z_expr = format!("{z_open}1{closing}");
+    let x_expr = format!("{x_open}0{closing}");
+    let y_expr = format!("{y_open}0{closing}");
 
     format!(
         "zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':d=1:s={OUT_WIDTH}x{OUT_HEIGHT}:fps={fps:.3}"
@@ -353,8 +475,12 @@ fn drawtext_filter(overlay: &ExportTextOverlay, text_path: &Path, font_path: &Pa
     } else {
         alpha_factors.join("*")
     };
+    // Fenêtre visible demi-ouverte [start, end), comme la condition `hidden`
+    // côté aperçu : `between` inclut `t == end`, ce qui affichait le titre une
+    // frame de trop à la coupure quand il n'a pas de fondu pour masquer l'écart.
+    let enable = format!("gte(t,{start:.6})*lt(t,{end:.6})");
     format!(
-        "drawtext=fontfile='{font}':textfile='{text}':expansion=none:fontcolor=white:fontsize={size:.3}:text_align=C:{style}:x='w*{x:.6}-text_w/2':y='h*{y:.6}-text_h/2':alpha='{alpha}':enable='between(t,{start:.6},{end:.6})':fix_bounds=1",
+        "drawtext=fontfile='{font}':textfile='{text}':expansion=none:fontcolor=white:fontsize={size:.3}:text_align=C:{style}:x='w*{x:.6}-text_w/2':y='h*{y:.6}-text_h/2':alpha='{alpha}':enable='{enable}':fix_bounds=1",
         font = escape_filter_path(font_path),
         text = escape_filter_path(text_path),
         size = overlay.font_size_px,
@@ -642,6 +768,12 @@ pub struct ExportZoom {
     pub ramp_in_ms: f64,
     #[serde(default)]
     pub ramp_out_ms: f64,
+    /// "out" si présent ; toute autre valeur (y compris absente) vaut "in".
+    #[serde(default)]
+    pub direction: String,
+    /// "ease" si présent ; toute autre valeur (y compris absente) vaut "linear".
+    #[serde(default)]
+    pub easing: String,
 }
 
 #[derive(Deserialize)]
@@ -704,8 +836,40 @@ fn missing_tool_error(tool: &str) -> String {
     format!("{tool} est introuvable. Installe FFmpeg et vérifie qu'il est dans le PATH.")
 }
 
+/// Message d'erreur pour l'échec du LANCEMENT d'un outil (`spawn`).
+///
+/// Seule une erreur `NotFound` signifie vraiment que le binaire est absent.
+/// Bug réel corrigé : `spawn()` rapportait TOUJOURS « introuvable, vérifie le
+/// PATH », quelle que soit la cause réelle — y compris une ligne de commande
+/// trop longue pour `CreateProcess` sur Windows (limite ~32 767 caractères,
+/// atteinte par un montage chargé en zooms bien avant tout autre plafond du
+/// fichier). L'utilisateur allait alors réinstaller un binaire parfaitement
+/// présent au lieu d'apprendre la vraie cause. Toute erreur autre que
+/// `NotFound` remonte désormais le message réel de l'OS.
+fn spawn_error(tool: &str, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        missing_tool_error(tool)
+    } else {
+        format!("Lancement de {tool} impossible : {error}")
+    }
+}
+
 fn str_args(values: &[&str]) -> Vec<String> {
     values.iter().map(|s| s.to_string()).collect()
+}
+
+/// Un échec de disque plein (ou d'écriture en général) frappe l'encodage,
+/// pas l'encodeur : blâmer NVENC, le désactiver pour la session et relancer
+/// tout l'encodage en CPU ne ferait qu'échouer une seconde fois, plus
+/// lentement, pour la même raison.
+fn is_encoder_agnostic_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("no space left on device")
+        || lower.contains("disk full")
+        || lower.contains("espace disque")
+        || lower.contains("i/o error")
+        || lower.contains("permission denied")
+        || lower.contains("read-only file system")
 }
 
 fn video_encoder_args(encoder: VideoEncoder, cpu_preset: &str, quality: u8) -> Vec<String> {
@@ -748,9 +912,16 @@ fn parse_ffmpeg_time(value: &str) -> Option<f64> {
 }
 
 /// Lance ffmpeg avec `-progress pipe:1` et remonte l'avancement via `on_progress`.
+///
+/// `cancel` est vérifié à chaque ligne de progression (FFmpeg en écrit
+/// plusieurs par seconde) : dès qu'il passe à vrai, le process est tué
+/// (`kill`) plutôt qu'abandonné à tourner en arrière-plan jusqu'à sa fin
+/// naturelle — sans ça, « annuler » ne faisait que cesser d'écouter un FFmpeg
+/// qui continuait, seul, à consommer CPU/GPU pour un résultat qu'on jetait.
 fn run_ffmpeg_with_progress(
     args: &[String],
     total_ms: f64,
+    cancel: &AtomicBool,
     mut on_progress: impl FnMut(f64),
 ) -> Result<(), String> {
     let mut child = base_command(MediaTool::Ffmpeg)
@@ -758,7 +929,7 @@ fn run_ffmpeg_with_progress(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|_| missing_tool_error("FFmpeg"))?;
+        .map_err(|e| spawn_error("FFmpeg", &e))?;
 
     let stdout = child.stdout.take().ok_or("Sortie FFmpeg indisponible")?;
     let stderr = child.stderr.take();
@@ -779,7 +950,12 @@ fn run_ffmpeg_with_progress(
         tail
     });
 
+    let mut cancelled = false;
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        if cancel.load(Ordering::SeqCst) {
+            cancelled = true;
+            break;
+        }
         if let Some(value) = line.strip_prefix("out_time=") {
             if let Some(out_ms) = parse_ffmpeg_time(value) {
                 if total_ms > 0.0 {
@@ -787,6 +963,15 @@ fn run_ffmpeg_with_progress(
                 }
             }
         }
+    }
+    if !cancelled && cancel.load(Ordering::SeqCst) {
+        cancelled = true;
+    }
+    if cancelled {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr_handle.join();
+        return Err(CANCELLED.into());
     }
 
     let status = child.wait().map_err(|e| format!("FFmpeg : {e}"))?;
@@ -860,11 +1045,6 @@ fn probe_file(path: &Path) -> Result<ProbeInfo, String> {
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("Réponse FFprobe illisible : {e}"))?;
 
-    let duration_s: f64 = parsed["format"]["duration"]
-        .as_str()
-        .and_then(|d| d.parse().ok())
-        .ok_or("Durée introuvable dans le fichier.")?;
-
     let streams = parsed["streams"].as_array().ok_or("Aucun flux détecté.")?;
     let video = streams
         .iter()
@@ -872,10 +1052,26 @@ fn probe_file(path: &Path) -> Result<ProbeInfo, String> {
         .ok_or("Aucune piste vidéo détectée dans ce fichier.")?;
     let has_audio = streams.iter().any(|s| s["codec_type"] == "audio");
 
+    // `format.duration` couvre TOUT le conteneur (piste audio comprise, marge
+    // du muxer) : elle peut dépasser la durée réelle du flux vidéo de plus
+    // d'une image. Un montage coupé jusque-là fabrique un clip valide sans
+    // aucune image à exporter (FFmpeg finit par "Output file is empty").
+    // La durée du flux vidéo lui-même est la seule fiable ; `format.duration`
+    // ne sert que de repli quand le flux ne la fournit pas.
+    let duration_s: f64 = video["duration"]
+        .as_str()
+        .and_then(|d| d.parse().ok())
+        .or_else(|| {
+            parsed["format"]["duration"]
+                .as_str()
+                .and_then(|d| d.parse().ok())
+        })
+        .ok_or("Durée introuvable dans le fichier.")?;
+
     let fps = video["avg_frame_rate"]
         .as_str()
-        .or_else(|| video["r_frame_rate"].as_str())
         .and_then(parse_frame_rate)
+        .or_else(|| video["r_frame_rate"].as_str().and_then(parse_frame_rate))
         .unwrap_or(30.0);
 
     Ok(ProbeInfo {
@@ -915,7 +1111,24 @@ fn emit_import(app: &AppHandle, stage: &'static str, percent: f64) {
     let _ = app.emit("import://progress", ImportProgress { stage, percent });
 }
 
+/// Un seul import à la fois par empreinte de fichier : sans ce verrou, deux
+/// dépôts concurrents du même rush (glisser-déposer + sélection manuelle, par
+/// exemple) écriraient tous les deux dans le même `.partial.mp4` et le même
+/// dossier de vignettes, corrompant l'un des deux proxys.
+fn import_lock_for(id: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let registry = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+    registry
+        .entry(id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, String> {
+    // Remis à zéro : une annulation d'un import précédent ne doit pas tuer
+    // celui-ci avant même qu'il commence.
+    import_cancel_flag().store(false, Ordering::SeqCst);
     let source = PathBuf::from(path);
     if !source.is_file() {
         return Err("Ce fichier n'existe pas ou n'est pas accessible.".into());
@@ -936,15 +1149,18 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
     emit_import(app, "hash", 5.0);
     let id = quick_fingerprint(&source)?;
 
+    let lock = import_lock_for(&id);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
     emit_import(app, "probe", 10.0);
     let probe = probe_file(&source)?;
 
     // 1) Proxy de montage (réutilisé s'il existe déjà pour cette source).
     let proxies_dir = root.join("proxies");
     ensure_dir(&proxies_dir)?;
-    let proxy_path = proxies_dir.join(format!("{id}.mp4"));
+    let proxy_path = proxies_dir.join(format!("{id}-v{PROXY_VERSION}.mp4"));
     if !proxy_path.is_file() {
-        let partial = proxies_dir.join(format!("{id}.partial.mp4"));
+        let partial = proxies_dir.join(format!("{id}-v{PROXY_VERSION}.partial.mp4"));
         let _ = fs::remove_file(&partial);
         let mut args: Vec<String> =
             str_args(&["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
@@ -977,14 +1193,26 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
         ]));
         args.push(partial.to_str().ok_or("Chemin proxy invalide.")?.into());
 
-        let first_result = run_ffmpeg_with_progress(&args, probe.duration_ms, |p| {
-            emit_import(app, "proxy", 10.0 + p * 0.6);
-        });
+        let first_result = run_ffmpeg_with_progress(
+            &args,
+            probe.duration_ms,
+            import_cancel_flag(),
+            |p| {
+                emit_import(app, "proxy", 10.0 + p * 0.6);
+            },
+        );
         if let Err(nvenc_error) = first_result {
-            if encoder != VideoEncoder::H264Nvenc {
+            let _ = fs::remove_file(&partial);
+            // Une annulation ne se rattrape jamais par un repli CPU : elle doit
+            // arrêter l'import net, pas relancer un second encodage. Pareil pour
+            // une panne qui ne vient pas de l'encodeur (disque plein, permissions…) :
+            // le CPU échouerait pour la même raison, après avoir tout refait.
+            if nvenc_error == CANCELLED
+                || encoder != VideoEncoder::H264Nvenc
+                || is_encoder_agnostic_failure(&nvenc_error)
+            {
                 return Err(nvenc_error);
             }
-            let _ = fs::remove_file(&partial);
             hardware::disable_nvenc(
                 "NVENC a échoué pendant la création d'un proxy ; repli CPU pour cette session.",
             );
@@ -993,13 +1221,23 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
                 encoder_start..encoder_end,
                 video_encoder_args(VideoEncoder::Libx264, "veryfast", 23),
             );
-            run_ffmpeg_with_progress(&cpu_args, probe.duration_ms, |p| {
-                emit_import(app, "proxy", 10.0 + p * 0.6);
-            })
+            run_ffmpeg_with_progress(
+                &cpu_args,
+                probe.duration_ms,
+                import_cancel_flag(),
+                |p| {
+                    emit_import(app, "proxy", 10.0 + p * 0.6);
+                },
+            )
             .map_err(|cpu_error| {
-                format!(
-                    "NVENC puis l'encodage CPU ont échoué.\nNVENC : {nvenc_error}\nCPU : {cpu_error}"
-                )
+                let _ = fs::remove_file(&partial);
+                if cpu_error == CANCELLED {
+                    cpu_error
+                } else {
+                    format!(
+                        "NVENC puis l'encodage CPU ont échoué.\nNVENC : {nvenc_error}\nCPU : {cpu_error}"
+                    )
+                }
             })?;
         }
         fs::rename(&partial, &proxy_path)
@@ -1022,8 +1260,15 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
     let thumb_paths = if thumbs_dir.is_dir() && count_jpgs(&thumbs_dir) > 0 {
         list_jpgs(&thumbs_dir)
     } else {
-        ensure_dir(&thumbs_dir)?;
-        let pattern = thumbs_dir.join("%05d.jpg");
+        // Comme le proxy : générées dans un dossier temporaire puis renommées
+        // d'un coup. Écrire directement dans `thumbs_dir` laissait un import
+        // annulé en cours de route (`cancel_import`) derrière un lot de
+        // vignettes partiel, que le check de cache ci-dessus prenait ensuite
+        // pour un import complet — sans jamais le régénérer.
+        let partial_thumbs_dir = root.join("thumbs").join(format!("{id}-v{THUMB_VERSION}.partial"));
+        let _ = fs::remove_dir_all(&partial_thumbs_dir);
+        ensure_dir(&partial_thumbs_dir)?;
+        let pattern = partial_thumbs_dir.join("%05d.jpg");
         let mut args: Vec<String> =
             str_args(&["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
         args.push("-i".into());
@@ -1039,9 +1284,15 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
         ));
         args.extend(str_args(&["-q:v", "4", "-progress", "pipe:1", "-nostats"]));
         args.push(pattern.to_str().ok_or("Chemin vignettes invalide.")?.into());
-        run_ffmpeg_with_progress(&args, probe.duration_ms, |p| {
+        if let Err(e) = run_ffmpeg_with_progress(&args, probe.duration_ms, import_cancel_flag(), |p| {
             emit_import(app, "thumbs", 72.0 + p * 0.18);
-        })?;
+        }) {
+            let _ = fs::remove_dir_all(&partial_thumbs_dir);
+            return Err(e);
+        }
+        let _ = fs::remove_dir_all(&thumbs_dir);
+        fs::rename(&partial_thumbs_dir, &thumbs_dir)
+            .map_err(|e| format!("Finalisation des vignettes impossible : {e}"))?;
         list_jpgs(&thumbs_dir)
     };
 
@@ -1053,6 +1304,12 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
         let waveform = waveforms_dir.join(format!("{id}-w{WAVEFORM_VERSION}.png"));
         if !waveform.is_file() {
             let width = ((probe.duration_ms / 1000.0 * 30.0) as u32).clamp(900, 24000);
+            // Comme le proxy et les vignettes : écrite à part puis renommée.
+            // `showwavespic` n'émet son unique image qu'à la toute fin du
+            // décodage — un import annulé en cours de route pouvait laisser un
+            // PNG tronqué que `is_file()` prenait pour une waveform complète.
+            let partial_waveform = waveforms_dir.join(format!("{id}-w{WAVEFORM_VERSION}.partial.png"));
+            let _ = fs::remove_file(&partial_waveform);
             let mut args: Vec<String> =
                 str_args(&["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
             args.push("-i".into());
@@ -1064,9 +1321,14 @@ fn import_source_blocking(app: &AppHandle, path: &str) -> Result<SourceInfo, Str
                 "aformat=channel_layouts=mono,showwavespic=s={width}x120:colors=#7aa4ff:scale=sqrt"
             ));
             args.extend(str_args(&["-frames:v", "1"]));
-            args.push(waveform.to_str().ok_or("Chemin waveform invalide.")?.into());
+            args.push(partial_waveform.to_str().ok_or("Chemin waveform invalide.")?.into());
             // Pas de suivi de progression nécessaire : c'est très rapide.
-            run_ffmpeg_with_progress(&args, 0.0, |_| {})?;
+            if let Err(e) = run_ffmpeg_with_progress(&args, 0.0, import_cancel_flag(), |_| {}) {
+                let _ = fs::remove_file(&partial_waveform);
+                return Err(e);
+            }
+            fs::rename(&partial_waveform, &waveform)
+                .map_err(|e| format!("Finalisation de la waveform impossible : {e}"))?;
         }
         Some(waveform.to_string_lossy().to_string())
     } else {
@@ -1115,6 +1377,13 @@ pub async fn export_timeline(app: AppHandle, request: ExportRequest) -> Result<S
 }
 
 fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<String, String> {
+    if export_in_progress().swap(true, Ordering::SeqCst) {
+        return Err("Un export est déjà en cours.".into());
+    }
+    let _guard = ExportInProgressGuard;
+    // Remis à zéro : une annulation d'un export précédent ne doit pas tuer
+    // celui-ci avant même qu'il commence.
+    export_cancel_flag().store(false, Ordering::SeqCst);
     // Validation stricte des entrées avant toute construction de commande.
     if request.segments.is_empty() {
         return Err("Aucun clip à exporter.".into());
@@ -1139,10 +1408,13 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     if request.mode != "crop" && request.mode != "blur" {
         return Err("Mode d'export inconnu.".into());
     }
-    let name_ok = !request.file_name.is_empty()
-        && request.file_name.len() <= 60
-        && request
-            .file_name
+    // Validé sur la forme TRIM.EE : c'est elle qui finit dans le nom de
+    // fichier plus bas, sinon un nom fait uniquement d'espaces passait la
+    // validation puis produisait un fichier littéralement nommé « .mp4 ».
+    let trimmed_name = request.file_name.trim();
+    let name_ok = !trimmed_name.is_empty()
+        && trimmed_name.len() <= 60
+        && trimmed_name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '_' || c == '-');
     if !name_ok {
@@ -1161,10 +1433,10 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
 
     let exports_dir = data_root(app)?.join("exports");
     ensure_dir(&exports_dir)?;
-    let mut output = exports_dir.join(format!("{}.mp4", request.file_name.trim()));
+    let mut output = exports_dir.join(format!("{trimmed_name}.mp4"));
     let mut counter = 2;
     while output.exists() {
-        output = exports_dir.join(format!("{} ({counter}).mp4", request.file_name.trim()));
+        output = exports_dir.join(format!("{trimmed_name} ({counter}).mp4"));
         counter += 1;
     }
 
@@ -1178,6 +1450,7 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     let total_video_ms: f64 = request.segments.iter().map(timeline_ms).sum();
     let total_audio_ms: f64 = request.audio_segments.iter().map(timeline_ms).sum();
     validate_text_overlays(&request.text_overlays, total_video_ms)?;
+    validate_zooms(&request.zooms)?;
 
     let (regular_font, bold_font) = if request.text_overlays.is_empty() {
         (PathBuf::new(), PathBuf::new())
@@ -1221,6 +1494,38 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     let black_input = n_sources;
     let silence_input = n_sources + if has_gap { 1 } else { 0 };
 
+    // Sans seek d'entrée, FFmpeg décoderait chaque rush depuis l'image 0 avant
+    // de jeter tout ce qui précède le `trim` du filtre — sur un rush de
+    // plusieurs heures, un extrait de fin décoderait des heures pour rien.
+    // On avance donc chaque `-i` juste avant le point le plus tôt réellement
+    // lu sur cette source (vidéo ET son confondus), puis on décale d'autant
+    // les bornes passées aux filtres `trim`/`atrim`, qui lisent le flux déjà
+    // décalé et non plus le fichier depuis son origine.
+    let mut seek_offsets = vec![f64::INFINITY; n_sources];
+    for segment in &request.segments {
+        let prefix_ms = segment.transition_in_ms / 2.0;
+        let rate = segment.playback_rate;
+        let raw_start = if video_fade_filter(segment, prefix_ms).is_empty() {
+            (segment.src_in_ms - prefix_ms * rate) / 1000.0
+        } else {
+            (segment.src_in_ms - segment.video_fade_offset_ms * rate - prefix_ms * rate) / 1000.0
+        };
+        let slot = &mut seek_offsets[segment.source_index];
+        *slot = slot.min(raw_start);
+    }
+    for segment in &request.audio_segments {
+        let prefix_ms = segment.transition_in_ms / 2.0;
+        let raw_start = (segment.src_in_ms - prefix_ms * segment.playback_rate) / 1000.0;
+        let slot = &mut seek_offsets[segment.source_index];
+        *slot = slot.min(raw_start);
+    }
+    // Petite marge de sécurité contre un arrondi qui ferait tomber un `trim`
+    // juste sous zéro une fois décalé.
+    let seek_offsets: Vec<f64> = seek_offsets
+        .into_iter()
+        .map(|start| if start.is_finite() { (start - 0.05).max(0.0) } else { 0.0 })
+        .collect();
+
     // `concat` exige des flux homogènes : même définition, même format de pixel,
     // même SAR, même format audio. Chaque segment est donc amené AU FORMAT DE
     // SORTIE avant d'être concaténé, cadrage compris : le décalage de cadrage
@@ -1257,9 +1562,10 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
             .get(segment_index + 1)
             .map(|next| next.transition_in_ms / 2.0)
             .unwrap_or(0.0);
-        let start = (segment.src_in_ms - prefix_ms * segment.playback_rate) / 1000.0;
-        let end = (segment.src_out_ms + suffix_ms * segment.playback_rate) / 1000.0;
         let input = segment.source_index;
+        let seek = seek_offsets[input];
+        let start = (segment.src_in_ms - prefix_ms * segment.playback_rate) / 1000.0 - seek;
+        let end = (segment.src_out_ms + suffix_ms * segment.playback_rate) / 1000.0 - seek;
         let rate = segment.playback_rate;
         let i = next_label;
         // setpts=PTS/rate : accélérer revient à rapprocher les horodatages.
@@ -1273,9 +1579,10 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
             let offset = segment.video_fade_offset_ms / 1000.0;
             let duration = (segment.src_out_ms - segment.src_in_ms) / rate / 1000.0
                 + (prefix_ms + suffix_ms) / 1000.0;
-            let clip_start =
-                (segment.src_in_ms - segment.video_fade_offset_ms * rate - prefix_ms * rate)
-                    / 1000.0;
+            let clip_start = (segment.src_in_ms - segment.video_fade_offset_ms * rate
+                - prefix_ms * rate)
+                / 1000.0
+                - seek;
             let clip_end = clip_start
                 + (segment.video_clip_duration_ms + prefix_ms + suffix_ms) * rate / 1000.0;
             let extract_end = offset + duration;
@@ -1318,9 +1625,10 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
                 .get(request_index + 1)
                 .map(|next| next.transition_in_ms / 2.0)
                 .unwrap_or(0.0);
-            let start = (segment.src_in_ms - prefix_ms * segment.playback_rate) / 1000.0;
-            let end = (segment.src_out_ms + suffix_ms * segment.playback_rate) / 1000.0;
             let input = segment.source_index;
+            let seek = seek_offsets[input];
+            let start = (segment.src_in_ms - prefix_ms * segment.playback_rate) / 1000.0 - seek;
+            let end = (segment.src_out_ms + suffix_ms * segment.playback_rate) / 1000.0 - seek;
             let duration =
                 (segment.src_out_ms - segment.src_in_ms) / segment.playback_rate / 1000.0
                     + (prefix_ms + suffix_ms) / 1000.0;
@@ -1402,9 +1710,35 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     let partial = exports_dir.join(format!(".partial-{}.mp4", std::process::id()));
     let _ = fs::remove_file(&partial);
 
+    // Le graphe passe par un FICHIER (`-filter_complex_script`), jamais en
+    // ligne de commande (`-filter_complex <graphe>`).
+    //
+    // `Command::args` sur Windows assemble tous les arguments en UNE seule
+    // chaîne pour `CreateProcess`, plafonnée à 32 767 caractères par l'OS — en
+    // pratique un peu moins une fois l'exécutable et les guillemets comptés.
+    // Un montage chargé en zooms (l'expression `zoompan` s'allonge à chaque
+    // zoom, elle n'est jamais bornée comme `MAX_SEGMENTS`) dépassait cette
+    // limite dès 100 à 110 zooms, bien avant tout autre plafond du fichier.
+    // `-filter_complex_script` lit exactement le même graphe, à la même
+    // syntaxe, mais depuis le disque : la ligne de commande reste minuscule
+    // quelle que soit la taille du montage.
+    let filter_script_path =
+        exports_dir.join(format!(".filtergraph-{}.txt", std::process::id()));
+    fs::write(&filter_script_path, &graph)
+        .map_err(|e| format!("Écriture du graphe de filtres impossible : {e}"))?;
+    temporary_text_files.0.push(filter_script_path.clone());
+
     let mut args: Vec<String> = str_args(&["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
-    // Les rushs d'abord, dans l'ordre exact référencé par les segments.
-    for source in &request.sources {
+    // Les rushs d'abord, dans l'ordre exact référencé par les segments. Le
+    // `-ss` place avant `-i` est un seek d'ENTRÉE : FFmpeg saute au mot-clé le
+    // plus proche puis décode en avant jusqu'au point exact, au lieu de
+    // décoder tout le fichier depuis l'image 0 avant que le filtre `trim` n'en
+    // jette le début.
+    for (index, source) in request.sources.iter().enumerate() {
+        let seek = seek_offsets[index];
+        if seek > 0.0 {
+            args.extend(["-ss".into(), format!("{seek:.6}")]);
+        }
         args.extend(["-i".into(), source.path.clone()]);
     }
     if has_gap {
@@ -1425,8 +1759,8 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
         ]);
     }
     args.extend([
-        "-filter_complex".into(),
-        graph,
+        "-filter_complex_script".into(),
+        filter_script_path.to_string_lossy().to_string(),
         "-map".into(),
         format!("[{video_output_label}]"),
     ]);
@@ -1464,10 +1798,18 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
     };
 
     emit(0.0, false, None);
-    let first_result = run_ffmpeg_with_progress(&args, total_ms, |p| emit(p, false, None));
+    let first_result =
+        run_ffmpeg_with_progress(&args, total_ms, export_cancel_flag(), |p| emit(p, false, None));
     if let Err(nvenc_error) = first_result {
         let _ = fs::remove_file(&partial);
-        if encoder != VideoEncoder::H264Nvenc {
+        // Une annulation ne se rattrape jamais par un repli CPU : elle doit
+        // arrêter l'export net, pas relancer un second encodage. Pareil pour
+        // une panne qui ne vient pas de l'encodeur (disque plein, permissions…) :
+        // le CPU échouerait pour la même raison, après avoir tout refait.
+        if nvenc_error == CANCELLED
+            || encoder != VideoEncoder::H264Nvenc
+            || is_encoder_agnostic_failure(&nvenc_error)
+        {
             return Err(nvenc_error);
         }
         hardware::disable_nvenc("NVENC a échoué pendant un export ; repli CPU pour cette session.");
@@ -1477,14 +1819,19 @@ fn export_timeline_blocking(app: &AppHandle, request: &ExportRequest) -> Result<
             video_encoder_args(VideoEncoder::Libx264, "fast", 19),
         );
         emit(0.0, false, None);
-        run_ffmpeg_with_progress(&cpu_args, total_ms, |p| emit(p, false, None)).map_err(
-            |cpu_error| {
-                let _ = fs::remove_file(&partial);
+        run_ffmpeg_with_progress(&cpu_args, total_ms, export_cancel_flag(), |p| {
+            emit(p, false, None)
+        })
+        .map_err(|cpu_error| {
+            let _ = fs::remove_file(&partial);
+            if cpu_error == CANCELLED {
+                cpu_error
+            } else {
                 format!(
                     "NVENC puis l'encodage CPU ont échoué.\nNVENC : {nvenc_error}\nCPU : {cpu_error}"
                 )
-            },
-        )?;
+            }
+        })?;
     }
 
     fs::rename(&partial, &output)
@@ -1798,16 +2145,18 @@ mod tests {
                 y: 0.25,
                 ramp_in_ms: 500.0,
                 ramp_out_ms: 500.0,
+                direction: String::new(),
+                easing: String::new(),
             }],
             30.0,
         );
-        assert!(filter.contains("between(it,1.000000,3.000000)"));
+        assert!(filter.contains("gt(it,1.000000)*lt(it,3.000000)"));
         assert!(filter.contains("min(1,(it-1.000000)/0.500000)"));
         assert!(filter.contains("min(1,(3.000000-it)/0.500000)"));
         // Hors des bornes, la valeur de repli est 1 : la vue d'avant est
         // retrouvee a l'identique, pas approchee.
         assert!(filter.ends_with(":d=1:s=1080x1920:fps=30.000"));
-        assert!(filter.contains("1+1.000000*"));
+        assert!(filter.contains("1.000000+1.000000*"));
         // Le coin de la fenetre est borne : viser un bord ne fait jamais
         // entrer de noir dans le cadre.
         assert!(filter.contains("max(0,min(iw-iw/zoom,iw*0.750000-(iw/zoom)/2))"));
@@ -1827,11 +2176,53 @@ mod tests {
                 y: 0.5,
                 ramp_in_ms: 0.0,
                 ramp_out_ms: 0.0,
+                direction: String::new(),
+                easing: String::new(),
             }],
             30.0,
         );
         assert!(!filter.contains("/0.000000"));
         assert!(filter.contains("max(0,min(1,1))"));
+    }
+
+    #[test]
+    fn le_zoom_out_part_du_pic_et_revient_au_cadre_normal() {
+        // Symetrique du zoom "in" : base = pic, delta = 1 - pic, au lieu de
+        // base = 1, delta = pic - 1.
+        let filter = zoompan_filter(
+            &[ExportZoom {
+                timeline_start_ms: 0.0,
+                timeline_end_ms: 1000.0,
+                scale: 2.0,
+                x: 0.5,
+                y: 0.5,
+                ramp_in_ms: 200.0,
+                ramp_out_ms: 200.0,
+                direction: "out".to_string(),
+                easing: String::new(),
+            }],
+            30.0,
+        );
+        assert!(filter.contains("2.000000+-1.000000*"));
+    }
+
+    #[test]
+    fn le_zoom_ease_adoucit_le_gain_par_un_smoothstep() {
+        let filter = zoompan_filter(
+            &[ExportZoom {
+                timeline_start_ms: 0.0,
+                timeline_end_ms: 1000.0,
+                scale: 2.0,
+                x: 0.5,
+                y: 0.5,
+                ramp_in_ms: 200.0,
+                ramp_out_ms: 200.0,
+                direction: String::new(),
+                easing: "ease".to_string(),
+            }],
+            30.0,
+        );
+        assert!(filter.contains("*(3-2*("));
     }
 
     #[test]
@@ -1849,6 +2240,8 @@ mod tests {
                 y: 0.5,
                 ramp_in_ms: 5000.0,
                 ramp_out_ms: 5000.0,
+                direction: String::new(),
+                easing: String::new(),
             }],
             30.0,
         );
@@ -1873,7 +2266,7 @@ mod tests {
         assert!(filter.contains("fontfile='C\\:/Windows/Fonts/segoeuib.ttf'"));
         assert!(filter.contains("text_align=C"));
         assert!(filter.contains("alpha='1'"));
-        assert!(filter.contains("enable='between(t,0.500000,2.500000)'"));
+        assert!(filter.contains("enable='gte(t,0.500000)*lt(t,2.500000)'"));
     }
 
     #[test]
@@ -1919,5 +2312,69 @@ mod tests {
             audio_volume_filter(&segment, 250.0),
             "volume='0.800000*min(1,max(0,(t+0.250000)/1.000000))*min(1,max(0,(5.000000-0.250000-t)/2.000000))':eval=frame"
         );
+    }
+
+    #[test]
+    fn cent_dix_zooms_depassent_a_eux_seuls_la_limite_windows() {
+        // Chiffres du bug réel : la ligne de commande que Windows passe à
+        // `CreateProcess` est plafonnée à 32 767 caractères, et en pratique
+        // l'échec constaté survenait entre 30 004 et 32 754 une fois le reste
+        // de la commande compté (chemins des rushs, chaîne de concaténation,
+        // etc.). Ce test mesure que ~110 zooms SEULS — bien avant MAX_SEGMENTS
+        // (500) — suffisent, à eux seuls, à franchir le bas de cette fenêtre
+        // d'échec : le reste de la commande n'a besoin d'ajouter presque rien
+        // pour basculer. C'est justement pour ça que le graphe passe désormais
+        // par un fichier (`-filter_complex_script`) : sa taille ne dépend plus
+        // de rien ici, quel que soit le nombre de zooms.
+        let zooms: Vec<ExportZoom> = (0..110)
+            .map(|i| {
+                let start = i as f64 * 1000.0;
+                ExportZoom {
+                    timeline_start_ms: start,
+                    timeline_end_ms: start + 900.0,
+                    scale: 1.6,
+                    x: 0.5,
+                    y: 0.5,
+                    ramp_in_ms: 400.0,
+                    ramp_out_ms: 400.0,
+                    direction: String::new(),
+                    easing: String::new(),
+                }
+            })
+            .collect();
+        let filter = zoompan_filter(&zooms, 30.0);
+        const OBSERVED_FAILURE_FLOOR: usize = 30_004;
+        assert!(
+            filter.len() > OBSERVED_FAILURE_FLOOR,
+            "attendu > {OBSERVED_FAILURE_FLOOR} caractères (bas de la fenêtre d'échec \
+             observée), obtenu {} — ajuster le nombre de zooms si `zoompan_filter` \
+             change de forme",
+            filter.len()
+        );
+    }
+
+    #[test]
+    fn spawn_error_ne_blame_ffmpeg_que_si_le_binaire_manque_vraiment() {
+        // Bug réel corrigé : `spawn()` rapportait TOUJOURS « FFmpeg
+        // introuvable, vérifie le PATH », quelle que soit la cause — y compris
+        // une ligne de commande trop longue pour `CreateProcess`, dont l'erreur
+        // OS réelle sur Windows est « le nom de fichier ou l'extension est trop
+        // long » (ERROR_FILENAME_EXCED_RANGE), pas « fichier introuvable ».
+        let vraiment_absent =
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no such file or directory");
+        assert_eq!(
+            spawn_error("FFmpeg", &vraiment_absent),
+            "FFmpeg est introuvable. Installe FFmpeg et vérifie qu'il est dans le PATH."
+        );
+
+        // N'importe quelle autre cause doit remonter le message réel de l'OS,
+        // pas la fausse piste « introuvable ».
+        let ligne_trop_longue = std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "The filename or extension is too long. (os error 206)",
+        );
+        let message = spawn_error("FFmpeg", &ligne_trop_longue);
+        assert!(!message.contains("introuvable"));
+        assert!(message.contains("too long"));
     }
 }

@@ -7,7 +7,7 @@
 // absents — n'est pas grisée, elle n'est pas affichée : un menu court se lit
 // plus vite qu'un menu majoritairement inerte.
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useFloatingMenu } from "../hooks/useFloatingMenu";
 import { Icon, type IconName } from "./Icon";
 import type { EditorAction } from "../state/editor";
 import type { Clip } from "../types";
@@ -30,14 +30,32 @@ interface Props {
   canPaste: boolean;
   /** Faux sur le dernier clip du montage : le réducteur en garde toujours un. */
   canDelete: boolean;
+  /**
+   * Piste du clip verrouillée : le réducteur refuse silencieusement toute
+   * action qui le modifierait (voir `clipIsLocked` dans editor.ts). Une entrée
+   * qui ne ferait rien ne doit pas apparaître, au même titre qu'un fondu déjà
+   * absent — sans ce garde, le menu affichait « Supprimer », « Couper ici »
+   * et consorts sur un clip verrouillé, actifs en apparence mais inertes au clic.
+   */
+  locked: boolean;
   onClose: () => void;
   dispatch: (action: EditorAction) => void;
+  /**
+   * Ouvre le menu de coupe étendue (SplitMenu) à la même position, avec ce
+   * clip précoché. Distinct d'une simple `action` : ce n'est pas un dispatch
+   * direct, mais une seconde étape où choisir quels titres/zooms/autres rushs
+   * couper avec lui, en une seule entrée d'historique.
+   */
+  onExtendSplit: () => void;
 }
 
 interface Entry {
   icon: IconName;
   label: string;
-  action: EditorAction;
+  /** Dispatché directement au clic. Absent quand `onSelect` ouvre autre chose. */
+  action?: EditorAction;
+  /** Remplace `action` : une étape supplémentaire plutôt qu'un dispatch direct. */
+  onSelect?: () => void;
   /** Raccourci équivalent, affiché à droite. Uniquement s'il fait EXACTEMENT
    *  la même chose : annoncer « S » sur une découpe au pointeur alors que la
    *  touche coupe au playhead serait un mensonge. */
@@ -53,60 +71,12 @@ export function ClipMenu({
   canSplit,
   canPaste,
   canDelete,
+  locked,
   onClose,
   dispatch,
+  onExtendSplit,
 }: Props) {
-  const ref = useRef<HTMLDivElement | null>(null);
-  /** Position corrigée : le menu se retourne plutôt que de sortir de l'écran. */
-  const [placement, setPlacement] = useState({ left: target.x, top: target.y });
-
-  // En layout : la correction doit être appliquée AVANT la peinture, sinon le
-  // menu s'affiche une image au mauvais endroit puis saute.
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const { width, height } = el.getBoundingClientRect();
-    const margin = 8;
-    const left =
-      target.x + width + margin > window.innerWidth
-        ? Math.max(margin, target.x - width)
-        : target.x;
-    const top =
-      target.y + height + margin > window.innerHeight
-        ? Math.max(margin, target.y - height)
-        : target.y;
-    setPlacement({ left, top });
-  }, [target.x, target.y]);
-
-  // Fermeture au clic extérieur, à Échap et au défilement : un menu contextuel
-  // qui reste accroché pendant que la timeline défile pointe le vide.
-  useEffect(() => {
-    const abort = new AbortController();
-    // EN CAPTURE, impérativement. Les gestes de la timeline appellent
-    // `stopPropagation()` sur leur événement React, ce qui arrête aussi
-    // l'événement natif au conteneur racine : en phase de bulle, la fenêtre ne
-    // voyait jamais le clic et le menu restait ouvert. La capture passe avant
-    // tout gestionnaire, donc avant toute possibilité d'être interrompue.
-    const options = { signal: abort.signal, capture: true } as const;
-    window.addEventListener(
-      "pointerdown",
-      (event: PointerEvent) => {
-        if (!ref.current?.contains(event.target as Node)) onClose();
-      },
-      options,
-    );
-    window.addEventListener(
-      "keydown",
-      (event: KeyboardEvent) => {
-        if (event.key === "Escape") onClose();
-      },
-      options,
-    );
-    window.addEventListener("wheel", () => onClose(), options);
-    // Redimensionner la fenêtre laisserait le menu accroché dans le vide.
-    window.addEventListener("resize", () => onClose(), options);
-    return () => abort.abort();
-  }, [onClose]);
+  const { ref, placement } = useFloatingMenu<HTMLDivElement>(target.x, target.y, onClose);
 
   const entries: Entry[] = [];
   entries.push({
@@ -129,14 +99,19 @@ export function ClipMenu({
       action: { type: "PASTE_CLIP", atMs: target.timelineMs },
     });
   }
-  if (canSplit) {
+  if (canSplit && !locked) {
     entries.push({
       icon: "split",
       label: "Couper ici",
       action: { type: "SPLIT_AT", timelineMs: target.timelineMs },
     });
+    entries.push({
+      icon: "layers",
+      label: "Couper ici et étendre…",
+      onSelect: onExtendSplit,
+    });
   }
-  if (canDelete) {
+  if (canDelete && !locked) {
     entries.push({
       icon: "trash",
       label: "Supprimer",
@@ -146,40 +121,42 @@ export function ClipMenu({
     });
   }
 
-  entries.push({
-    icon: clip.audioEnabled ? "soundOff" : "sound",
-    label: clip.audioEnabled ? "Couper le son" : "Rendre le son",
-    shortcut: "M",
-    action: { type: "TOGGLE_CLIP_AUDIO", clipId: clip.id },
-    group: true,
-  });
-  entries.push({
-    icon: "layers",
-    label: "Nouvelle piste au-dessus",
-    action: { type: "CLIP_TO_NEW_TRACK", clipId: clip.id },
-  });
-  if (clip.playbackRate !== 1) {
+  if (!locked) {
+    entries.push({
+      icon: clip.audioEnabled ? "soundOff" : "sound",
+      label: clip.audioEnabled ? "Couper le son" : "Rendre le son",
+      shortcut: "M",
+      action: { type: "TOGGLE_CLIP_AUDIO", clipId: clip.id },
+      group: true,
+    });
+    entries.push({
+      icon: "layers",
+      label: "Nouvelle piste au-dessus",
+      action: { type: "CLIP_TO_NEW_TRACK", clipId: clip.id },
+    });
+  }
+  if (clip.playbackRate !== 1 && !locked) {
     entries.push({
       icon: "frame",
       label: "Vitesse 1×",
       action: { type: "SET_CLIP_RATE", clipId: clip.id, rate: 1 },
     });
   }
-  if (clip.cropX !== 0) {
+  if (clip.cropX !== 0 && !locked) {
     entries.push({
       icon: "crop",
       label: "Recentrer",
       action: { type: "SET_CLIP_CROP_X", clipId: clip.id, cropX: 0 },
     });
   }
-  if (clip.videoFadeInMs > 0 || clip.videoFadeOutMs > 0) {
+  if ((clip.videoFadeInMs > 0 || clip.videoFadeOutMs > 0) && !locked) {
     entries.push({
       icon: "frame",
       label: "Sans fondu vidéo",
       action: { type: "SET_CLIP_VIDEO_FADE", clipId: clip.id, side: "both", fadeMs: 0 },
     });
   }
-  if (clip.audioFadeInMs > 0 || clip.audioFadeOutMs > 0) {
+  if ((clip.audioFadeInMs > 0 || clip.audioFadeOutMs > 0) && !locked) {
     entries.push({
       icon: "volume",
       label: "Sans fondu audio",
@@ -203,7 +180,8 @@ export function ClipMenu({
             "menu-item" + (entry.danger ? " warn" : "") + (entry.group ? " group" : "")
           }
           onClick={() => {
-            dispatch(entry.action);
+            if (entry.onSelect) entry.onSelect();
+            else if (entry.action) dispatch(entry.action);
             onClose();
           }}
         >

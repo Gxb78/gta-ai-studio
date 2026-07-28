@@ -1,7 +1,7 @@
 // Écran d'accueil : choisir un rush et suivre la préparation (proxy, vignettes).
 
 import { useEffect, useRef, useState } from "react";
-import { importSource, onImportProgress, pickVideoFile } from "../ipc";
+import { CANCELLED, cancelImport, importSource, onImportProgress, pickVideoFile } from "../ipc";
 import type { ImportProgress, SourceInfo } from "../types";
 import { Icon } from "./Icon";
 
@@ -20,9 +20,17 @@ interface Props {
   /** Import déclenché par un dépôt de fichiers, piloté par App. */
   droppedBusy: boolean;
   droppedProgress: ImportProgress | null;
+  /** Le dernier projet n'a pas pu être repris au démarrage (piloté par App). */
+  startupError?: string | null;
 }
 
-export function ImportView({ onImported, onOpenProjects, droppedBusy, droppedProgress }: Props) {
+export function ImportView({
+  onImported,
+  onOpenProjects,
+  droppedBusy,
+  droppedProgress,
+  startupError,
+}: Props) {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState<ImportProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -50,7 +58,9 @@ export function ImportView({ onImported, onOpenProjects, droppedBusy, droppedPro
       const source = await importSource(path);
       onImported(source);
     } catch (e) {
-      setError(String(e));
+      // Une annulation n'est pas un échec : FFmpeg a été tué à la demande de
+      // l'utilisateur, il n'y a rien à lui signaler comme une erreur.
+      if (String(e) !== CANCELLED) setError(String(e));
     } finally {
       setBusy(false);
       setProgress(null);
@@ -92,21 +102,33 @@ export function ImportView({ onImported, onOpenProjects, droppedBusy, droppedPro
           </>
         )}
 
-        {working && shown && (
+        {working && (
           <div className="import-progress">
-            <div className="progress-track">
-              <div
-                className="progress-fill"
-                style={{ width: `${Math.round(shown.percent)}%` }}
-              />
-            </div>
-            <span className="muted">
-              {STAGE_LABELS[shown.stage]} {Math.round(shown.percent)} %
-            </span>
+            {shown && (
+              <>
+                <div className="progress-track">
+                  <div
+                    className="progress-fill"
+                    style={{ width: `${Math.round(shown.percent)}%` }}
+                  />
+                </div>
+                <span className="muted">
+                  {STAGE_LABELS[shown.stage]} {Math.round(shown.percent)} %
+                </span>
+              </>
+            )}
+            {/* Occupé dès le dépôt, avant même la première progression reçue :
+                le bouton doit exister tout de suite, sinon rien ne permet
+                d'annuler pendant cette fenêtre. */}
+            <button className="ghost small" onClick={() => void cancelImport()}>
+              <Icon name="close" size={14} />
+              Annuler
+            </button>
           </div>
         )}
 
         {error && <p className="error">{error}</p>}
+        {startupError && <p className="error">{startupError}</p>}
       </div>
     </div>
   );

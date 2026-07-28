@@ -10,6 +10,7 @@
 
 import { Icon } from "./Icon";
 import { InspectorSection } from "./InspectorSection";
+import { useDebouncedSlider } from "../hooks/useDebouncedSlider";
 import type { ZoomRegion } from "../types";
 import {
   MAX_ZOOM_RAMP_MS,
@@ -33,6 +34,23 @@ export function ZoomInspector({ zoom, durationMs, onUpdate, onDelete, onCollapse
   const maxRampMs = clampZoomRampMs(MAX_ZOOM_RAMP_MS, zoomDurationMs) || MAX_ZOOM_RAMP_MS;
   const rampLabel = (rampMs: number): string =>
     rampMs === 0 ? "Instantané" : `${(rampMs / 1000).toFixed(rampMs % 1000 === 0 ? 0 : 2)} s`;
+
+  // Un curseur par réglage, chacun ne committant qu'une fois relâché ou
+  // resté silencieux (voir useDebouncedSlider) : sans ça, tirer l'agrandissement
+  // ou une rampe empile une entrée d'historique par tick de la souris.
+  const scaleSlider = useDebouncedSlider(zoom.scale, (value) => onUpdate({ scale: value }), zoom.id);
+  const xSlider = useDebouncedSlider(zoom.x, (value) => onUpdate({ x: value }), zoom.id);
+  const ySlider = useDebouncedSlider(zoom.y, (value) => onUpdate({ y: value }), zoom.id);
+  const rampInSlider = useDebouncedSlider(
+    zoom.rampInMs,
+    (value) => onUpdate({ rampInMs: value }),
+    zoom.id,
+  );
+  const rampOutSlider = useDebouncedSlider(
+    zoom.rampOutMs,
+    (value) => onUpdate({ rampOutMs: value }),
+    zoom.id,
+  );
 
   /** Déplacer le début garde la durée : on règle le quand, pas le combien. */
   const updateStart = (seconds: number) => {
@@ -58,7 +76,10 @@ export function ZoomInspector({ zoom, durationMs, onUpdate, onDelete, onCollapse
         </button>
       </div>
 
-      <InspectorSection title="Agrandissement" summary={`${zoom.scale.toFixed(2)}×`}>
+      <InspectorSection
+        title="Zone"
+        summary={`${scaleSlider.value.toFixed(2)}× · ${Math.round(100 / scaleSlider.value)} % du cadre`}
+      >
         <div className="slider-row">
           <Icon name="search" size={15} />
           <input
@@ -66,49 +87,163 @@ export function ZoomInspector({ zoom, durationMs, onUpdate, onDelete, onCollapse
             min={MIN_ZOOM_SCALE}
             max={MAX_ZOOM_SCALE}
             step={0.05}
-            value={zoom.scale}
-            onChange={(event) => onUpdate({ scale: Number(event.target.value) })}
+            value={scaleSlider.value}
+            onChange={(event) => scaleSlider.onChange(Number(event.target.value))}
+            onPointerUp={scaleSlider.commitNow}
+            onBlur={scaleSlider.commitNow}
             aria-label="Agrandissement du zoom"
           />
-          <span className="slider-value">{zoom.scale.toFixed(2)}×</span>
+          <input
+            type="number"
+            className="slider-number"
+            min={MIN_ZOOM_SCALE}
+            max={MAX_ZOOM_SCALE}
+            step={0.05}
+            value={Number(scaleSlider.value.toFixed(2))}
+            onChange={(event) => scaleSlider.onChange(Number(event.target.value))}
+            onBlur={scaleSlider.commitNow}
+            aria-label="Agrandissement du zoom, valeur exacte"
+          />
         </div>
         <p className="muted small-text">
           Au-delà de 2×, l'image du rush est étirée et devient molle : c'est le
-          rush qui décide, pas le réglage.
+          rush qui décide, pas le réglage. Tire aussi un coin de la zone dans
+          l'aperçu pour l'agrandir ou la rétrécir directement.
         </p>
+        <div className="zoom-presets">
+          <button
+            type="button"
+            className="ghost small"
+            onClick={() => {
+              scaleSlider.cancel();
+              onUpdate({ scale: 2 });
+            }}
+          >
+            Moitié
+          </button>
+          <button
+            type="button"
+            className="ghost small"
+            onClick={() => {
+              scaleSlider.cancel();
+              onUpdate({ scale: 3 });
+            }}
+          >
+            Tiers
+          </button>
+          <button
+            type="button"
+            className="ghost small"
+            onClick={() => {
+              scaleSlider.cancel();
+              onUpdate({ scale: 4 });
+            }}
+          >
+            Quart
+          </button>
+        </div>
       </InspectorSection>
 
       <InspectorSection
         title="Point visé"
-        summary={`${Math.round(zoom.x * 100)} % · ${Math.round(zoom.y * 100)} %`}
+        summary={`${Math.round(xSlider.value * 100)} % · ${Math.round(ySlider.value * 100)} %`}
       >
         <p className="muted small-text">
-          Tire le repère dans l'aperçu pour viser. Le zoom s'arrête au bord du
-          cadre : viser un coin ne fait jamais entrer de noir.
+          Tire le repère dans l'aperçu pour viser, ou pose un coin d'un clic.
+          Le zoom s'arrête au bord du cadre : viser un coin ne fait jamais
+          entrer de noir.
         </p>
-        {(["x", "y"] as const).map((axis) => (
+        {(
+          [
+            { axis: "x" as const, label: "Gauche/droite", slider: xSlider },
+            { axis: "y" as const, label: "Haut/bas", slider: ySlider },
+          ]
+        ).map(({ axis, label, slider }) => (
           <label className="slider-row" key={axis}>
-            <span className="fade-label">{axis === "x" ? "Gauche/droite" : "Haut/bas"}</span>
+            <span className="fade-label">{label}</span>
             <input
               type="range"
               min={0}
               max={1}
               step={0.01}
-              value={zoom[axis]}
-              onChange={(event) => onUpdate({ [axis]: Number(event.target.value) })}
+              value={slider.value}
+              onChange={(event) => slider.onChange(Number(event.target.value))}
+              onPointerUp={slider.commitNow}
+              onBlur={slider.commitNow}
             />
-            <span className="slider-value">{Math.round(zoom[axis] * 100)} %</span>
+            <span className="slider-value">{Math.round(slider.value * 100)} %</span>
           </label>
         ))}
-        {(zoom.x !== 0.5 || zoom.y !== 0.5) && (
+        <div className="zoom-presets zoom-presets-grid">
+          {(
+            [
+              { x: 0, y: 0, label: "↖ Coin" },
+              { x: 0.5, y: 0, label: "↑ Haut" },
+              { x: 1, y: 0, label: "↗ Coin" },
+              { x: 0, y: 0.5, label: "← Gauche" },
+              { x: 0.5, y: 0.5, label: "• Centre" },
+              { x: 1, y: 0.5, label: "Droite →" },
+              { x: 0, y: 1, label: "↙ Coin" },
+              { x: 0.5, y: 1, label: "↓ Bas" },
+              { x: 1, y: 1, label: "↘ Coin" },
+            ] as const
+          ).map((preset) => (
+            <button
+              key={preset.label}
+              type="button"
+              className="ghost small"
+              onClick={() => {
+                xSlider.cancel();
+                ySlider.cancel();
+                onUpdate({ x: preset.x, y: preset.y });
+              }}
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+      </InspectorSection>
+
+      <InspectorSection
+        title="Effet"
+        summary={`${zoom.direction === "out" ? "Éloignement" : "Rapprochement"} · ${zoom.easing === "ease" ? "progressif" : "linéaire"}`}
+      >
+        <p className="muted small-text">
+          Le sens du mouvement, et si la caméra démarre/s'arrête net ou en
+          douceur.
+        </p>
+        <div className="zoom-effect-row">
           <button
             type="button"
-            className="ghost small"
-            onClick={() => onUpdate({ x: 0.5, y: 0.5 })}
+            className={"ghost small" + (zoom.direction !== "out" ? " active" : "")}
+            onClick={() => onUpdate({ direction: "in" })}
           >
-            Recentrer le point visé
+            Rapprochement
           </button>
-        )}
+          <button
+            type="button"
+            className={"ghost small" + (zoom.direction === "out" ? " active" : "")}
+            onClick={() => onUpdate({ direction: "out" })}
+          >
+            Éloignement
+          </button>
+        </div>
+        <div className="zoom-effect-row">
+          <button
+            type="button"
+            className={"ghost small" + (zoom.easing !== "ease" ? " active" : "")}
+            onClick={() => onUpdate({ easing: "linear" })}
+          >
+            Linéaire
+          </button>
+          <button
+            type="button"
+            className={"ghost small" + (zoom.easing === "ease" ? " active" : "")}
+            onClick={() => onUpdate({ easing: "ease" })}
+          >
+            Progressif
+          </button>
+        </div>
       </InspectorSection>
 
       <InspectorSection
@@ -148,7 +283,7 @@ export function ZoomInspector({ zoom, durationMs, onUpdate, onDelete, onCollapse
 
       <InspectorSection
         title="Rampes"
-        summary={`${rampLabel(zoom.rampInMs)} / ${rampLabel(zoom.rampOutMs)}`}
+        summary={`${rampLabel(rampInSlider.value)} / ${rampLabel(rampOutSlider.value)}`}
       >
         <p className="muted small-text">
           Le temps que met la caméra à s'approcher, puis à revenir. Une rampe
@@ -162,11 +297,13 @@ export function ZoomInspector({ zoom, durationMs, onUpdate, onDelete, onCollapse
               min={0}
               max={maxRampMs}
               step={50}
-              value={zoom.rampInMs}
-              onChange={(event) => onUpdate({ rampInMs: Number(event.target.value) })}
+              value={rampInSlider.value}
+              onChange={(event) => rampInSlider.onChange(Number(event.target.value))}
+              onPointerUp={rampInSlider.commitNow}
+              onBlur={rampInSlider.commitNow}
               aria-label="Durée du zoom avant"
             />
-            <span className="slider-value">{rampLabel(zoom.rampInMs)}</span>
+            <span className="slider-value">{rampLabel(rampInSlider.value)}</span>
           </label>
           <label className="slider-row">
             <span className="fade-label">Retour</span>
@@ -175,11 +312,13 @@ export function ZoomInspector({ zoom, durationMs, onUpdate, onDelete, onCollapse
               min={0}
               max={maxRampMs}
               step={50}
-              value={zoom.rampOutMs}
-              onChange={(event) => onUpdate({ rampOutMs: Number(event.target.value) })}
+              value={rampOutSlider.value}
+              onChange={(event) => rampOutSlider.onChange(Number(event.target.value))}
+              onPointerUp={rampOutSlider.commitNow}
+              onBlur={rampOutSlider.commitNow}
               aria-label="Durée du retour"
             />
-            <span className="slider-value">{rampLabel(zoom.rampOutMs)}</span>
+            <span className="slider-value">{rampLabel(rampOutSlider.value)}</span>
           </label>
         </div>
       </InspectorSection>

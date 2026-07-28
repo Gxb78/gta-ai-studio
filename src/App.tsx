@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { DragPreview } from "./components/DragPreview";
 import { ExportDialog } from "./components/ExportDialog";
 import { ImportView } from "./components/ImportView";
 import { Inspector } from "./components/Inspector";
@@ -9,14 +10,15 @@ import { ZoomInspector } from "./components/ZoomInspector";
 import { PreviewStage, type ViewMode } from "./components/PreviewStage";
 import { ProjectsDialog } from "./components/ProjectsDialog";
 import { ShortcutsPanel } from "./components/ShortcutsPanel";
-import { SideGrip } from "./components/SideGrip";
 import { Timeline } from "./components/Timeline";
-import { ToolRail, type Tool } from "./components/ToolRail";
+import { ToolRail, type SidePanel, type Tool } from "./components/ToolRail";
 import { TopBar, type SaveState } from "./components/TopBar";
 import {
+  CANCELLED,
   importSource,
   getHardwareCapabilities,
   loadLastProject,
+  onCloseRequested,
   onFilesDropped,
   onImportProgress,
   pathsExist,
@@ -25,7 +27,11 @@ import {
   saveProject,
 } from "./ipc";
 import { usePlayback } from "./playback/usePlayback";
-import { compileTimeline, transitionCapacityMs } from "./timeline/compileTimeline";
+import {
+  compileTimeline,
+  rawTransitionCapacityMs,
+  transitionCapacityMs,
+} from "./timeline/compileTimeline";
 import {
   editorReducer,
   effectiveClips,
@@ -44,8 +50,12 @@ import type {
 } from "./types";
 import {
   ASSET_VERSION,
+  clipEndMs,
   frameMs,
+  isProjectVersionSupported,
+  isUnwantedKeyRepeat,
   sourceAspect,
+  sourcesNeedingRegeneration,
   timelineDurationMs,
   timelineTimeToSourceTime,
 } from "./types";
@@ -53,29 +63,30 @@ import {
 /** Référence stable : évite de recréer un objet vide à chaque rendu. */
 const EMPTY_SOURCES: Record<string, SourceInfo> = {};
 
-/** Bornes de la zone timeline, pour qu'elle ne mange jamais tout l'aperçu. */
+/**
+ * Bornes de la zone timeline, pour qu'elle ne mange jamais tout l'aperçu.
+ *
+ * `minHeight` de la fenêtre (tauri.conf.json) vaut 700 px. La barre du haut
+ * et la barre de lecture sous l'aperçu prennent chacune ~48 px de chrome fixe
+ * ; le reste doit rester à l'aperçu et à l'inspecteur, pas à la timeline.
+ * 720 dépassait déjà la fenêtre minimale à lui seul — poignée tirée à fond
+ * sur une petite fenêtre, l'aperçu et l'inspecteur étaient écrasés à rien.
+ */
 const MIN_TIMELINE_PX = 180;
-const MAX_TIMELINE_PX = 720;
+const MAX_TIMELINE_PX = 420;
 const DEFAULT_TIMELINE_PX = 320;
-
-/** Bornes du volet Inspecteur, en bas de la colonne de gauche. */
-const MIN_INSPECTOR_PX = 200;
-const MAX_INSPECTOR_PX = 900;
-const DEFAULT_INSPECTOR_PX = 420;
 
 export default function App() {
   if (import.meta.env.DEV) console.count("[render] App");
   const [state, dispatch] = useReducer(editorReducer, initialEditorState);
   const [pxPerSec, setPxPerSec] = useState(30);
   const [tool, setTool] = useState<Tool>("select");
-  const [mediaOpen, setMediaOpen] = useState(true);
-  const [textOpen, setTextOpen] = useState(false);
-  const [inspectorOpen, setInspectorOpen] = useState(true);
-  const [viewMode, setViewMode] = useState<ViewMode>("output");
+  /** Panneau ouvert dans la colonne de gauche : un seul à la fois, jamais deux. */
+  const [sidePanel, setSidePanel] = useState<SidePanel | null>("media");
+  const [viewMode, setViewMode] = useState<ViewMode>("source");
   const [showSafeZones, setShowSafeZones] = useState(false);
   const [volume, setVolume] = useState(1);
   const [timelineHeight, setTimelineHeight] = useState(DEFAULT_TIMELINE_PX);
-  const [inspectorHeight, setInspectorHeight] = useState(DEFAULT_INSPECTOR_PX);
   const [exporting, setExporting] = useState(false);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
@@ -84,6 +95,13 @@ export default function App() {
   const [importing, setImporting] = useState(false);
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
+  /**
+   * Refus d'ouvrir un projet dont le format dépasse ce que ce build sait lire
+   * (voir `isProjectVersionSupported`). Distinct de `importError` : ce n'est
+   * pas un rush qui a échoué à s'importer, c'est un fichier de projet entier
+   * qu'on refuse délibérément de toucher pour ne rien lui faire perdre.
+   */
+  const [loadError, setLoadError] = useState<string | null>(null);
   /** Rushs dont le fichier d'origine est introuvable (déplacé, supprimé). */
   const [missingIds, setMissingIds] = useState<ReadonlySet<string>>(new Set());
   /** Média tiré depuis le panneau Médias, en attente de dépôt sur la timeline. */
@@ -111,6 +129,25 @@ export default function App() {
     () => compileTimeline(state.clips, hiddenTracks, state.project?.sources ?? {}),
     [hiddenTracks, state.clips, state.project?.sources],
   );
+  // Ne dépend que des clips COMMITTÉS : recalculer à chaque rendu referait ce
+  // travail sur chaque image d'un glisser/redimensionnement de clip, qui ne
+  // change que `transientClips`, jamais `state.clips`.
+  //
+  // Doit vivre AVANT le retour anticipé « pas de projet » plus bas : tous les
+  // hooks d'un composant doivent s'exécuter à chaque rendu, dans le même
+  // ordre — un `useMemo` posé après ce retour ne s'exécute que lorsqu'un
+  // projet est chargé, ce qui change le nombre de hooks appelés d'un rendu à
+  // l'autre et fait planter React (« Rendered more hooks than during the
+  // previous render »), écran noir au démarrage puisque l'écran d'import est
+  // justement ce qui s'affiche avant qu'un projet existe.
+  const clipCounts = useMemo(
+    () =>
+      state.clips.reduce<Record<string, number>>((counts, clip) => {
+        counts[clip.sourceId] = (counts[clip.sourceId] ?? 0) + 1;
+        return counts;
+      }, {}),
+    [state.clips],
+  );
   const playback = usePlayback(
     videoA,
     videoB,
@@ -134,10 +171,38 @@ export default function App() {
   useEffect(() => {
     void loadLastProject().then(async (project) => {
       if (!project) return;
+      // Un format plus récent que ce que ce build sait lire : on refuse de
+      // charger plutôt que de migrer en aveugle. Migrer perdrait les champs
+      // inconnus, puis l'autosave réécrirait aussitôt le fichier appauvri sur
+      // le disque — irréversible. L'écran d'accueil reste affiché, intact.
+      if (!isProjectVersionSupported(project.version)) {
+        setLoadError(
+          `Le dernier projet ouvert vient d'une version plus récente de l'application ` +
+            `(format ${project.version}). Mets à jour GTA Studio pour le récupérer ; ` +
+            `il n'a pas été modifié.`,
+        );
+        return;
+      }
       dispatch({ type: "LOAD", project });
-      const stale = Object.values(project.sources ?? {})
-        .concat(project.source ? [project.source] : [])
-        .filter((source) => source.assetVersion < ASSET_VERSION);
+      const allSources = Object.values(project.sources ?? {}).concat(
+        project.source ? [project.source] : [],
+      );
+      // Le backend n'exige plus qu'un proxy soit présent pour ouvrir le
+      // projet (voir project.rs) : c'est ici qu'on répare ceux qui manquent.
+      // Coûteux (un aller-retour IPC), donc seulement pour les sources pas
+      // déjà connues comme périmées — celles-là seront de toute façon
+      // refaites, régénérer leur proxy en plus ne changerait rien.
+      const freshEnough = allSources.filter((source) => source.assetVersion >= ASSET_VERSION);
+      const proxyExists = new Set(
+        freshEnough.length === 0
+          ? []
+          : await pathsExist(freshEnough.map((source) => source.proxyPath))
+              .then((results) =>
+                freshEnough.filter((_, index) => results[index]).map((source) => source.id),
+              )
+              .catch(() => freshEnough.map((source) => source.id)),
+      );
+      const stale = sourcesNeedingRegeneration(allSources, proxyExists);
       for (const source of stale) {
         try {
           const refreshed = await importSource(source.originalPath);
@@ -148,33 +213,84 @@ export default function App() {
           // Rush introuvable ou déplacé : on garde les anciens fichiers.
         }
       }
+    }).catch((error) => {
+      // Une erreur backend authentique (pas le « aucun projet » ni le format
+      // trop récent, déjà gérés plus haut) laissait sinon une rejection non
+      // suivie : l'écran d'accueil restait affiché, sans message, comme si
+      // rien ne s'était passé.
+      setLoadError(
+        `Impossible de reprendre le dernier projet : ${String(error)}`,
+      );
     });
   }, []);
 
-  // Sauvegarde automatique (débouncée) à chaque modification committée, avec son
-  // état visible dans la barre supérieure : une sauvegarde silencieuse qui
-  // échoue est le pire des cas.
+  /**
+   * Sauvegarde automatique débouncée : le point le plus sensible de l'appli,
+   * celui où une erreur silencieuse perd du travail.
+   *
+   * `pendingSaveRef` porte la DERNIÈRE version du projet, mise à jour à chaque
+   * rendu, indépendamment du minuteur. Le nettoyage de l'effet se contente
+   * d'annuler le minuteur en cours — il ne perd rien, puisque la donnée à
+   * sauvegarder vit dans la ref, pas dans le minuteur. `flushSave` peut donc
+   * être appelée à tout moment (fermer le projet, fermer la fenêtre) pour
+   * écrire immédiatement ce qu'il reste en attente, au lieu de laisser le
+   * minuteur de 600 ms s'annoncer et disparaître avec la dernière modification.
+   */
+  const pendingSaveRef = useRef<Project | null>(null);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushSave = useCallback(async () => {
+    if (saveTimerRef.current !== null) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    const pending = pendingSaveRef.current;
+    if (!pending) return;
+    pendingSaveRef.current = null;
+    setSaveState("saving");
+    setSaveError(null);
+    try {
+      await saveProject(pending);
+      setSaveState("saved");
+    } catch (error) {
+      // Ne jamais relancer : un appelant (la fermeture de la fenêtre, en
+      // particulier) doit pouvoir attendre cette promesse sans jamais rester
+      // bloqué sur un échec d'écriture.
+      setSaveState("error");
+      setSaveError(String(error));
+    }
+  }, []);
+
   useEffect(() => {
     if (!state.project) return;
-    const project: Project = {
+    pendingSaveRef.current = {
       ...state.project,
       clips: state.clips,
       textOverlays: state.textOverlays,
       zooms: state.zooms,
       updatedAt: new Date().toISOString(),
     };
-    const timer = setTimeout(() => {
-      setSaveState("saving");
-      setSaveError(null);
-      void saveProject(project)
-        .then(() => setSaveState("saved"))
-        .catch((error: unknown) => {
-          setSaveState("error");
-          setSaveError(String(error));
-        });
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [state.clips, state.project, state.textOverlays, state.zooms]);
+    saveTimerRef.current = setTimeout(() => void flushSave(), 600);
+    return () => {
+      if (saveTimerRef.current !== null) clearTimeout(saveTimerRef.current);
+    };
+  }, [state.clips, state.project, state.textOverlays, state.zooms, flushSave]);
+
+  // Fermeture de la fenêtre : Tauri attend que le handler se résolve avant de
+  // détruire la fenêtre, donc avant de vider une sauvegarde en attente laisse
+  // filer la dernière modification sans qu'elle ait jamais touché le disque.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void onCloseRequested(flushSave).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [flushSave]);
 
   // Progression d'import, affichée dans le panneau Médias.
   useEffect(() => {
@@ -215,6 +331,16 @@ export default function App() {
       disposed = true;
     };
   }, [sources]);
+
+  // Curseur « saisie » sur toute la fenêtre pendant qu'un rush est tiré depuis
+  // le panneau Médias — le pointeur peut survoler des éléments qui portent
+  // leur propre curseur (bouton, texte) en chemin vers la timeline ; sans
+  // cette classe globale, il y reprendrait sa forme normale en plein geste.
+  // Même mécanisme que `body.moving` pour le déplacement d'un clip déjà posé.
+  useEffect(() => {
+    document.body.classList.toggle("dragging-media", pendingSource !== null);
+    return () => document.body.classList.remove("dragging-media");
+  }, [pendingSource]);
 
   const handleImported = useCallback((source: SourceInfo) => {
     const now = new Date().toISOString();
@@ -285,7 +411,11 @@ export default function App() {
           }
         }
       } catch (error) {
-        setImportError(String(error));
+        // Une annulation n'est pas un échec : FFmpeg a été tué à la demande
+        // de l'utilisateur, il n'y a rien à lui signaler comme une erreur —
+        // et un dépôt de plusieurs fichiers s'arrête net, sans enchaîner sur
+        // les suivants.
+        if (String(error) !== CANCELLED) setImportError(String(error));
       } finally {
         setImporting(false);
         setImportProgress(null);
@@ -339,17 +469,31 @@ export default function App() {
     dispatch({ type: "SPLIT_AT", timelineMs: playback.clock.getPlayheadMs() });
   }, [playback.clock]);
 
+  // Même ordre de priorité que l'inspecteur affiché plus bas (zoom, puis
+  // titre, puis clip) : Suppr doit toujours agir sur ce que l'utilisateur voit
+  // réellement à l'écran. Bug réel : les trois sélections n'étaient pas
+  // mutuellement exclusives (voir SELECT_ZOOM dans editor.ts), et ce
+  // gestionnaire ne connaissait même pas les zooms — sélectionner un zoom
+  // laissait le clip précédemment sélectionné « actif » en silence, et Suppr
+  // le supprimait à la place du zoom affiché dans l'inspecteur.
   const deleteSelected = useCallback(() => {
-    if (state.selectedTextOverlayId) {
+    if (state.selectedZoomId) {
+      dispatch({ type: "DELETE_ZOOM", zoomId: state.selectedZoomId });
+    } else if (state.selectedTextOverlayId) {
       dispatch({ type: "DELETE_TEXT", textOverlayId: state.selectedTextOverlayId });
     } else if (state.selectedClipId) {
       dispatch({ type: "DELETE_CLIP", clipId: state.selectedClipId });
     }
-  }, [state.selectedClipId, state.selectedTextOverlayId]);
+  }, [state.selectedClipId, state.selectedTextOverlayId, state.selectedZoomId]);
 
   // Cadence de référence pour les pas clavier : celle du clip sélectionné, à
   // défaut celle du premier rush. Deux rushs peuvent différer.
-  const selectedClip = state.clips.find((clip) => clip.id === state.selectedClipId) ?? null;
+  //
+  // `clips` (transient-aware) et non `state.clips` (committé) : sinon les
+  // champs numériques de l'inspecteur — durée de trim, transition — restent
+  // figés sur la valeur d'avant-geste pendant qu'on fait glisser le clip,
+  // alors même que la Timeline affiche déjà la position en cours.
+  const selectedClip = clips.find((clip) => clip.id === state.selectedClipId) ?? null;
   const selectedTransitionIndex = selectedClip
     ? compiledTimeline.video.segments.findIndex(
         (segment) =>
@@ -357,15 +501,42 @@ export default function App() {
           Math.abs(segment.startMs - selectedClip.timelineStartMs) < 1,
       )
     : -1;
-  const selectedTransitionMaxMs = transitionCapacityMs(
-    compiledTimeline.video.segments,
-    selectedTransitionIndex,
-    sources,
-  );
+  /**
+   * Secours quand la frontière n'existe plus comme segments adjacents.
+   *
+   * `flattenTracks` fusionne deux clips committés contigus dès qu'ils sont,
+   * pour l'instant, réglés à l'identique — c'est systématiquement le cas juste
+   * après une découpe (SPLIT_AT), tant qu'aucune des deux moitiés n'a été
+   * retouchée (voir compileTimeline.ts). Sans ce secours, `selectedTransitionIndex`
+   * vaut -1 et l'inspecteur affiche « poignées insuffisantes » sur une coupe
+   * fraîche qui n'a pourtant aucun problème de poignées — juste plus de
+   * frontière visible. Le clip committé qui précède directement `selectedClip`
+   * sur SA piste, sans trou, reste la même frontière, qu'elle soit ou non
+   * visible comme segment distinct.
+   */
+  const precedingClip =
+    selectedClip && selectedTransitionIndex === -1
+      ? (clips.find(
+          (c) =>
+            c.id !== selectedClip.id &&
+            c.track === selectedClip.track &&
+            Math.abs(clipEndMs(c) - selectedClip.timelineStartMs) < 1,
+        ) ?? null)
+      : null;
+  const selectedTransitionMaxMs =
+    selectedTransitionIndex !== -1
+      ? transitionCapacityMs(compiledTimeline.video.segments, selectedTransitionIndex, sources)
+      : precedingClip && selectedClip
+        ? rawTransitionCapacityMs(precedingClip, selectedClip, sources)
+        : 0;
   const selectedTransitionMs =
-    compiledTimeline.video.transitions.find(
-      (transition) => transition.toIndex === selectedTransitionIndex,
-    )?.durationMs ?? 0;
+    selectedTransitionIndex !== -1
+      ? (compiledTimeline.video.transitions.find(
+          (transition) => transition.toIndex === selectedTransitionIndex,
+        )?.durationMs ?? 0)
+      : selectedClip
+        ? Math.max(0, Math.min(selectedClip.transitionInMs, selectedTransitionMaxMs))
+        : 0;
   const selectedTextOverlay =
     textOverlays.find((overlay) => overlay.id === state.selectedTextOverlayId) ?? null;
   const selectedZoom = zooms.find((zoom) => zoom.id === state.selectedZoomId) ?? null;
@@ -418,6 +589,9 @@ export default function App() {
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
       if (!state.project || exporting) return;
 
+      // Répétition clavier (maintenir la touche) : voir isUnwantedKeyRepeat.
+      if (isUnwantedKeyRepeat(event.repeat, event.key)) return;
+
       // Les combinaisons Ctrl passent AVANT les touches simples : sans ce
       // traitement séparé, Ctrl+V déclencherait aussi la branche « v », qui
       // bascule sur l'outil de sélection.
@@ -438,7 +612,27 @@ export default function App() {
           dispatch({ type: "PASTE_CLIP", atMs: playback.clock.getPlayheadMs() });
           return;
         }
+        if (key === "z") {
+          event.preventDefault();
+          dispatch({ type: "UNDO" });
+          return;
+        }
+        if (key === "y") {
+          event.preventDefault();
+          dispatch({ type: "REDO" });
+          return;
+        }
       }
+      if (event.ctrlKey && event.shiftKey && !event.altKey && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        dispatch({ type: "REDO" });
+        return;
+      }
+      // Toute autre combinaison Ctrl (Ctrl+S, Ctrl+B, Ctrl+I…) ne doit RIEN
+      // faire ici plutôt que de retomber sur les raccourcis à touche seule :
+      // sans ce garde-fou, Ctrl+S coupait le clip au playhead au lieu de ne
+      // rien faire, et un Ctrl+V sans presse-papiers basculait l'outil.
+      if (event.ctrlKey || event.metaKey) return;
 
       if (event.key === "?" || (event.key === "/" && event.shiftKey)) {
         event.preventDefault();
@@ -454,15 +648,6 @@ export default function App() {
         setTool("blade");
       } else if (event.key === "Delete" || event.key === "Backspace") {
         deleteSelected();
-      } else if (event.ctrlKey && !event.shiftKey && event.key.toLowerCase() === "z") {
-        event.preventDefault();
-        dispatch({ type: "UNDO" });
-      } else if (
-        (event.ctrlKey && event.key.toLowerCase() === "y") ||
-        (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "z")
-      ) {
-        event.preventDefault();
-        dispatch({ type: "REDO" });
       } else if (event.key === "m" || event.key === "M") {
         toggleClipAudio();
       } else if (event.key === "i" || event.key === "I") {
@@ -496,10 +681,23 @@ export default function App() {
     toggleClipAudio, trimSelected,
   ]);
 
-  const openStoredProject = useCallback((project: StoredProject) => {
-    dispatch({ type: "LOAD", project });
-    setShowProjects(false);
-  }, []);
+  const openStoredProject = useCallback(
+    (project: StoredProject) => {
+      // Même risque qu'un « Nouveau projet » : LOAD remplace clips, titres et
+      // zooms d'un coup, et une modification encore en attente de minuteur
+      // n'aurait plus personne pour la recevoir.
+      void flushSave();
+      // Le projet remplacé peut être en cours de lecture : sans l'arrêter et
+      // remettre le playhead à zéro AVANT le remplacement, la balise vidéo
+      // active continue de lire l'ancien média pendant que la boucle de
+      // lecture bascule déjà sur les segments du nouveau projet.
+      playback.pause();
+      playback.seek(0);
+      dispatch({ type: "LOAD", project });
+      setShowProjects(false);
+    },
+    [flushSave, playback.pause, playback.seek],
+  );
 
   if (!state.project) {
     return (
@@ -509,6 +707,7 @@ export default function App() {
           onOpenProjects={() => setShowProjects(true)}
           droppedBusy={importing}
           droppedProgress={importProgress}
+          startupError={loadError}
         />
         {showProjects && (
           <ProjectsDialog
@@ -529,10 +728,6 @@ export default function App() {
   const transitionClip =
     state.clips.find((clip) => clip.id === playback.transitionVideoClipId) ?? null;
   const visibleSource = visibleClip ? sources[visibleClip.sourceId] : undefined;
-  const clipCounts = state.clips.reduce<Record<string, number>>((counts, clip) => {
-    counts[clip.sourceId] = (counts[clip.sourceId] ?? 0) + 1;
-    return counts;
-  }, {});
 
   return (
     <div className="app">
@@ -547,7 +742,13 @@ export default function App() {
         onRedo={() => dispatch({ type: "REDO" })}
         onOpenProjects={() => setShowProjects(true)}
         onShowShortcuts={() => setShowShortcuts(true)}
-        onNewProject={() => dispatch({ type: "CLOSE" })}
+        onNewProject={() => {
+          // Vide la sauvegarde en attente AVANT de fermer le projet : sinon
+          // la dernière modification n'a plus de projet vers lequel écrire une
+          // fois le minuteur écoulé, et disparaît silencieusement.
+          void flushSave();
+          dispatch({ type: "CLOSE" });
+        }}
         onExport={() => {
           playback.pause();
           setExporting(true);
@@ -560,27 +761,15 @@ export default function App() {
         <ToolRail
           tool={tool}
           onToolChange={setTool}
-          mediaOpen={mediaOpen}
-          onToggleMedia={() => {
-            setMediaOpen((open) => !open);
-            setTextOpen(false);
-          }}
-          textOpen={textOpen}
-          onToggleText={() => {
-            setTextOpen((open) => !open);
-            setMediaOpen(false);
-          }}
-          inspectorOpen={inspectorOpen}
-          onToggleInspector={() => setInspectorOpen((open) => !open)}
+          sidePanel={sidePanel}
+          onSelectPanel={setSidePanel}
         />
 
-        {/* Colonne de gauche, en deux volets : la bibliothèque en haut,
-            l'inspecteur en bas. Les deux sont des panneaux « de côté » ; les
-            réunir libère toute la droite pour l'image et le montage. La colonne
-            entière disparaît quand ses deux volets sont repliés. */}
-        {(mediaOpen || textOpen || inspectorOpen) && (
+        {/* Colonne de gauche : un seul panneau à la fois, qui en prend toute
+            la hauteur. Elle disparaît quand aucun panneau n'est ouvert. */}
+        {sidePanel !== null && (
           <div className="side-column">
-        {mediaOpen && (
+        {sidePanel === "media" && (
           <MediaPanel
             sources={Object.values(sources)}
             missingIds={missingIds}
@@ -596,47 +785,31 @@ export default function App() {
                 atMs: playback.clock.getPlayheadMs(),
               })
             }
+            draggingId={pendingSource?.id ?? null}
             onBeginDrag={setPendingSource}
             onRelocate={(source) => void handleRelocate(source)}
-            onCollapse={() => setMediaOpen(false)}
+            onCollapse={() => setSidePanel(null)}
           />
         )}
 
-        {textOpen && (
+        {sidePanel === "text" && (
           <TextPanel
             overlays={textOverlays}
             selectedId={state.selectedTextOverlayId}
             onAdd={() => {
               dispatch({ type: "ADD_TEXT", atMs: playback.clock.getPlayheadMs() });
-              setInspectorOpen(true);
+              setSidePanel("inspector");
             }}
             onSelect={(textOverlayId) => {
               dispatch({ type: "SELECT_TEXT", textOverlayId });
-              setInspectorOpen(true);
+              setSidePanel("inspector");
             }}
-            onCollapse={() => setTextOpen(false)}
+            onCollapse={() => setSidePanel(null)}
           />
         )}
 
-        {inspectorOpen && (mediaOpen || textOpen) && (
-          <SideGrip
-            height={inspectorHeight}
-            onHeightChange={(next) =>
-              setInspectorHeight(
-                Math.min(MAX_INSPECTOR_PX, Math.max(MIN_INSPECTOR_PX, next)),
-              )
-            }
-          />
-        )}
-
-        {/* Volet du bas. Il ne porte une hauteur fixe que s'il partage la
-            colonne : seul, il la prend tout entière. */}
-        {inspectorOpen && (
-        <div
-          className="side-pane-bottom"
-          style={mediaOpen || textOpen ? { height: inspectorHeight } : undefined}
-        >
-        {selectedZoom ? (
+        {sidePanel === "inspector" && (
+        selectedZoom ? (
           <ZoomInspector
             zoom={selectedZoom}
             durationMs={timelineDurationMs(state.clips)}
@@ -644,7 +817,7 @@ export default function App() {
               dispatch({ type: "UPDATE_ZOOM", zoomId: selectedZoom.id, patch })
             }
             onDelete={() => dispatch({ type: "DELETE_ZOOM", zoomId: selectedZoom.id })}
-            onCollapse={() => setInspectorOpen(false)}
+            onCollapse={() => setSidePanel(null)}
           />
         ) : selectedTextOverlay ? (
           <TextInspector
@@ -660,7 +833,7 @@ export default function App() {
             onDelete={() =>
               dispatch({ type: "DELETE_TEXT", textOverlayId: selectedTextOverlay.id })
             }
-            onCollapse={() => setInspectorOpen(false)}
+            onCollapse={() => setSidePanel(null)}
           />
         ) : (
           <Inspector
@@ -717,10 +890,9 @@ export default function App() {
             onToggleAudio={toggleClipAudio}
             canDelete={state.clips.length > 1}
             onDelete={deleteSelected}
-            onCollapse={() => setInspectorOpen(false)}
+            onCollapse={() => setSidePanel(null)}
           />
-        )}
-        </div>
+        )
         )}
         </div>
         )}
@@ -741,7 +913,14 @@ export default function App() {
           visibleClip={visibleClip}
           transitionClip={transitionClip}
           cropX={visibleClip?.cropX ?? 0}
-          sourceAspect={visibleSource ? sourceAspect(visibleSource.probe) : 16 / 9}
+          // Tant que la source visible n'est pas connue (chargement, coupe en
+          // cours…), 16:9 donnait un format toujours plus large que la sortie,
+          // ce qui rendait le cadrage « glissable » (curseur ew-resize) même
+          // sur un rush déjà vertical qui n'a rien à recadrer. 9:16 — le
+          // format de sortie lui-même — ne peut jamais déclencher ça : par
+          // défaut, tant qu'on ne sait pas, on suppose qu'il n'y a rien à
+          // glisser plutôt que l'inverse.
+          sourceAspect={visibleSource ? sourceAspect(visibleSource.probe) : 9 / 16}
           viewMode={viewMode}
           onViewModeChange={setViewMode}
           showSafeZones={showSafeZones}
@@ -752,7 +931,15 @@ export default function App() {
           volume={volume}
           onVolumeChange={setVolume}
           onTogglePlay={playback.toggle}
+          onPause={playback.pause}
           onStepFrame={stepFrame}
+          onSplitAtPlayhead={splitAtPlayhead}
+          onAddZoom={() => {
+            dispatch({ type: "ADD_ZOOM", atMs: playback.clock.getPlayheadMs() });
+            // Le zoom naît sélectionné : ouvrir l'inspecteur évite d'avoir posé
+            // une zone sans voir par quoi on la règle.
+            setSidePanel("inspector");
+          }}
           onCommitCropX={
             visibleClip
               ? (cropX) => dispatch({ type: "SET_CLIP_CROP_X", clipId: visibleClip.id, cropX })
@@ -766,11 +953,17 @@ export default function App() {
                   dispatch({ type: "UPDATE_ZOOM", zoomId: selectedZoom.id, patch: { x, y } })
               : null
           }
+          onCommitZoomBox={
+            selectedZoom
+              ? (x, y, scale) =>
+                  dispatch({ type: "UPDATE_ZOOM", zoomId: selectedZoom.id, patch: { x, y, scale } })
+              : null
+          }
           textOverlays={textOverlays}
           selectedTextOverlayId={state.selectedTextOverlayId}
           onSelectTextOverlay={(textOverlayId) => {
             dispatch({ type: "SELECT_TEXT", textOverlayId });
-            setInspectorOpen(true);
+            setSidePanel("inspector");
           }}
           onCommitTextPosition={(textOverlayId, x, y) =>
             dispatch({ type: "UPDATE_TEXT", textOverlayId, patch: { x, y } })
@@ -795,10 +988,13 @@ export default function App() {
           zooms={zooms}
           anchorZooms={state.zooms}
           selectedZoomId={state.selectedZoomId}
-          onSelectZoom={(zoomId) => {
-            dispatch({ type: "SELECT_ZOOM", zoomId });
-            if (zoomId) setInspectorOpen(true);
-          }}
+          onSelectZoom={(zoomId) => dispatch({ type: "SELECT_ZOOM", zoomId })}
+          // Ouvre l'inspecteur seulement une fois le geste sur le zoom conclu :
+          // le faire dès le pointerdown changerait la mise en page pendant que
+          // le geste lit encore sa géométrie en direct, et décalerait la
+          // timeline sous le curseur en plein déplacement. Inconditionnel :
+          // ce callback ne se déclenche que si un zoom a bien été visé.
+          onZoomGestureEnd={() => setSidePanel("inspector")}
           onSeek={playback.seek}
           onSelect={selectClip}
           onPreviewFrame={playback.showFrame}
@@ -824,6 +1020,8 @@ export default function App() {
 
       </div>
 
+      <DragPreview source={pendingSource} />
+
       {showShortcuts && (
         <ShortcutsPanel
           frameStepMs={frameMs(referenceFps)}
@@ -836,6 +1034,7 @@ export default function App() {
           currentId={state.project.id}
           onOpen={openStoredProject}
           onNewProject={() => {
+            void flushSave();
             setShowProjects(false);
             dispatch({ type: "CLOSE" });
           }}

@@ -45,13 +45,18 @@ export function TopBar(props: Props) {
 
   // Fermeture au clic extérieur : un menu qui reste ouvert derrière l'aperçu
   // est plus gênant que pas de menu du tout.
+  //
+  // En phase de CAPTURE, pas de bulle : la timeline arrête la propagation de
+  // son propre `pointerdown` sur ses repères et ses clips (pour ne pas aussi
+  // déclencher un déplacement ou une lecture derrière), ce qui empêchait ce
+  // menu de jamais apprendre qu'on avait cliqué ailleurs.
   useEffect(() => {
     if (!menuOpen) return;
     const onDown = (event: PointerEvent) => {
       if (!menuRef.current?.contains(event.target as Node)) setMenuOpen(false);
     };
-    window.addEventListener("pointerdown", onDown);
-    return () => window.removeEventListener("pointerdown", onDown);
+    window.addEventListener("pointerdown", onDown, true);
+    return () => window.removeEventListener("pointerdown", onDown, true);
   }, [menuOpen]);
 
   const commitName = () => {

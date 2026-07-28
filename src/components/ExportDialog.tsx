@@ -1,7 +1,7 @@
 // Export TikTok 1080×1920. Le seul moment où FFmpeg travaille sur le rush original.
 
 import { useEffect, useRef, useState } from "react";
-import { exportTimeline, onExportProgress, revealPath } from "../ipc";
+import { CANCELLED, cancelExport, exportTimeline, onExportProgress, revealPath } from "../ipc";
 import { Icon } from "./Icon";
 import type {
   ExportRequest,
@@ -191,6 +191,12 @@ export function ExportDialog(props: Props) {
       setOutputPath(path);
       setPhase("done");
     } catch (e) {
+      // Une annulation n'est pas un échec : FFmpeg a été tué à la demande de
+      // l'utilisateur. On revient au réglage plutôt que d'afficher une erreur.
+      if (String(e) === CANCELLED) {
+        setPhase("config");
+        return;
+      }
       setError(String(e));
       setPhase("error");
     }
@@ -279,6 +285,11 @@ export function ExportDialog(props: Props) {
               <div className="progress-fill" style={{ width: `${Math.round(percent)}%` }} />
             </div>
             <span className="muted">Rendu en cours… {Math.round(percent)}%</span>
+            <div className="modal-actions">
+              <button className="ghost" onClick={() => void cancelExport()}>
+                Annuler l'export
+              </button>
+            </div>
           </div>
         )}
 
